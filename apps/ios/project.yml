@@ -1,0 +1,66 @@
+name: Remo
+
+options:
+  developmentLanguage: ja
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+
+targets:
+  Remo:
+    type: application
+    platform: iOS
+    info:
+      path: Remo/Info.plist
+      properties:
+        CFBundleDisplayName: Remo
+        CFBundleDevelopmentRegion: ja
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleLocalizations:
+          - ja
+        REMO_API_BASE_URL: "$(REMO_API_BASE_URL)"
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSLocationWhenInUseUsageDescription: ログに現在地を添付するために使用します。
+        NSLocationAlwaysAndWhenInUseUsageDescription: アプリを閉じている間も移動ログを自動記録するために使用します。
+        NSMotionUsageDescription: 移動状態を検知してバッテリー消費を抑えるために使用します。
+        NSPhotoLibraryUsageDescription: 写真ライブラリを読み込み、撮影日時と位置からタイムラインを作ります。ログイン中は縮小した写真をバックアップします。
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.remo.app.backup-refresh
+        UIBackgroundModes:
+          - fetch
+          - location
+        UILaunchScreen: {}
+    sources:
+      - path: Remo/Sources
+      - Remo/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.remo.app
+        PRODUCT_NAME: Remo
+        REMO_API_BASE_URL: http://localhost:8787
+      configs:
+        Release:
+          REMO_API_BASE_URL: https://remo-api.just-do-it-my-life.workers.dev
+    scheme:
+      testTargets:
+        - RemoTests
+
+  RemoTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Remo/Tests
+    dependencies:
+      - target: Remo
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.remo.app.tests
+        GENERATE_INFOPLIST_FILE: YES

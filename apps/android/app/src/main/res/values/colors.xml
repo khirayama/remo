@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="launcher_background">#FFFFFFFF</color>
+    <color name="app_background">#FFF4F5F1</color>
+    <color name="brand_green">#FF2F5A45</color>
+</resources>

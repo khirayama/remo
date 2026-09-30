@@ -1,0 +1,25 @@
+.DS_Store
+.env
+.claude/settings.local.json
+node_modules/
+dist/
+coverage/
+.wrangler/
+apps/api/.dev.vars
+apps/web/.env*
+!apps/web/.env.example
+apps/android/.gradle/
+apps/android/build/
+apps/android/app/build/
+apps/android/local.properties
+apps/ios/build/
+apps/ios/build-release/
+apps/ios/DerivedData/
+apps/ios/LocalSecrets.plist
+**/xcuserdata/
+*.xcuserstate
+
+# Runtime logs and generated screenshots
+*.log
+android_*.png
+ios_*.png

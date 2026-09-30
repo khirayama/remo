@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Remo</title>
+  <desc id="desc">A rounded triangular loop with a flowing green-to-cyan gradient on a transparent background.</desc>
+  <defs>
+    <linearGradient id="logo-gradient" x1="120" y1="110" x2="400" y2="400" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#43f2a5" />
+      <stop offset="0.3" stop-color="#2ce9a9" />
+      <stop offset="0.57" stop-color="#10d5c3" />
+      <stop offset="0.8" stop-color="#0bc8dd" />
+      <stop offset="1" stop-color="#0aa9b9" />
+    </linearGradient>
+  </defs>
+
+  <!-- The transparent cutout is the same soft-triangle shape as the outside, only smaller. -->
+  <path
+    fill="url(#logo-gradient)"
+    fill-rule="evenodd"
+    d="
+      M256 105
+      C303 105 337 133 358 177
+      C380 223 396 266 396 291
+      C396 331 372 353 332 373
+      C290 394 239 407 201 407
+      C162 407 128 389 108 360
+      C88 330 91 291 112 251
+      C132 213 148 171 170 137
+      C192 106 220 105 256 105 Z
+      M256 187
+      C278 187 293 199 303 220
+      C313 241 320 261 320 272
+      C320 291 309 301 291 310
+      C272 319 248 325 231 325
+      C213 325 197 317 188 304
+      C179 290 180 272 190 254
+      C199 236 206 217 216 201
+      C226 187 239 187 256 187 Z" />
+</svg>

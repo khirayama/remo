@@ -1,0 +1,92 @@
+set shell := ["zsh", "-cu"]
+
+build:
+    xcodegen generate
+    xcodebuild -project Remo.xcodeproj -scheme Remo -configuration Debug -derivedDataPath build -destination 'generic/platform=iOS Simulator' CODE_SIGN_IDENTITY="-" build
+
+test target='iPhone 17':
+    #!/usr/bin/env zsh
+    set -euo pipefail
+
+    target="{{ target }}"
+    device_udid=$(
+      xcrun simctl list devices available --json \
+        | jq -er --arg target "$target" '
+          [
+            .devices
+            | to_entries[]
+            | .key as $runtime
+            | .value[]
+            | select(.udid == $target or .name == $target)
+            | { runtime: $runtime, udid }
+          ]
+          | sort_by(.runtime, .udid)
+          | last
+          | .udid
+        '
+    )
+
+    xcodegen generate
+    xcodebuild test -project Remo.xcodeproj -scheme Remo -destination "platform=iOS Simulator,id=$device_udid" CODE_SIGN_IDENTITY="-"
+
+build-release api_base_url='https://remo-api.just-do-it-my-life.workers.dev':
+    xcodegen generate
+    xcodebuild -project Remo.xcodeproj -scheme Remo -configuration Release -derivedDataPath build-release -destination 'generic/platform=iOS Simulator' CODE_SIGN_IDENTITY="-" REMO_API_BASE_URL="{{ api_base_url }}" build
+
+run:
+    xcrun simctl install booted build/Build/Products/Debug-iphonesimulator/Remo.app
+    xcrun simctl launch booted com.remo.app
+
+simulator-list:
+    xcrun simctl list devices available
+
+simulator target='iPhone 17':
+    #!/usr/bin/env zsh
+    set -euo pipefail
+
+    target="{{ target }}"
+
+    if [[ -z "$target" ]]; then
+      echo "usage: just simulator <device-name-or-udid>" >&2
+      exit 1
+    fi
+
+    open -a Simulator
+
+    device_json=$(
+      xcrun simctl list devices available --json \
+        | jq -cer --arg target "$target" '
+          .devices
+          | to_entries[]
+          | .key as $runtime
+          | .value[]
+          | select(.udid == $target or .name == $target)
+          | {
+              runtime: $runtime,
+              udid,
+              name,
+              dataPath,
+              deviceTypeIdentifier
+            }
+          ' \
+        | head -n 1
+    )
+
+    target_udid=$(jq -r '.udid' <<<"$device_json")
+    data_path=$(jq -r '.dataPath' <<<"$device_json")
+
+    if [[ ! -d "$data_path" ]]; then
+      runtime=$(jq -r '.runtime' <<<"$device_json")
+      name=$(jq -r '.name' <<<"$device_json")
+      device_type=$(jq -r '.deviceTypeIdentifier' <<<"$device_json")
+
+      echo "Recreating stale simulator $target_udid ($name, $runtime)" >&2
+      xcrun simctl delete "$target_udid" >/dev/null 2>&1 || true
+      target_udid=$(xcrun simctl create "$name" "$device_type" "$runtime")
+    fi
+
+    xcrun simctl boot "$target_udid"
+    xcrun simctl bootstatus "$target_udid" -b
+
+screenshot target='current':
+    xcrun simctl io booted screenshot ios_{{ target }}.png

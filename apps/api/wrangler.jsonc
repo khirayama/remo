@@ -1,0 +1,71 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "account_id": "3be94fe02250b737f7a9dcec19a3be39",
+  "name": "remo-api-dev",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-07-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "remo-db",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [{ "binding": "PHOTO_PREVIEWS", "bucket_name": "remo-photo-previews-dev" }],
+  "ratelimits": [
+    { "name": "AUTH_RATE_LIMITER", "namespace_id": "2001", "simple": { "limit": 10, "period": 60 } }
+  ],
+  "vars": {
+    "APP_ENV": "development",
+    "CORS_ALLOWED_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173",
+    "BETTER_AUTH_TRUSTED_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173,remo://auth"
+  },
+  "env": {
+    "development": {
+      "name": "remo-api-dev",
+      "r2_buckets": [{ "binding": "PHOTO_PREVIEWS", "bucket_name": "remo-photo-previews-dev" }],
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "remo-db",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "ratelimits": [
+        { "name": "AUTH_RATE_LIMITER", "namespace_id": "2001", "simple": { "limit": 10, "period": 60 } }
+      ],
+      "vars": {
+        "APP_ENV": "development",
+        "APP_PUBLIC_URL": "http://localhost:8787",
+        "CORS_ALLOWED_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173",
+        "BETTER_AUTH_TRUSTED_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173,remo://auth"
+      }
+    },
+    "production": {
+      "name": "remo-api",
+      "r2_buckets": [{ "binding": "PHOTO_PREVIEWS", "bucket_name": "remo-photo-previews" }],
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "remo-db",
+          "database_id": "22479f90-3b69-4a78-94cc-d947ad555d53",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "ratelimits": [
+        { "name": "AUTH_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+      ],
+      "triggers": { "crons": ["17 3 * * *"] },
+      "vars": {
+        "APP_ENV": "production",
+        "CORS_ALLOWED_ORIGINS": "https://remo-api.just-do-it-my-life.workers.dev,https://remo-web.pages.dev,https://remo-web.just-do-it-my-life.workers.dev",
+        "APP_PUBLIC_URL": "https://remo-api.just-do-it-my-life.workers.dev",
+        "BETTER_AUTH_TRUSTED_ORIGINS": "https://remo-api.just-do-it-my-life.workers.dev,https://remo-web.pages.dev,https://remo-web.just-do-it-my-life.workers.dev,remo://auth"
+      }
+    }
+  }
+}

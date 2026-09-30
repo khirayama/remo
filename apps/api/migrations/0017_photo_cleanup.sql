@@ -1,0 +1,3 @@
+CREATE TABLE photo_cleanup (
+  prefix TEXT PRIMARY KEY NOT NULL
+) WITHOUT ROWID;

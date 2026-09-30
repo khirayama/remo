@@ -1,0 +1,3 @@
+-- issuer was included in 0001_auth.sql for fresh databases.
+-- Keep this migration as a no-op so fresh and existing databases share the
+-- same migration history without attempting to add the column twice.

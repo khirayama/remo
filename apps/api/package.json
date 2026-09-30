@@ -1,0 +1,27 @@
+{
+  "name": "@remo/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run db:migrate:local && wrangler dev --env development",
+    "db:migrate:local": "wrangler d1 migrations apply remo-db --local --env development",
+    "db:migrate:remote": "wrangler d1 migrations apply remo-db --remote --env production",
+    "deploy:production": "wrangler deploy --env production",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@better-auth/drizzle-adapter": "^1.7.2",
+    "better-auth": "^1.7.2",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.9.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260831.1",
+    "@types/node": "^24.13.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4",
+    "wrangler": "4.127.1"
+  }
+}

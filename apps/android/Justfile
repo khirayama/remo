@@ -1,0 +1,35 @@
+set shell := ["zsh", "-cu"]
+
+lint:
+    ./gradlew lintDebug
+
+test:
+    ./gradlew testDebugUnitTest
+
+build:
+    ./gradlew assembleDebug
+
+build-release api_base_url='https://remo-api.just-do-it-my-life.workers.dev':
+    ./gradlew assembleRelease -PapiBaseUrl="{{ api_base_url }}"
+    test -f app/build/outputs/apk/release/app-release.apk
+
+run:
+    adb install -r app/build/outputs/apk/debug/app-debug.apk || { adb uninstall com.remo.app || true; adb install app/build/outputs/apk/debug/app-debug.apk; }
+    adb shell monkey -p com.remo.app -c android.intent.category.LAUNCHER 1
+
+run-clean:
+    adb uninstall com.remo.app || true
+    adb install app/build/outputs/apk/debug/app-debug.apk
+    adb shell monkey -p com.remo.app -c android.intent.category.LAUNCHER 1
+
+emulator-list:
+    emulator -list-avds
+
+# Quick boot restores a snapshot whose virtual Wi-Fi routing table can come back
+# empty, which silently cuts the app off from the host API on 10.0.2.2. Cold boot
+# instead: slower to start, but the network is always wired up.
+emulator target='Pixel_9_API_35':
+    nohup emulator -avd {{ target }} -no-snapshot-load > emulator.log 2>&1 &
+
+screenshot target='current':
+    adb -s emulator-5554 exec-out screencap -p > android_{{ target }}.png

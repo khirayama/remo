@@ -1,0 +1,8 @@
+[
+  { "featureType": "poi.business", "stylers": [{ "visibility": "off" }] },
+  { "featureType": "poi", "elementType": "labels.icon", "stylers": [{ "saturation": -70 }, { "lightness": 25 }] },
+  { "featureType": "poi", "elementType": "labels.text.fill", "stylers": [{ "color": "#7c8a80" }] },
+  { "featureType": "poi.park", "elementType": "geometry.fill", "stylers": [{ "color": "#dcebdc" }] },
+  { "featureType": "transit", "elementType": "labels.icon", "stylers": [{ "saturation": -60 }] },
+  { "featureType": "water", "elementType": "geometry.fill", "stylers": [{ "color": "#cfe3e6" }] }
+]
