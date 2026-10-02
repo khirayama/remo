@@ -34,11 +34,11 @@
 		<true/>
 	</dict>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>アプリを閉じている間も移動ログを自動記録するために使用します。</string>
+	<string>アプリを閉じている間も現在地を記録し、1日の移動と滞在を地図のタイムラインにまとめるために使用します。</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>ログに現在地を添付するために使用します。</string>
+	<string>現在地を記録し、1日の移動と滞在を地図のタイムラインにまとめるために使用します。</string>
 	<key>NSMotionUsageDescription</key>
-	<string>移動状態を検知してバッテリー消費を抑えるために使用します。</string>
+	<string>静止しているかどうかを判定し、位置情報の記録間隔を広げてバッテリー消費を抑えるために使用します。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>写真ライブラリを読み込み、撮影日時と位置からタイムラインを作ります。ログイン中は縮小した写真をバックアップします。</string>
 	<key>REMO_API_BASE_URL</key>

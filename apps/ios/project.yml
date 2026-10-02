@@ -28,9 +28,9 @@ targets:
         REMO_API_BASE_URL: "$(REMO_API_BASE_URL)"
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
-        NSLocationWhenInUseUsageDescription: ログに現在地を添付するために使用します。
-        NSLocationAlwaysAndWhenInUseUsageDescription: アプリを閉じている間も移動ログを自動記録するために使用します。
-        NSMotionUsageDescription: 移動状態を検知してバッテリー消費を抑えるために使用します。
+        NSLocationWhenInUseUsageDescription: 現在地を記録し、1日の移動と滞在を地図のタイムラインにまとめるために使用します。
+        NSLocationAlwaysAndWhenInUseUsageDescription: アプリを閉じている間も現在地を記録し、1日の移動と滞在を地図のタイムラインにまとめるために使用します。
+        NSMotionUsageDescription: 静止しているかどうかを判定し、位置情報の記録間隔を広げてバッテリー消費を抑えるために使用します。
         NSPhotoLibraryUsageDescription: 写真ライブラリを読み込み、撮影日時と位置からタイムラインを作ります。ログイン中は縮小した写真をバックアップします。
         BGTaskSchedulerPermittedIdentifiers:
           - com.remo.app.backup-refresh
@@ -41,6 +41,9 @@ targets:
     sources:
       - path: Remo/Sources
       - Remo/Assets.xcassets
+      - Remo/PrivacyInfo.xcprivacy
+    dependencies:
+      - sdk: libsqlite3.tbd
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.remo.app
