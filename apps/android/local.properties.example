@@ -1,2 +1,8 @@
 apiBaseUrl=http://10.0.2.2:8787
 mapsApiKey=YOUR_GOOGLE_MAPS_API_KEY
+# Release signing (or REMO_RELEASE_STORE_FILE etc. environment variables).
+# Without these, release builds are signed with the debug key and are not for distribution.
+#releaseStoreFile=keystore/remo-release.jks
+#releaseStorePassword=
+#releaseKeyAlias=remo
+#releaseKeyPassword=

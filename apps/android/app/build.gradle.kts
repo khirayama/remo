@@ -20,6 +20,16 @@ val mapsApiKey = providers.gradleProperty("mapsApiKey")
     .orElse(providers.provider { localProperties.getProperty("mapsApiKey", "") })
     .get()
 
+// Release signing comes from gradle properties, environment variables or
+// local.properties (releaseStoreFile, releaseStorePassword, releaseKeyAlias,
+// releaseKeyPassword). Without them, release builds fall back to the debug key
+// so they stay installable for local verification only.
+fun signingValue(name: String): String? = providers.gradleProperty(name)
+    .orElse(providers.environmentVariable("REMO_" + name.replace(Regex("([A-Z])"), "_$1").uppercase()))
+    .orElse(providers.provider { localProperties.getProperty(name) ?: "" })
+    .get().takeIf(String::isNotBlank)
+val releaseStoreFile = signingValue("releaseStoreFile")
+
 fun buildConfigString(value: String): String =
     "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
@@ -31,20 +41,35 @@ android {
         applicationId = providers.gradleProperty("applicationId").orElse("com.remo.app").get()
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        // Each store upload needs a higher code: pass -PversionCode=<n> (and
+        // -PversionName=<x.y.z>) from the release pipeline.
+        versionCode = providers.gradleProperty("versionCode").map(String::toInt).orElse(1).get()
+        versionName = providers.gradleProperty("versionName").orElse("0.1.0").get()
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         manifestPlaceholders["MAPS_API_KEY"] = mapsApiKey
+    }
+
+    signingConfigs {
+        if (releaseStoreFile != null) {
+            create("release") {
+                storeFile = rootProject.file(releaseStoreFile)
+                storePassword = signingValue("releaseStorePassword")
+                keyAlias = signingValue("releaseKeyAlias")
+                keyPassword = signingValue("releaseKeyPassword")
+            }
+        }
     }
 
     buildTypes {
         debug { buildConfigField("String", "API_BASE_URL", buildConfigString(debugApiBaseUrl)) }
         release {
             buildConfigField("String", "API_BASE_URL", buildConfigString(releaseApiBaseUrl))
-            isMinifyEnabled = false
-            // Keep the local release build installable for device verification.
-            // A production distribution must replace this with its private release key.
-            signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            signingConfig = if (releaseStoreFile != null) signingConfigs.getByName("release") else {
+                logger.warn("Release signing is not configured; signing the release build with the debug key (not for distribution).")
+                signingConfigs.getByName("debug")
+            }
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
@@ -74,6 +99,8 @@ dependencies {
     implementation(libs.play.services.location)
     implementation(libs.androidx.work.runtime)
     testImplementation(libs.junit)
+    // android.jar only has org.json stubs; the golden test parses the shared fixture.
+    testImplementation("org.json:json:20250517")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
