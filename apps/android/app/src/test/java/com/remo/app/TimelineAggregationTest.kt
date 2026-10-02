@@ -539,4 +539,16 @@ class TimelineAggregationTest {
         assertEquals(2, history.dayCount)
         assertEquals(3 * 20 * minute, history.totalDurationMs)
     }
+
+    @Test fun joinsMovementsThatEndUpNextToEachOther() {
+        val first = TimelineActivity("m1", TimelineActivityKind.MOVEMENT, 0, 10 * minute, 10 * minute, path = listOf(LatLng(35.0, 139.0), LatLng(35.1, 139.0)), from = LatLng(35.0, 139.0), to = LatLng(35.1, 139.0), distanceMeters = 100.0)
+        val second = TimelineActivity("m2", TimelineActivityKind.MOVEMENT, 5 * minute, 20 * minute, 15 * minute, path = listOf(LatLng(35.1, 139.0), LatLng(35.2, 139.0)), from = LatLng(35.1, 139.0), to = LatLng(35.2, 139.0), distanceMeters = 100.0)
+        val stay = TimelineActivity("s", TimelineActivityKind.STAY, 20 * minute, 30 * minute, 10 * minute)
+        val merged = mergeAdjacentMovements(listOf(first, second, stay))
+        assertEquals(listOf("m1", "s"), merged.map(TimelineActivity::id))
+        assertEquals(20 * minute, merged[0].durationMs)
+        assertEquals(LatLng(35.2, 139.0), merged[0].to)
+        assertEquals(200.0, merged[0].distanceMeters!!, 0.0)
+        assertEquals(3, merged[0].path.size)
+    }
 }
