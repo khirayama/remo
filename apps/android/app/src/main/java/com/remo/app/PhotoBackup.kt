@@ -3,7 +3,6 @@ package com.remo.app
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import androidx.core.content.edit
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -39,10 +38,31 @@ object PhotoBackup {
         return null
     }
 
-    suspend fun uploadPending(context: Context, events: List<LogEntry>, token: String): Boolean = withContext(Dispatchers.IO) {
+    /** What the last complete pass covered; nothing is scanned again until one of these changes. */
+    private data class CompletedPass(val account: String, val indexGeneration: Long, val photoRevision: Long)
+    @Volatile private var completedPass: CompletedPass? = null
+
+    private fun requireReachable(code: Int) {
+        if (code == 401) throw ApiException(401, "Authentication required", "unauthorized")
+    }
+
+    /**
+     * Uploads previews of photos that are not backed up yet and tells the server which
+     * previews each changed record still has. Returns true while work remains.
+     */
+    suspend fun uploadPending(context: Context, token: String): Boolean = withContext(Dispatchers.IO) {
         val account = SecureTokenStore.accountId() ?: return@withContext false
-        val active = events.filter { it.source == EventSource.PHOTO }.mapTo(HashSet()) { it.id }
-        val preferences = context.getSharedPreferences("rem_photo_backup_$account", Context.MODE_PRIVATE)
+        val store = LogStore.get(context)
+        val index = PhotoIndexStore.get(context)
+        val pass = CompletedPass(account, PhotoLibrary.indexGeneration, store.revision)
+        // Walking the whole library on every backup is wasted work when neither
+        // the library nor the records changed since everything was uploaded.
+        if (completedPass == pass) return@withContext false
+        val active = store.photoEntries().mapTo(HashSet()) { it.id }
+        val markers = index.uploadedMarkers(account).toMutableMap()
+        val manifests = index.pendingManifests()
+        /** Digests of the previews each record waiting for a manifest still has; null once one is unknown. */
+        val digests = manifests.associateWithTo(HashMap<String, MutableList<String>?>()) { mutableListOf() }
         var uploaded = 0
         var unavailable = false
         for (photo in PhotoLibrary.queryAll(context)) {
@@ -51,11 +71,16 @@ object PhotoBackup {
             val eventId = PhotoLibrary.eventIdFor(context, photo) ?: continue
             if (eventId !in active) continue
             val marker = "${photo.id}:${photo.modifiedAt}:${photo.size}:$eventId"
-            if (preferences.getBoolean(marker, false)) continue
+            val known = markers[marker]
+            // A preview uploaded before digests were kept is uploaded once more
+            // when its record needs a manifest, to learn its digest.
+            if (marker in markers && (known != null || eventId !in manifests)) {
+                if (known != null) digests[eventId]?.add(known)
+                continue
+            }
             val bitmap = PhotoLibrary.loadThumbnail(context, photo, 640)
-            if (bitmap == null) { unavailable = true; continue }
-            val bytes = jpeg(bitmap)
-            if (bytes == null) { unavailable = true; continue }
+            val bytes = bitmap?.let(::jpeg)
+            if (bytes == null) { unavailable = true; digests[eventId] = null; continue }
             val digest = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
             val request = connection("$eventId/$digest", token)
             try {
@@ -64,12 +89,48 @@ object PhotoBackup {
                 request.setFixedLengthStreamingMode(bytes.size)
                 request.doOutput = true
                 request.outputStream.use { it.write(bytes) }
+                requireReachable(request.responseCode)
                 if (request.responseCode !in 200..299) return@withContext true
-                preferences.edit { putBoolean(marker, true) }
+                index.markUploaded(account, marker, digest)
+                markers[marker] = digest
+                digests[eventId]?.add(digest)
                 uploaded++
             } finally { request.disconnect() }
         }
-        unavailable
+        var manifestsPending = false
+        for (eventId in manifests) {
+            val current = digests[eventId]
+            when {
+                // The record is gone; deleting it removed its previews.
+                eventId !in active -> index.clearPendingManifest(eventId)
+                // A record always keeps at least one photo. An empty list means its
+                // photos were not seen in this pass (library access changed), and
+                // sending it would remove every preview.
+                current.isNullOrEmpty() -> manifestsPending = true
+                sendManifest(eventId, current, token) -> index.clearPendingManifest(eventId)
+                else -> manifestsPending = true
+            }
+        }
+        if (!unavailable && !manifestsPending) completedPass = pass
+        unavailable || manifestsPending
+    }
+
+    /** Tells the server which previews a record still has; it removes the others. */
+    private fun sendManifest(eventId: String, digests: List<String>, token: String): Boolean {
+        val request = connection(eventId, token)
+        return try {
+            request.requestMethod = "PUT"
+            request.setRequestProperty("Content-Type", "application/json")
+            request.doOutput = true
+            request.outputStream.use { it.write(JSONObject().put("digests", org.json.JSONArray(digests)).toString().toByteArray(Charsets.UTF_8)) }
+            requireReachable(request.responseCode)
+            // 404: the record is not in the backup (yet); there is nothing to remove.
+            request.responseCode in 200..299 || request.responseCode == 404
+        } catch (error: ApiException) {
+            throw error
+        } catch (_: Exception) {
+            false
+        } finally { request.disconnect() }
     }
 
     suspend fun remoteThumbnail(eventId: String): Bitmap? = withContext(Dispatchers.IO) {

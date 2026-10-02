@@ -10,12 +10,22 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     @Published private(set) var assets: [PHAsset] = []
     @Published private(set) var revision = 0
 
+    private var observing = false
+
     override init() {
         super.init()
-        PHPhotoLibrary.shared().register(self)
+        observeIfDetermined()
     }
 
-    deinit { PHPhotoLibrary.shared().unregisterChangeObserver(self) }
+    deinit { if observing { PHPhotoLibrary.shared().unregisterChangeObserver(self) } }
+
+    /// Registering for changes makes the system ask for photo access, so it
+    /// waits until the user has answered that question once.
+    private func observeIfDetermined() {
+        guard !observing, PHPhotoLibrary.authorizationStatus(for: .readWrite) != .notDetermined else { return }
+        observing = true
+        PHPhotoLibrary.shared().register(self)
+    }
 
     var hasAccess: Bool { status == .authorized || status == .limited }
 
@@ -26,10 +36,12 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] value in
                 Task { @MainActor in
                     self?.status = value
+                    self?.observeIfDetermined()
                     self?.reload()
                 }
             }
         case .authorized, .limited:
+            observeIfDetermined()
             reload()
         default:
             assets = []

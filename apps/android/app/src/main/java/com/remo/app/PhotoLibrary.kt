@@ -13,20 +13,20 @@ import android.provider.MediaStore
 import android.util.LruCache
 import android.util.Size
 import androidx.core.content.ContextCompat
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.FileNotFoundException
-import java.security.MessageDigest
-import java.text.SimpleDateFormat
-import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.yield
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.withLock
 
 data class LibraryPhoto(val id: Long, val uri: Uri, val takenAt: Long, val mediaType: MediaType, val modifiedAt: Long = 0L, val size: Long = 0L)
-data class PhotoImportResult(val entries: List<LogEntry>)
+data class PhotoImportResult(
+    val entries: List<LogEntry>,
+    /** Photo records this device created that no longer match any photo; removed by the caller. */
+    val staleEventIds: Set<String> = emptySet(),
+    /** New record id to the record whose location correction it takes over. */
+    val inheritedCorrections: Map<String, String> = emptyMap(),
+)
 
 internal fun isCachedPhotoValid(
     cachedTakenAt: Long?, cachedMediaType: MediaType?, cachedModifiedAt: Long?, cachedSize: Long?,
@@ -34,13 +34,8 @@ internal fun isCachedPhotoValid(
 ): Boolean = !permissionChanged && photo.modifiedAt > 0L && cachedTakenAt == photo.takenAt && cachedMediaType == photo.mediaType &&
     cachedModifiedAt == photo.modifiedAt && cachedSize == photo.size
 
-private data class PhotoGroup(val key: String, var latestTakenAt: Long = 0, var latitude: Double? = null, var longitude: Double? = null, var mediaType: MediaType = MediaType.PHOTO, var count: Int = 0)
 
 object PhotoLibrary {
-    private const val CACHE_PREFS = "photo_library_index"
-    private const val CACHE_KEY = "entries"
-    private const val PERMISSION_KEY = "permission_signature"
-    private data class CachedPhoto(val takenAt: Long, val mediaType: MediaType, val modifiedAt: Long, val size: Long, val coordinate: Pair<Double, Double>?)
     private data class ExifResult(val coordinate: Pair<Double, Double>?, val reliable: Boolean)
     private val thumbnailCache = object : LruCache<String, Bitmap>(8 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = (value.byteCount / 1024).coerceAtLeast(1)
@@ -89,27 +84,35 @@ object PhotoLibrary {
 
     fun queryAll(context: Context): List<LibraryPhoto> = query(context, null, true)
 
+    /** Changes whenever a scan found the library different from the stored index. */
+    @Volatile var indexGeneration = 0L
+        private set
+
     private val indexMutex = kotlinx.coroutines.sync.Mutex()
-    private var memoryCache: Pair<String?, Map<Long, CachedPhoto>>? = null
+    private var memoryCache: Pair<String?, Map<Long, PhotoIndexStore.Row>>? = null
 
     suspend fun clearCache(context: Context) = withContext(Dispatchers.IO) {
         indexMutex.withLock {
             memoryCache = null
+            indexGeneration += 1
             thumbnailCache.evictAll()
-            context.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+            PhotoIndexStore.get(context).clear()
         }
     }
 
-    suspend fun indexAll(context: Context, onBatch: suspend (List<LogEntry>) -> Unit = {}): PhotoImportResult = withContext(Dispatchers.IO) {
+    /** Scans the library into photo records. [existingEventIds] are the photo records already on this device. */
+    suspend fun indexAll(context: Context, existingEventIds: Set<String> = emptySet()): PhotoImportResult = withContext(Dispatchers.IO) {
         indexMutex.lock()
         try {
             val photos = query(context, null, false)
             if (!hasAnyAccess(context)) return@withContext PhotoImportResult(emptyList())
-            val cache = memoryCache ?: loadCache(context).also { memoryCache = it }
+            val store = PhotoIndexStore.get(context)
+            val cache = memoryCache ?: store.load().also { memoryCache = it }
             val signature = permissionSignature(context)
             val permissionChanged = cache.first != signature
-            val groups = linkedMapOf<String, PhotoGroup>()
-            val nextCache = linkedMapOf<Long, CachedPhoto>()
+            val sessionGrouping = store.sessionGrouping()
+            val scanned = linkedMapOf<Long, PhotoIndexStore.Row>()
+            val groupable = ArrayList<GroupablePhoto>(photos.size)
             photos.forEach { photo ->
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 val cached = cache.second[photo.id]
@@ -123,70 +126,67 @@ object PhotoLibrary {
                 // Retain a previously readable coordinate and retry on the next scan.
                 val coordinate = if (exif.reliable) exif.coordinate else cached?.coordinate
                 val takenAt = if (!exif.reliable && cached != null) cached.takenAt else photo.takenAt
-                val key = groupKey(takenAt, coordinate, photo.mediaType)
-                val group = groups.getOrPut(key) { PhotoGroup(key, mediaType = photo.mediaType) }
-                group.latestTakenAt = maxOf(group.latestTakenAt, takenAt)
-                group.count += 1
-                if (coordinate != null) {
-                    group.latitude = group.latitude ?: coordinate.first
-                    group.longitude = group.longitude ?: coordinate.second
-                }
-                if (exif.reliable) nextCache[photo.id] = CachedPhoto(photo.takenAt, photo.mediaType, photo.modifiedAt, photo.size, coordinate)
-                else if (cached != null) nextCache[photo.id] = cached.copy(modifiedAt = -1L)
+                groupable += GroupablePhoto(photo.id, takenAt, photo.mediaType, coordinate, cached?.eventId)
+                scanned[photo.id] = if (exif.reliable) PhotoIndexStore.Row(photo.takenAt, photo.mediaType, photo.modifiedAt, photo.size, coordinate, cached?.eventId)
+                    else cached?.copy(modifiedAt = -1L) ?: PhotoIndexStore.Row(photo.takenAt, photo.mediaType, -1L, photo.size, null, null)
             }
-            // Publish complete aggregates: partial counts could otherwise overwrite
-            // an existing group when a scan is cancelled or interrupted.
-            val entries = makeEntries(groups.values)
-            entries.chunked(100).forEach { batch -> onBatch(batch); yield() }
-            val next = signature to nextCache.toMap()
-            if (cache != next) saveCache(context, signature, nextCache)
+            val groups = groupLibraryPhotos(groupable, existingEventIds, legacyEventId = if (sessionGrouping) null else { photo ->
+                legacyPhotoEventId(photo.takenAt, photo.coordinate, photo.mediaType)
+            })
+            val assigned = scanned.toMutableMap()
+            groups.forEach { group -> group.photoIds.forEach { id -> assigned[id]?.let { assigned[id] = it.copy(eventId = group.eventId) } } }
+            // Only complete aggregates are returned: partial counts could otherwise
+            // overwrite an existing group when a scan is cancelled or interrupted.
+            val entries = makeEntries(groups)
+
+            // Records this device created for photos that are no longer in any
+            // group (deleted photos, regrouped sessions, migrated day records).
+            // Only a complete view of the library can tell a photo is gone.
+            val current = groups.mapTo(HashSet()) { it.eventId }
+            val previous = cache.second.values.mapNotNullTo(HashSet()) { it.eventId }
+            val legacy = if (sessionGrouping) emptySet() else groupable.mapTo(HashSet()) { legacyPhotoEventId(it.takenAt, it.coordinate, it.mediaType) }
+            val stale = if (hasFullLibraryAccess(context) && photos.isNotEmpty()) (previous + legacy) - current else emptySet()
+
+            // Records that lost a photo since the last scan. As with stale
+            // records, only a complete view of the library can tell.
+            val shrunk = if (hasFullLibraryAccess(context) && photos.isNotEmpty()) {
+                cache.second.mapNotNullTo(HashSet()) { (photoId, row) -> row.eventId?.takeIf { it != assigned[photoId]?.eventId } }
+            } else emptySet()
+            val next = signature to assigned.toMap()
+            if (cache != next || !sessionGrouping) {
+                store.replace(signature, assigned, completedGrouping = true, changedEvents = shrunk)
+                indexGeneration += 1
+            }
             memoryCache = next
-            PhotoImportResult(entries)
+            PhotoImportResult(entries, staleEventIds = stale, inheritedCorrections = groups.mapNotNull { group -> group.inheritsFrom?.let { group.eventId to it } }.toMap())
         } finally {
             indexMutex.unlock()
         }
+    }
+
+    /** Every photo and video is visible: no partial ("selected photos") access. */
+    private fun hasFullLibraryAccess(context: Context): Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED
+    } else {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun permissionSignature(context: Context): String = readPermissions().joinToString(",") {
         "$it=${ContextCompat.checkSelfPermission(context, it)}"
     } + "|${java.util.TimeZone.getDefault().id}|" + if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) MediaStore.getVersion(context) else "legacy"
 
-    private fun loadCache(context: Context): Pair<String?, Map<Long, CachedPhoto>> {
-        val prefs = context.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE)
-        val result = mutableMapOf<Long, CachedPhoto>()
-        runCatching {
-            val array = JSONArray(prefs.getString(CACHE_KEY, "[]"))
-            for (i in 0 until array.length()) {
-                val item = array.getJSONObject(i)
-                val coordinate = if (item.has("lat") && item.has("lon")) item.getDouble("lat") to item.getDouble("lon") else null
-                result[item.getLong("id")] = CachedPhoto(item.getLong("taken"), if (item.getString("type") == MediaType.VIDEO.wireValue) MediaType.VIDEO else MediaType.PHOTO, item.optLong("modified"), item.optLong("size"), coordinate)
-            }
-        }
-        return prefs.getString(PERMISSION_KEY, null) to result
-    }
-
-    private fun saveCache(context: Context, signature: String, cache: Map<Long, CachedPhoto>) {
-        val array = JSONArray()
-        cache.forEach { (id, item) ->
-            array.put(JSONObject().apply { put("id", id); put("taken", item.takenAt); put("type", item.mediaType.wireValue); put("modified", item.modifiedAt); put("size", item.size)
-                item.coordinate?.let { put("lat", it.first); put("lon", it.second) } })
-        }
-        context.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).edit().putString(CACHE_KEY, array.toString()).putString(PERMISSION_KEY, signature).apply()
-    }
-
-    private fun makeEntries(groups: Collection<PhotoGroup>): List<LogEntry> {
+    private fun makeEntries(groups: Collection<PhotoGroupAssignment>): List<LogEntry> {
         val now = System.currentTimeMillis()
         return groups.map { group ->
-            val latest = group.latestTakenAt.takeIf { it > 0 } ?: now
-            LogEntry(id = stableUUID("photo:${group.key}"), startedAt = latest, latitude = group.latitude, longitude = group.longitude, originalLatitude = group.latitude, originalLongitude = group.longitude, locationSource = if (hasUsableCoordinates(group.latitude, group.longitude)) PhotoLocationSource.EXIF else null, mediaType = group.mediaType, photoCount = group.count, source = EventSource.PHOTO, updatedAt = now)
+            val startedAt = group.startedAt.takeIf { it > 0 } ?: now
+            LogEntry(id = group.eventId, startedAt = startedAt, latitude = group.latitude, longitude = group.longitude, originalLatitude = group.latitude, originalLongitude = group.longitude, locationSource = if (hasUsableCoordinates(group.latitude, group.longitude)) PhotoLocationSource.EXIF else null, mediaType = group.mediaType, photoCount = group.count, source = EventSource.PHOTO, updatedAt = now)
         }.sortedByDescending { it.startedAt }
     }
 
-    fun eventIdFor(context: Context, photo: LibraryPhoto): String? {
-        val indexed = (memoryCache ?: loadCache(context).also { memoryCache = it }).second[photo.id] ?: return null
-        val key = groupKey(photo.takenAt, indexed.coordinate, photo.mediaType)
-        return stableUUID("photo:$key")
-    }
+    /** The timeline record the last scan assigned [photo] to. */
+    fun eventIdFor(context: Context, photo: LibraryPhoto): String? =
+        memoryCache?.second?.get(photo.id)?.eventId ?: PhotoIndexStore.get(context).eventId(photo.id)
 
     fun loadThumbnail(context: Context, photo: LibraryPhoto, sizePx: Int): Bitmap? = runCatching {
         if (!hasAnyAccess(context)) { thumbnailCache.evictAll(); return@runCatching null }
@@ -226,17 +226,6 @@ object PhotoLibrary {
         } else {
             values[0].toDouble() to values[1].toDouble()
         }
-    }
-
-    private fun groupKey(timestamp: Long, coordinate: Pair<Double, Double>?, mediaType: MediaType): String {
-        val day = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(timestamp)
-        val location = coordinate?.let { "${"%.4f".format(Locale.US, it.first)}|${"%.4f".format(Locale.US, it.second)}" } ?: "none"
-        return if (mediaType == MediaType.VIDEO) "$day|$location|video" else "$day|$location"
-    }
-
-    private fun stableUUID(value: String): String {
-        val hex = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8)).take(16).joinToString("") { "%02x".format(it) }
-        return "${hex.substring(0, 8)}-${hex.substring(8, 12)}-5${hex.substring(13, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}"
     }
 
     private fun calculateSample(width: Int, height: Int, target: Int): Int {

@@ -1,6 +1,6 @@
 import { loadPhotoPreview, makeBackupThumbnail } from "./photo-storage";
 
-const baseURL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8787").replace(/\/$/, "");
+import { apiBaseURL as baseURL } from "./api-base";
 
 export async function uploadPhotoPreview(storageId: string, eventId: string): Promise<boolean> {
   const stored = await loadPhotoPreview(storageId, eventId);
