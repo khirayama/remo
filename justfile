@@ -58,6 +58,10 @@ api:
 api-deploy:
     cd apps/api && npm run deploy:production
 
+deploy-all:
+    just web-deploy
+    just api-deploy
+
 # Saves the production database as SQL before a migration that rewrites tables.
 api-backup file='remo-db-backup.sql':
     cd apps/api && npx wrangler d1 export remo-db --remote --env production --output "{{ file }}"
