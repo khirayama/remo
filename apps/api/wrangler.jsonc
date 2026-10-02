@@ -3,7 +3,7 @@
   "account_id": "3be94fe02250b737f7a9dcec19a3be39",
   "name": "remo-api-dev",
   "main": "src/index.ts",
-  "compatibility_date": "2025-07-12",
+  "compatibility_date": "2026-09-18",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
   "d1_databases": [
@@ -16,7 +16,8 @@
   ],
   "r2_buckets": [{ "binding": "PHOTO_PREVIEWS", "bucket_name": "remo-photo-previews-dev" }],
   "ratelimits": [
-    { "name": "AUTH_RATE_LIMITER", "namespace_id": "2001", "simple": { "limit": 10, "period": 60 } }
+    { "name": "AUTH_RATE_LIMITER", "namespace_id": "2001", "simple": { "limit": 10, "period": 60 } },
+    { "name": "API_RATE_LIMITER", "namespace_id": "2002", "simple": { "limit": 600, "period": 60 } }
   ],
   "vars": {
     "APP_ENV": "development",
@@ -36,7 +37,9 @@
         }
       ],
       "ratelimits": [
-        { "name": "AUTH_RATE_LIMITER", "namespace_id": "2001", "simple": { "limit": 10, "period": 60 } }
+        { "name": "AUTH_RATE_LIMITER", "namespace_id": "2001", "simple": { "limit": 10, "period": 60 } },
+        { "name": "API_RATE_LIMITER", "namespace_id": "2002", "simple": { "limit": 600, "period": 60 } },
+    { "name": "API_RATE_LIMITER", "namespace_id": "2002", "simple": { "limit": 600, "period": 60 } }
       ],
       "vars": {
         "APP_ENV": "development",
@@ -57,14 +60,19 @@
         }
       ],
       "ratelimits": [
-        { "name": "AUTH_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+        { "name": "AUTH_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } },
+        { "name": "API_RATE_LIMITER", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } }
       ],
-      "triggers": { "crons": ["17 3 * * *"] },
+      "triggers": { "crons": ["17 * * * *"] },
       "vars": {
         "APP_ENV": "production",
-        "CORS_ALLOWED_ORIGINS": "https://remo-api.just-do-it-my-life.workers.dev,https://remo-web.pages.dev,https://remo-web.just-do-it-my-life.workers.dev",
+        // Only origins this project serves. A host that is no longer ours
+        // (an old Pages project name anyone can claim) must not be listed:
+        // Better Auth redirects password-reset links to trusted origins.
+        "CORS_ALLOWED_ORIGINS": "https://remo-api.just-do-it-my-life.workers.dev,https://remo-web.just-do-it-my-life.workers.dev",
         "APP_PUBLIC_URL": "https://remo-api.just-do-it-my-life.workers.dev",
-        "BETTER_AUTH_TRUSTED_ORIGINS": "https://remo-api.just-do-it-my-life.workers.dev,https://remo-web.pages.dev,https://remo-web.just-do-it-my-life.workers.dev,remo://auth"
+        "WEB_APP_URL": "https://remo-web.just-do-it-my-life.workers.dev",
+        "BETTER_AUTH_TRUSTED_ORIGINS": "https://remo-api.just-do-it-my-life.workers.dev,https://remo-web.just-do-it-my-life.workers.dev,remo://auth"
       }
     }
   }

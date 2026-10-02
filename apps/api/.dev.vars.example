@@ -4,3 +4,7 @@ APP_PUBLIC_URL=http://localhost:8787
 RESEND_API_KEY=
 MAIL_FROM=
 
+# Optional: sign-in waits for a confirmed email address (needs RESEND_API_KEY and MAIL_FROM)
+REQUIRE_EMAIL_VERIFICATION=
+# Where the browser lands after confirming an email address
+WEB_APP_URL=http://localhost:5173
