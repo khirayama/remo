@@ -7,6 +7,10 @@ final class RemoAppDelegate: NSObject, UIApplicationDelegate {
     private static let refreshIdentifier = "com.remo.app.backup-refresh"
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // After the system relaunches the app for a location event (the app was
+        // terminated, or the phone restarted), no view is created: recording
+        // has to start from here.
+        AutomaticCaptureService.shared.resumeInBackground()
         BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.refreshIdentifier, using: nil) { task in
             guard let refreshTask = task as? BGAppRefreshTask else {
                 task.setTaskCompleted(success: false)
@@ -38,13 +42,10 @@ final class RemoAppDelegate: NSObject, UIApplicationDelegate {
             return
         }
         do {
-            let store = LogStore()
-            let pendingDeletes = Array(store.pendingDeleteIDs)
-            try await LifeEventSync.delete(pendingDeletes)
-            pendingDeletes.forEach(store.markDeleteSynced)
-            let synchronized = try await LifeEventSync.synchronize(store.logs, pendingUpserts: store.pendingUpsertEntries)
-            store.replaceAll(synchronized.events)
-            store.markUpsertsSynced(synchronized.uploaded)
+            // The same coordinator as the foreground sync: the two never run at
+            // once, and what the download returns is applied record by record,
+            // so a sample captured meanwhile is never dropped.
+            _ = try await BackupCoordinator.shared.synchronize(pull: true)
             task.setTaskCompleted(success: true)
         } catch {
             task.setTaskCompleted(success: false)

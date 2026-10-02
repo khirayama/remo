@@ -14,6 +14,8 @@ object SecureTokenStore {
     private const val preferences = "rem_auth"
     private const val tokenKey = "better_auth_token"
     private const val accountIdKey = "account_id"
+    private const val accountEmailKey = "account_email"
+    private const val accountNameKey = "account_name"
     private const val keyAlias = "rem_better_auth_token"
 
     private fun secretKey(): SecretKey {
@@ -63,8 +65,28 @@ object SecureTokenStore {
         RemoApplication.context.getSharedPreferences(preferences, 0).edit { putString(accountIdKey, value) }
     }
 
+    /** Remembers who is signed in, so the app can start without reaching the API. */
+    fun setAccount(user: RemoUser) {
+        RemoApplication.context.getSharedPreferences(preferences, 0).edit {
+            putString(accountIdKey, user.id)
+            putString(accountEmailKey, user.email)
+            putString(accountNameKey, user.name)
+        }
+    }
+
+    /** The signed-in user as last confirmed by the API, or null when unknown. */
+    fun cachedAccount(): RemoUser? {
+        val stored = RemoApplication.context.getSharedPreferences(preferences, 0)
+        val id = stored.getString(accountIdKey, null)?.takeIf(String::isNotBlank) ?: return null
+        return RemoUser(id, stored.getString(accountEmailKey, null).orEmpty(), stored.getString(accountNameKey, null).orEmpty())
+    }
+
     fun clearAccountId() {
-        RemoApplication.context.getSharedPreferences(preferences, 0).edit { remove(accountIdKey) }
+        RemoApplication.context.getSharedPreferences(preferences, 0).edit {
+            remove(accountIdKey)
+            remove(accountEmailKey)
+            remove(accountNameKey)
+        }
     }
 
     fun clear() {

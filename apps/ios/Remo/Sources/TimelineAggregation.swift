@@ -833,24 +833,58 @@ func buildTimelineActivities(_ logs: [LogEntry], analysis: TimelineAnalysis? = n
         }
     }
 
+    // Location samples inside a stay's time range but outside the stay start a
+    // movement that overlaps it, so boundaries do not always meet exactly.
+    // After ordering (stable, like the other platforms), movements that end up
+    // next to each other are one.
+    let ordered = mergeAdjacentMovements(activities.enumerated()
+        .sorted { $0.element.startedAt != $1.element.startedAt ? $0.element.startedAt < $1.element.startedAt : $0.offset < $1.offset }
+        .map(\.element))
     var photosByActivity: [String: [LogEntry]] = [:]
-    for activity in activities {
+    for activity in ordered {
         photosByActivity[activity.id] = []
     }
     for photo in logs.filter({ $0.source == .photo }).sorted(by: { $0.startedAt < $1.startedAt }) {
-        let stay = activities.first { activity in
+        let stay = ordered.first { activity in
             activity.kind == .stay && photo.startedAt >= activity.startedAt && photo.startedAt <= activity.endedAt
         }
-        let movement = stay == nil ? activities.first { activity in
+        let movement = stay == nil ? ordered.first { activity in
             activity.kind == .movement && photo.startedAt >= activity.startedAt && photo.startedAt <= activity.endedAt
         } : nil
         if let activity = stay ?? movement { photosByActivity[activity.id, default: []].append(photo) }
     }
-    return activities.sorted { $0.startedAt < $1.startedAt }.map { activity in
+    return ordered.map { activity in
         var assigned = activity
         assigned.photos = photosByActivity[activity.id] ?? []
         return assigned
     }
+}
+
+/// Joins movements that are adjacent in time order into one movement.
+func mergeAdjacentMovements(_ activities: [TimelineActivity]) -> [TimelineActivity] {
+    var result: [TimelineActivity] = []
+    for activity in activities {
+        if let previous = result.last, previous.kind == .movement, activity.kind == .movement {
+            let endedAt = max(previous.endedAt, activity.endedAt)
+            result[result.count - 1] = TimelineActivity(
+                id: previous.id,
+                kind: .movement,
+                startedAt: previous.startedAt,
+                endedAt: endedAt,
+                duration: max(0, endedAt.timeIntervalSince(previous.startedAt)),
+                photos: previous.photos + activity.photos,
+                coordinate: nil,
+                from: previous.from,
+                to: activity.endedAt > previous.endedAt ? activity.to : previous.to,
+                path: previous.path + Array(activity.path.dropFirst()),
+                distance: (previous.distance ?? 0) + (activity.distance ?? 0),
+                entries: [],
+            )
+        } else {
+            result.append(activity)
+        }
+    }
+    return result
 }
 
 func stayCircleRadiusMeters(_ duration: TimeInterval) -> CLLocationDistance {

@@ -241,7 +241,7 @@ struct TimelineMapView: UIViewRepresentable {
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let line = overlay as? RoutePolyline {
                 let renderer = MKPolylineRenderer(polyline: line)
-                renderer.strokeColor = line.isFocus ? UIColor(hex: 0x085E54) : UIColor(hex: 0x0E8577, alpha: line.alpha)
+                renderer.strokeColor = line.isFocus ? RemoMapColor.focusRoute : RemoMapColor.route.withAlphaComponent(line.alpha)
                 renderer.lineWidth = line.isFocus ? 6 : 4
                 renderer.lineCap = .round
                 renderer.lineJoin = .round
@@ -254,8 +254,8 @@ struct TimelineMapView: UIViewRepresentable {
                 case .selected: (255, 90)
                 case .dimmed: (50, 14)
                 }
-                renderer.strokeColor = UIColor(hex: 0x2F5A45, alpha: stroke / 255)
-                renderer.fillColor = UIColor(hex: 0x2F5A45, alpha: fill / 255)
+                renderer.strokeColor = RemoMapColor.stay.withAlphaComponent(stroke / 255)
+                renderer.fillColor = RemoMapColor.stay.withAlphaComponent(fill / 255)
                 renderer.lineWidth = circle.state == .selected ? 2.5 : 1.5
                 return renderer
             }
@@ -460,7 +460,7 @@ private final class StayInfoView: MKAnnotationView {
         displayPriority = .required
         detailLabel.numberOfLines = 0
         detailLabel.font = .systemFont(ofSize: 12)
-        detailLabel.textColor = UIColor(hex: 0x55635A)
+        detailLabel.textColor = .secondaryLabel
         detailCalloutAccessoryView = detailLabel
     }
 

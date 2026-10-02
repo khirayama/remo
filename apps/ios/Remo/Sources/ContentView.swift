@@ -65,117 +65,68 @@ struct LogEntry: Codable, Identifiable, Equatable {
     var displayTitle: String { source == .photo ? "写真" : "位置情報" }
 }
 
+/// The app's single timeline. The UI, the location service and background
+/// refresh share this instance. The records themselves live in [LogDatabase]
+/// and are read from there when needed; `revision` changes whenever stored
+/// records change, and screens reload what they show from it.
 @MainActor
 final class LogStore: ObservableObject {
-    @Published private(set) var logs: [LogEntry] = []
-    private let key = "remo.log.entries"
-    private let deletedKey = "remo.log.pending-deletes"
-    private let pendingUpsertKey = "remo.log.pending-upserts"
+    static let shared = LogStore(database: .shared)
 
-    init() { reload() }
+    @Published private(set) var revision = 0
+    /// Set when a write could not be stored (for example, the disk is full).
+    @Published var writeFailed = false
+    let database: LogDatabase
 
-    func reload() {
-        guard let data = UserDefaults.standard.data(forKey: key), let saved = try? JSONDecoder().decode([LogEntry].self, from: data) else {
-            logs = []
-            return
+    init(database: LogDatabase) {
+        self.database = database
+        database.onChange = { [weak self] in Task { @MainActor [weak self] in self?.revision += 1 } }
+        database.onWriteFailure = { [weak self] in Task { @MainActor [weak self] in self?.writeFailed = true } }
+    }
+
+    func add(_ entry: LogEntry) { database.upsert([entry]) }
+
+    /// Writes the photo records of a library scan.
+    func upsertScanned(_ entries: [LogEntry]) { database.upsertScanned(entries) }
+
+    /// Stores imported records in batches, so a large file is not one long transaction.
+    func importAll(_ entries: [LogEntry]) {
+        for start in stride(from: 0, to: entries.count, by: 2_000) {
+            database.upsert(Array(entries[start..<min(start + 2_000, entries.count)]))
         }
-        // Entries written before the display-placement lock was introduced
-        // decode the optional field as nil; normalize them once on load so
-        // sync comparisons do not keep treating false and nil as different.
-        logs = saved.map { entry in
-            var normalized = entry
-            normalized.photoLocationAutoPlacementDisabled = entry.photoLocationAutoPlacementDisabled ?? false
-            normalized.mediaType = entry.mediaType ?? (entry.source == .photo ? .photo : nil)
-            return normalized
-        }.sorted { $0.startedAt > $1.startedAt }
     }
 
-    func add(_ entry: LogEntry) { upsertAll([entry]) }
+    func delete(_ entry: LogEntry) { database.delete([entry.id]) }
 
-    func upsertAll(_ entries: [LogEntry]) {
-        guard !entries.isEmpty else { return }
-        var byID = Dictionary(uniqueKeysWithValues: logs.map { ($0.id, $0) })
-        var changedIDs = Set<String>()
-        entries.forEach { candidate in
-            guard let current = byID[candidate.id] else {
-                byID[candidate.id] = candidate
-                changedIDs.insert(candidate.id)
-                return
-            }
-            let next = preservePhotoCorrection(current, candidate)
-            if !sameContent(current, next) {
-                byID[candidate.id] = next
-                changedIDs.insert(candidate.id)
-            }
-        }
-        logs = byID.values.sorted { $0.startedAt > $1.startedAt }
-        var pending = pendingUpsertIDs
-        pending.formUnion(changedIDs)
-        UserDefaults.standard.set(Array(pending), forKey: pendingUpsertKey)
-        persist()
+    func deleteAll(_ ids: Set<String>) { database.delete(Array(ids)) }
+
+    func clearAll() { database.clear() }
+}
+
+/// The names the user gave to places, shown instead of the geocoder's label.
+@MainActor
+final class NamedPlaces: ObservableObject {
+    static let shared = NamedPlaces()
+    @Published private(set) var places: [NamedPlace] = []
+
+    func reload(from database: LogDatabase = .shared) {
+        let loaded = database.places()
+        if loaded != places { places = loaded }
     }
 
-    func delete(_ entry: LogEntry) {
-        logs.removeAll { $0.id == entry.id }
-        var pending = pendingDeleteIDs
-        pending.insert(entry.id)
-        UserDefaults.standard.set(Array(pending), forKey: deletedKey)
-        UserDefaults.standard.set(Array(pendingUpsertIDs.subtracting([entry.id])), forKey: pendingUpsertKey)
-        persist()
+    /// The named place at `coordinate`, if there is one within the stay-place radius.
+    func place(at coordinate: CLLocationCoordinate2D) -> NamedPlace? {
+        places.lazy
+            .filter { !$0.deleted }
+            .map { ($0, distanceMeters(CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude), coordinate)) }
+            .filter { $0.1 <= stayPlaceRadiusMeters }
+            .min { $0.1 < $1.1 }?.0
     }
 
-    var pendingDeleteIDs: Set<String> { Set(UserDefaults.standard.stringArray(forKey: deletedKey) ?? []) }
-
-    func markDeleteSynced(_ id: String) {
-        UserDefaults.standard.set(Array(pendingDeleteIDs.subtracting([id])), forKey: deletedKey)
-    }
-
-    var pendingUpsertIDs: Set<String> { Set(UserDefaults.standard.stringArray(forKey: pendingUpsertKey) ?? []) }
-    var pendingUpsertEntries: [LogEntry] { logs.filter { pendingUpsertIDs.contains($0.id) } }
-
-    func markUpsertsSynced(_ entries: [LogEntry]) {
-        var pending = pendingUpsertIDs
-        for sent in entries {
-            if let current = logs.first(where: { $0.id == sent.id }), current.updatedAt <= sent.updatedAt {
-                pending.remove(sent.id)
-            }
-        }
-        UserDefaults.standard.set(Array(pending), forKey: pendingUpsertKey)
-    }
-
-    func replaceAll(_ entries: [LogEntry]) {
-        logs = entries.sorted { $0.startedAt > $1.startedAt }
-        persist()
-    }
-
-    func clearAll() {
-        logs = []
-        UserDefaults.standard.removeObject(forKey: key)
-        UserDefaults.standard.removeObject(forKey: deletedKey)
-        UserDefaults.standard.removeObject(forKey: pendingUpsertKey)
-    }
-
-    private func persist() {
-        if let data = try? JSONEncoder().encode(logs) { UserDefaults.standard.set(data, forKey: key) }
-    }
-
-    private func sameContent(_ first: LogEntry, _ second: LogEntry) -> Bool {
-        var normalized = first
-        normalized.updatedAt = second.updatedAt
-        return normalized == second
-    }
-
-    private func preservePhotoCorrection(_ current: LogEntry?, _ candidate: LogEntry) -> LogEntry {
-        guard let current, current.source == .photo, let source = current.locationSource else { return candidate }
-        if source == .exif && current.photoLocationAutoPlacementDisabled != true { return candidate }
-        var preserved = candidate
-        preserved.latitude = current.latitude
-        preserved.longitude = current.longitude
-        preserved.originalLatitude = current.originalLatitude ?? candidate.originalLatitude
-        preserved.originalLongitude = current.originalLongitude ?? candidate.originalLongitude
-        preserved.locationSource = source
-        preserved.photoLocationAutoPlacementDisabled = current.photoLocationAutoPlacementDisabled
-        return preserved
+    /// The label to show for a place: the user's name for it when there is one, over the geocoder's.
+    func label(_ label: StayPlaceLabel?, at coordinate: CLLocationCoordinate2D) -> StayPlaceLabel? {
+        guard let name = place(at: coordinate)?.name else { return label }
+        return StayPlaceLabel(placeName: name, address: label?.address ?? label?.placeName)
     }
 }
 
@@ -196,6 +147,11 @@ final class StayPlaceLabelResolver: ObservableObject {
 
     /// One place's label, shared with the per-day cache; used by lazily shown rows.
     static func label(for coordinate: CLLocationCoordinate2D) async -> StayPlaceLabel? {
+        // A name the user gave to the place replaces the geocoder's.
+        NamedPlaces.shared.label(await geocoded(coordinate), at: coordinate)
+    }
+
+    private static func geocoded(_ coordinate: CLLocationCoordinate2D) async -> StayPlaceLabel? {
         let key = String(format: "%.4f,%.4f", coordinate.latitude, coordinate.longitude)
         if let cached = cache[key] { return cached }
         let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
@@ -213,15 +169,7 @@ final class StayPlaceLabelResolver: ObservableObject {
         }
         for place in places {
             guard !Task.isCancelled else { return }
-            let key = String(format: "%.4f,%.4f", place.coordinate.latitude, place.coordinate.longitude)
-            if let cached = Self.cache[key] {
-                assign(cached, to: place)
-                continue
-            }
-            let location = CLLocation(latitude: place.coordinate.latitude, longitude: place.coordinate.longitude)
-            guard let placemark = try? await CLGeocoder().reverseGeocodeLocation(location, preferredLocale: RemoFormat.locale).first,
-                  let label = stayPlaceLabel(placemark) else { continue }
-            Self.cache[key] = label
+            guard let label = await Self.label(for: place.coordinate) else { continue }
             assign(label, to: place)
             labels = labels.merging(resolved) { _, new in new }
         }
@@ -284,7 +232,6 @@ struct ContentView: View {
             }
         }
         .tint(RemoStyle.green)
-        .preferredColorScheme(.light)
     }
 }
 
@@ -295,11 +242,14 @@ private func locationAuthorized() -> Bool {
 
 private struct TrackerHomeView: View {
     @EnvironmentObject private var auth: AuthStore
-    @StateObject private var store = LogStore()
+    @ObservedObject private var store = LogStore.shared
+    @ObservedObject private var namedPlaces = NamedPlaces.shared
     @StateObject private var automaticCapture = AutomaticCaptureService.shared
     @StateObject private var photoLibrary = PhotoLibraryStore()
     @StateObject private var photoIndexer = PhotoTimelineIndexer()
     @State private var selectedDate = Calendar.current.startOfDay(for: Date())
+    /// Only the selected day is kept in memory; it is read again whenever the stored records change.
+    @State private var dayRecords: (date: Date, logs: [LogEntry])?
     @State private var selectedLog: LogEntry?
     @State private var showingSettings = false
     @State private var canLocate = locationAuthorized()
@@ -320,22 +270,28 @@ private struct TrackerHomeView: View {
     @State private var lastPullAt: Date?
     @State private var lastBackupAt: Date? = UserDefaults.standard.object(forKey: "remo.last-backup-at") as? Date
     @State private var showingAuth = false
+    /// The records on this device are backed up to another account than the one signed in.
+    @State private var ownershipConflict = false
+    @State private var confirmingReplace = false
+    @State private var showingIntro = !UserDefaults.standard.bool(forKey: introShownKey) && CLLocationManager().authorizationStatus == .notDetermined
     @StateObject private var stayIndex = StayIndexStore()
 
-    private var dayLogs: [LogEntry] { store.logs.filter { Calendar.current.isDate($0.startedAt, inSameDayAs: selectedDate) }.sorted { $0.startedAt < $1.startedAt } }
+    private static let introShownKey = "remo.intro.shown"
     private var capturing: Bool { automaticCapture.isEnabled && canLocate }
+    private var signedIn: Bool { auth.phase == .signedIn }
 
     var body: some View {
         ZStack {
             TimelineHomeView(
                 date: $selectedDate,
-                logs: dayLogs,
-                allLogs: store.logs,
+                logs: dayRecords?.logs ?? [],
+                logsDate: dayRecords?.date,
                 assets: photoLibrary.assets,
                 isCapturing: capturing,
                 canLocate: canLocate,
                 onEditPhoto: { selectedLog = $0 },
                 onOpenSettings: { withAnimation(.easeOut(duration: 0.25)) { showingSettings = true } },
+                onRenamePlace: renamePlace,
                 stayIndex: stayIndex,
             )
             if showingSettings {
@@ -353,20 +309,46 @@ private struct TrackerHomeView: View {
             try? await Task.sleep(for: .seconds(4))
             if !Task.isCancelled { status = nil }
         }
-        .task { automaticCapture.startIfPossible(); photoLibrary.requestAccess(); await indexPhotos(syncAfter: false); await sync(force: true) }
+        .task {
+            // The system prompts appear without context of their own: on a first
+            // launch the intro explains them and starts recording from there.
+            if !showingIntro { automaticCapture.startIfPossible(); photoLibrary.requestAccess() }
+            await indexPhotos(syncAfter: false)
+            await sync(force: true)
+        }
+        .task(id: "\(store.revision)@\(selectedDate.timeIntervalSince1970)") {
+            let date = selectedDate, database = store.database
+            let logs = await Task.detached(priority: .userInitiated) { database.entries(onDayOf: date) }.value
+            guard !Task.isCancelled else { return }
+            dayRecords = (date, logs)
+        }
         .onChange(of: photoLibrary.status) { _, _ in Task { await indexPhotos() } }
         .onReceive(photoLibrary.$revision.dropFirst()) { _ in Task { await indexPhotos() } }
         .onReceive(automaticCapture.$status) { _ in canLocate = locationAuthorized() }
-        .onReceive(store.$logs) { stayIndex.schedule($0) }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in canLocate = locationAuthorized(); automaticCapture.startIfPossible(); store.reload(); photoLibrary.reload(); Task { await indexPhotos(syncAfter: false); await sync(force: true) } }
-        .onReceive(NotificationCenter.default.publisher(for: .remoAutomaticLogSaved)) { _ in store.reload(); Task { await sync() } }
+        .onReceive(store.$revision) { _ in
+            stayIndex.schedule(database: store.database)
+            namedPlaces.reload(from: store.database)
+        }
+        .onChange(of: store.writeFailed) { _, failed in
+            guard failed else { return }
+            status = "記録を保存できませんでした。端末の空き容量を確認してください"
+            store.writeFailed = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            canLocate = locationAuthorized()
+            if !showingIntro { automaticCapture.startIfPossible() }
+            photoLibrary.reload()
+            Task { await indexPhotos(syncAfter: false); await sync(force: true) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .remoAutomaticLogSaved)) { _ in Task { await sync() } }
         .fullScreenCover(item: $selectedLog) { log in
             PhotoLocationEditor(
                 entry: log,
-                allLogs: store.logs,
+                // Location samples around the photo: the suggestion reads the track near it.
+                allLogs: store.database.entries(from: log.startedAt.addingTimeInterval(-3_600), to: log.startedAt.addingTimeInterval(3_600)),
                 onClose: { selectedLog = nil },
                 onUpdate: { updated in
-                    store.upsertAll([updated])
+                    store.add(updated)
                     selectedLog = updated
                     Task { await sync(force: true) }
                 },
@@ -374,7 +356,7 @@ private struct TrackerHomeView: View {
             )
         }
         .sheet(isPresented: $showingExport, onDismiss: {
-            if exportRequested { exportRequested = false; exportLogs(from: exportStartDate, through: exportEndDate, logs: store.logs) }
+            if exportRequested { exportRequested = false; exportLogs(from: exportStartDate, through: exportEndDate) }
         }) {
             ExportRangeSheet(startDate: $exportStartDate, endDate: $exportEndDate, count: exportCounts) { exportRequested = true }
         }
@@ -383,6 +365,21 @@ private struct TrackerHomeView: View {
             Task { await importLogs(result) }
         }
         .fullScreenCover(isPresented: $showingAuth) { AuthView(onClose: { showingAuth = false }).environmentObject(auth) }
+        .fullScreenCover(isPresented: $showingIntro) {
+            IntroView(
+                onStart: {
+                    UserDefaults.standard.set(true, forKey: Self.introShownKey)
+                    showingIntro = false
+                    automaticCapture.startIfPossible()
+                    photoLibrary.requestAccess()
+                },
+                onLater: {
+                    UserDefaults.standard.set(true, forKey: Self.introShownKey)
+                    showingIntro = false
+                    if automaticCapture.isEnabled { automaticCapture.toggle() }
+                },
+            )
+        }
         .onChange(of: auth.phase) { _, phase in
             if phase == .signedIn {
                 showingAuth = false
@@ -392,7 +389,8 @@ private struct TrackerHomeView: View {
             } else if phase == .signedOut {
                 lastSyncAttemptAt = nil
                 lastPullAt = nil
-                syncStatus = "端末に保存済み"
+                ownershipConflict = false
+                if syncStatus != sessionExpiredStatus { syncStatus = "端末に保存済み" }
             }
         }
         .alert("アカウントを削除しますか？", isPresented: $confirmingAccountDeletion) {
@@ -406,12 +404,30 @@ private struct TrackerHomeView: View {
             Button("すべて削除", role: .destructive) { Task { await deleteAllData() } }
             Button("キャンセル", role: .cancel) {}
         } message: {
-            Text("この端末とクラウドのバックアップから、位置と写真の記録をすべて削除します。この操作は元に戻せません。")
+            Text(signedIn && !ownershipConflict
+                ? "この端末とクラウドのバックアップから、位置と写真の記録をすべて削除し、位置情報の記録を停止します。他の端末に保存されている記録は、その端末に残ります。この操作は元に戻せません。"
+                : "この端末から、位置と写真の記録をすべて削除し、位置情報の記録を停止します。この操作は元に戻せません。")
+        }
+        .alert("別のアカウントの記録があります", isPresented: $ownershipConflict) {
+            Button("このアカウントに保存") { resolveOwnership(replace: false) }
+            // The next alert can only appear once this one has been dismissed.
+            Button("記録を削除して切り替える", role: .destructive) { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { confirmingReplace = true } }
+            Button("ログアウト", role: .cancel) { Task { await auth.signOut() } }
+        } message: {
+            Text("この端末には、別のアカウントでバックアップしていた記録が残っています。「このアカウントに保存」を選ぶと、残っている記録をログインしたアカウントにもバックアップします。自分の記録でない場合は選ばないでください。")
+        }
+        .alert("この端末の記録を削除しますか？", isPresented: $confirmingReplace) {
+            Button("削除して切り替える", role: .destructive) { resolveOwnership(replace: true) }
+            Button("キャンセル", role: .cancel) { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { ownershipConflict = true } }
+        } message: {
+            Text("別のアカウントで使っていた記録をこの端末から削除し、ログインしたアカウントの記録を表示します。元のアカウントのバックアップは残ります。")
         }
     }
 
+    private let sessionExpiredStatus = "再ログインが必要です"
+
     private var settingsState: SettingsState {
-        SettingsState(autoCapture: capturing, photoAccess: photoLibrary.hasAccess, syncStatus: syncStatus, lastBackupAt: lastBackupAt, email: auth.phase == .signedIn ? auth.user?.email ?? "ログイン中" : nil)
+        SettingsState(autoCapture: capturing, photoAccess: photoLibrary.hasAccess, syncStatus: syncStatus, lastBackupAt: lastBackupAt, email: auth.phase == .signedIn ? auth.user.flatMap { $0.email.isEmpty ? nil : $0.email } ?? "ログイン中" : nil)
     }
 
     private var settingsActions: SettingsActions {
@@ -433,11 +449,17 @@ private struct TrackerHomeView: View {
         )
     }
 
-    private func exportCounts(_ start: Date, _ end: Date) -> (locations: Int, photos: Int) {
+    private func dayRange(_ start: Date, _ end: Date) -> (from: Date, to: Date) {
         let from = Calendar.current.startOfDay(for: min(start, end))
         let to = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: max(start, end))) ?? from
-        let selected = store.logs.filter { $0.startedAt >= from && $0.startedAt < to }
-        return (selected.filter { $0.source != .photo }.count, selected.filter { $0.source == .photo }.reduce(0) { $0 + $1.photoCount })
+        return (from, to)
+    }
+
+    /// Counted by the database; the records themselves are not loaded.
+    private func exportCounts(_ start: Date, _ end: Date) -> (locations: Int, photos: Int) {
+        let range = dayRange(start, end)
+        let summary = store.database.summarize(from: range.from, to: range.to)
+        return (summary.locations, summary.photos)
     }
 
     private func toggleCapture() {
@@ -456,15 +478,45 @@ private struct TrackerHomeView: View {
         }
     }
 
+    private func renamePlace(_ coordinate: CLLocationCoordinate2D, _ name: String) {
+        let current = namedPlaces.place(at: coordinate)
+        store.database.putPlace(NamedPlace(
+            id: current?.id ?? UUID().uuidString,
+            name: name,
+            latitude: current?.latitude ?? coordinate.latitude,
+            longitude: current?.longitude ?? coordinate.longitude,
+            // Whole milliseconds, like the backup keeps them.
+            updatedAt: Date(timeIntervalSince1970: (Date().timeIntervalSince1970 * 1000).rounded() / 1000),
+            deleted: name.isEmpty,
+        ))
+        Task { await sync(force: true) }
+    }
+
+    private func resolveOwnership(replace: Bool) {
+        guard let account = AuthStore.storedUserID() else { return }
+        if replace {
+            clearDevice()
+            LifeEventSync.forgetDownloadPosition(account: account)
+        }
+        store.database.claim(account)
+        Task { await sync(force: true) }
+    }
+
+    /// Removes everything this device holds: records, photo assignments and the derived stay index.
+    private func clearDevice() {
+        store.clearAll()
+        PhotoTimelineIndexer.forgetAssignments()
+        stayIndex.clear()
+    }
 
     private func sync(force: Bool = false) async {
         guard KeychainToken.load() != nil else {
-            syncStatus = "端末に保存済み"
+            if syncStatus != sessionExpiredStatus { syncStatus = "端末に保存済み" }
             return
         }
         // Location notifications can arrive every 10 seconds while moving.
         // Android and Web already limit backup attempts; keep iOS from issuing
-        // a full database round-trip for every local sample as well.
+        // a round-trip for every local sample as well.
         let now = Date()
         if !force, let lastSyncAttemptAt, now.timeIntervalSince(lastSyncAttemptAt) < 60 {
             return
@@ -479,26 +531,19 @@ private struct TrackerHomeView: View {
             if syncQueued { syncQueued = false; Task { await sync() } }
         }
         do {
-            let pendingDeletes = Array(store.pendingDeleteIDs)
-            try await LifeEventSync.delete(pendingDeletes)
-            pendingDeletes.forEach(store.markDeleteSynced)
-            let localAtStart = store.logs
-            let synchronized = try await LifeEventSync.synchronize(localAtStart, pendingUpserts: store.pendingUpsertEntries, pull: shouldPull)
-            if shouldPull { lastPullAt = Date() }
-            // A background location can arrive while the request is running.
-            // Preserve that newer local entry for the next queued sync.
-            var merged = Dictionary(uniqueKeysWithValues: synchronized.events.map { ($0.id, $0) })
-            let deletedIDs = synchronized.deletedIds.union(store.pendingDeleteIDs)
-            deletedIDs.forEach { merged.removeValue(forKey: $0) }
-            let startedByID = Dictionary(uniqueKeysWithValues: localAtStart.map { ($0.id, $0) })
-            for local in store.logs {
-                if deletedIDs.contains(local.id) { continue }
-                if let remote = merged[local.id], local.updatedAt > remote.updatedAt { merged[local.id] = local }
-                else if startedByID[local.id] == nil { merged[local.id] = local }
+            switch try await BackupCoordinator.shared.synchronize(pull: shouldPull, database: store.database) {
+            case .local:
+                syncStatus = "端末に保存済み"
+                return
+            case .otherAccount:
+                syncStatus = "別のアカウントの記録があります"
+                ownershipConflict = true
+                return
+            case .synced:
+                break
             }
-            store.replaceAll(Array(merged.values))
-            store.markUpsertsSynced(synchronized.uploaded)
-            let photoBackup = await PhotoBackup.uploadPending(assets: photoLibrary.assets, events: store.logs)
+            if shouldPull { lastPullAt = Date() }
+            let photoBackup = try await PhotoBackup.uploadPending(assets: photoLibrary.assets, database: store.database)
             syncStatus = photoBackup.pending ? "写真バックアップ待ち" : "バックアップ済み"
             if photoBackup.more {
                 Task {
@@ -508,6 +553,12 @@ private struct TrackerHomeView: View {
             }
             lastBackupAt = Date()
             UserDefaults.standard.set(lastBackupAt, forKey: "remo.last-backup-at")
+        } catch SyncError.unauthorized {
+            // The session ended (expired, or signed out everywhere): say so
+            // instead of looking offline, and offer to sign in again.
+            syncStatus = sessionExpiredStatus
+            status = "ログインの有効期限が切れました。設定からもう一度ログインしてください"
+            auth.expireSession()
         } catch { syncStatus = "オフライン · 端末に保存済み" }
     }
 
@@ -520,8 +571,8 @@ private struct TrackerHomeView: View {
         let hasSecurityScope = url.startAccessingSecurityScopedResource()
         defer { if hasSecurityScope { url.stopAccessingSecurityScopedResource() } }
         do {
-            let imported = try TimelineImport.decode(data: Data(contentsOf: url))
-            store.upsertAll(imported)
+            let imported = try await Task.detached(priority: .userInitiated) { try TimelineImport.decode(data: Data(contentsOf: url)) }.value
+            store.importAll(imported)
             if let latest = imported.max(by: { $0.startedAt < $1.startedAt }) {
                 selectedDate = Calendar.current.startOfDay(for: latest.startedAt)
             }
@@ -534,33 +585,30 @@ private struct TrackerHomeView: View {
     private func requestPhotoAccess() { if photoLibrary.status == .notDetermined { photoLibrary.requestAccess() } else if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) } }
     private func indexPhotos(syncAfter: Bool = true) async {
         guard photoLibrary.hasAccess, !photoIndexer.isIndexing else { return }
-        let result = await photoIndexer.indexAll { entries in
-            store.upsertAll(entries)
-        }
+        let database = store.database
+        let photoRecords = database.photoEntries()
+        let result = await photoIndexer.indexAll(existingEventIDs: Set(photoRecords.map(\.id)))
+        store.upsertScanned(inheritPhotoCorrections(result.entries, inheritedFrom: result.inheritedCorrections, current: photoRecords))
+        let present = Set(database.photoEntries().map(\.id))
+        store.deleteAll(result.staleEventIDs.intersection(present))
         if syncAfter && !result.entries.isEmpty { await sync() }
     }
-    private func exportLogs(from startDate: Date, through endDate: Date, logs: [LogEntry]) {
-        let dateFormatter = DateFormatter()
-        dateFormatter.calendar = Calendar.current
-        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
-        dateFormatter.dateFormat = "yyyy-MM-dd"
-        let fromDate = Calendar.current.startOfDay(for: min(startDate, endDate))
-        let toDate = Calendar.current.startOfDay(for: max(startDate, endDate))
-        let exclusiveEnd = Calendar.current.date(byAdding: .day, value: 1, to: toDate) ?? toDate
-        let selected = logs.filter { $0.startedAt >= fromDate && $0.startedAt < exclusiveEnd }.sorted { $0.startedAt < $1.startedAt }
-        let from = dateFormatter.string(from: fromDate)
-        let to = dateFormatter.string(from: toDate)
-        let photoLogs = selected.filter { $0.source == .photo }
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        do {
-            let data = try encoder.encode(TimelineExport(schemaVersion: 1, exportedAt: Date(), range: ExportRange(from: from, to: to), summary: ExportSummary(eventCount: selected.count, photoRecordCount: photoLogs.count, photoCount: photoLogs.reduce(0) { $0 + $1.photoCount }), events: selected))
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent("remo-timeline-\(from)-\(to).json")
-            try data.write(to: url, options: .atomic)
-            exportFile = ExportFile(url: url)
-        } catch {
-            status = "エクスポートに失敗しました"
+
+    /// Writes the export a day at a time, so a year of records is never held in memory.
+    private func exportLogs(from startDate: Date, through endDate: Date) {
+        let range = dayRange(startDate, endDate)
+        let database = store.database
+        status = "JSONを書き出し中…"
+        Task {
+            do {
+                let url = try await Task.detached(priority: .userInitiated) {
+                    try TimelineExportWriter.write(database: database, from: range.from, to: range.to)
+                }.value
+                exportFile = ExportFile(url: url)
+                status = nil
+            } catch {
+                status = "エクスポートに失敗しました"
+            }
         }
     }
     private func deleteAccount() async {
@@ -577,20 +625,111 @@ private struct TrackerHomeView: View {
         status = "アカウントとクラウドのバックアップを削除しました。この端末の記録は残っています"
     }
 
-    private func deleteAllData() async { do { try await LifeEventSync.deleteAll(); store.clearAll(); stayIndex.clear(); if automaticCapture.isEnabled { automaticCapture.toggle() }; status = "すべての記録を削除しました" } catch { status = "クラウドに接続できないため削除できませんでした" } }
+    private func deleteAllData() async {
+        do {
+            // Without an account, or with another account's records, only this device is cleared.
+            if signedIn && !ownershipConflict { try await LifeEventSync.deleteAll() }
+            clearDevice()
+            if automaticCapture.isEnabled { automaticCapture.toggle() }
+            status = "すべての記録を削除し、位置情報の記録を停止しました"
+        } catch { status = "クラウドに接続できないため削除できませんでした" }
+    }
+}
+
+/// Shown on the first launch, before the system asks for location, motion and
+/// photo access: those prompts say nothing about what the app does with them.
+private struct IntroView: View {
+    let onStart: () -> Void
+    let onLater: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Spacer()
+            Text("毎日を、静かに。\n自分のために。").font(RemoFont.display).foregroundStyle(RemoStyle.ink)
+            Text("Remoは位置と写真を1日の地図にまとめます。はじめに、次の許可を確認します。")
+                .font(RemoFont.bodyLarge).foregroundStyle(RemoStyle.inkSecondary)
+            VStack(alignment: .leading, spacing: 16) {
+                introRow("location.fill", "位置情報", "移動中は10秒、静止中は5分ごとに現在地を記録します。アプリを閉じている間も記録するには、あとで「常に許可」を選んでください。")
+                introRow("figure.walk", "モーションとフィットネス", "静止しているかどうかを判定し、バッテリー消費を抑えるために使います。")
+                introRow("photo.on.rectangle", "写真", "撮影日時と位置をタイムラインに表示します。元の写真は端末から出ません（ログイン中は縮小画像だけをバックアップします）。")
+            }
+            Text("記録は端末に保存され、ログインしたときだけバックアップされます。記録は設定からいつでも停止できます。")
+                .font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkTertiary)
+            Spacer()
+            Button(action: onStart) {
+                Text("記録を始める").font(RemoFont.labelLarge).frame(maxWidth: .infinity).frame(height: 48)
+            }
+            .background(RemoStyle.green, in: Capsule())
+            .foregroundStyle(RemoStyle.onGreen)
+            Button(action: onLater) {
+                Text("あとで").font(RemoFont.labelLarge).frame(maxWidth: .infinity).frame(height: 40)
+            }
+            .foregroundStyle(RemoStyle.green)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(RemoStyle.background)
+    }
+
+    private func introRow(_ systemName: String, _ title: String, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: systemName).font(.system(size: 18)).foregroundStyle(RemoStyle.green).frame(width: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(RemoFont.titleSmall).foregroundStyle(RemoStyle.ink)
+                Text(text).font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkSecondary)
+            }
+        }
+    }
+}
+
+/// Writes a Remo JSON document for a range of days into a temporary file.
+enum TimelineExportWriter {
+    static func write(database: LogDatabase, from: Date, to: Date, calendar: Calendar = .current) throws -> URL {
+        let dayFormatter = DateFormatter()
+        dayFormatter.calendar = calendar
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+        let fromKey = dayFormatter.string(from: from)
+        let toKey = dayFormatter.string(from: calendar.date(byAdding: .day, value: -1, to: to) ?? from)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("remo-timeline-\(fromKey)-\(toKey).json")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        func put(_ text: String) throws { try handle.write(contentsOf: Data(text.utf8)) }
+
+        try put("{\n  \"schemaVersion\": 1,\n  \"exportedAt\": ")
+        try handle.write(contentsOf: try encoder.encode(Date()))
+        try put(",\n  \"range\": ")
+        try handle.write(contentsOf: try encoder.encode(ExportRange(from: fromKey, to: toKey)))
+        try put(",\n  \"events\": [")
+        var summary = ExportSummary(eventCount: 0, photoRecordCount: 0, photoCount: 0)
+        var day = from
+        while day < to {
+            let next = calendar.date(byAdding: .day, value: 1, to: day) ?? to
+            for entry in database.entries(from: day, to: min(next, to)) {
+                try put(summary.eventCount == 0 ? "\n    " : ",\n    ")
+                try handle.write(contentsOf: try encoder.encode(entry))
+                summary.eventCount += 1
+                if entry.source == .photo {
+                    summary.photoRecordCount += 1
+                    summary.photoCount += entry.photoCount
+                }
+            }
+            day = next
+        }
+        try put("\n  ],\n  \"summary\": ")
+        try handle.write(contentsOf: try encoder.encode(summary))
+        try put("\n}\n")
+        return url
+    }
 }
 
 private struct ExportFile: Identifiable {
     let url: URL
     var id: String { url.absoluteString }
-}
-
-private struct TimelineExport: Encodable {
-    let schemaVersion: Int
-    let exportedAt: Date
-    let range: ExportRange
-    let summary: ExportSummary
-    let events: [LogEntry]
 }
 
 private enum TimelineImportError: LocalizedError {
@@ -679,15 +818,15 @@ enum TimelineImport {
     private static func number(_ value: Any?) -> NSNumber? { value as? NSNumber }
 }
 
-private struct ExportRange: Encodable {
+struct ExportRange: Encodable {
     let from: String
     let to: String
 }
 
-private struct ExportSummary: Encodable {
-    let eventCount: Int
-    let photoRecordCount: Int
-    let photoCount: Int
+struct ExportSummary: Encodable {
+    var eventCount: Int
+    var photoRecordCount: Int
+    var photoCount: Int
 }
 
 private struct ShareSheet: UIViewControllerRepresentable {

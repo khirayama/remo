@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and earlier; see data_extraction_rules.xml. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="rem_auth.xml" />
+    <exclude domain="sharedpref" path="rem_sync.xml" />
+    <exclude domain="database" path="rem_photo_index.db" />
+    <exclude domain="file" path="stay-index.json" />
+</full-backup-content>

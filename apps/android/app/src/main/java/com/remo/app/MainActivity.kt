@@ -96,9 +96,10 @@ import java.util.TimeZone
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         val transparent = android.graphics.Color.TRANSPARENT
+        // Bar icons follow the system appearance, like the rest of the app.
         enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.light(transparent, transparent),
-            navigationBarStyle = SystemBarStyle.light(transparent, transparent),
+            statusBarStyle = SystemBarStyle.auto(transparent, transparent),
+            navigationBarStyle = SystemBarStyle.auto(transparent, transparent),
         )
         super.onCreate(savedInstanceState)
         setContent { RemoTheme { RemoRoot() } }
@@ -120,13 +121,13 @@ private fun RemoRoot(viewModel: AuthViewModel = viewModel()) {
             return@Surface
         }
         // Auth sits on top so closing it returns to the same screen and day.
-        TrackerHome(state.user, viewModel::signOut, viewModel::deleteAccount) { showAuth = true }
+        TrackerHome(state.user, viewModel::signOut, viewModel::deleteAccount, viewModel::sessionExpired) { showAuth = true }
         if (showAuth && !state.signedIn) AuthScreen(state, viewModel) { showAuth = false }
     }
 }
 
 @Composable
-internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount: suspend (String) -> String?, onOpenAuth: () -> Unit) {
+internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount: suspend (String) -> String?, onSessionExpired: () -> Unit = {}, onOpenAuth: () -> Unit) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
@@ -154,7 +155,11 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     var showExportDialog by remember { mutableStateOf(false) }
     var exportStartDate by remember { mutableStateOf(selectedDate) }
     var exportEndDate by remember { mutableStateOf(selectedDate) }
-    var pendingExport by remember { mutableStateOf<String?>(null) }
+    var pendingExport by remember { mutableStateOf<Pair<String, String>?>(null) }
+    // The records on this device are backed up to another account than the one signed in.
+    var ownershipConflict by remember { mutableStateOf(false) }
+    val introPreferences = remember { context.getSharedPreferences("rem_intro", Context.MODE_PRIVATE) }
+    var showLocationIntro by remember { mutableStateOf(false) }
     var syncInFlight by remember { mutableStateOf(false) }
     var syncQueued by remember { mutableStateOf(false) }
     var photoRevision by remember { mutableIntStateOf(0) }
@@ -162,14 +167,20 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     var photoRefreshJob by remember { mutableStateOf<Job?>(null) }
 
     val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
-        val payload = pendingExport
+        val range = pendingExport
         pendingExport = null
-        if (uri != null && payload != null) {
-            runCatching {
-                context.contentResolver.openOutputStream(uri)?.use { output -> output.write(payload.toByteArray(Charsets.UTF_8)) }
-                    ?: error("ファイルを開けませんでした")
-            }.onSuccess { status = "JSONを書き出しました" }
-                .onFailure { status = "エクスポートに失敗しました" }
+        if (uri != null && range != null) {
+            scope.launch {
+                status = "JSONを書き出し中…"
+                // Written a day at a time, so a year of records is never held in memory.
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openOutputStream(uri)?.use { output -> writeTimelineExport(output, store, range.first, range.second) }
+                            ?: error("ファイルを開けませんでした")
+                    }
+                }.onSuccess { status = "JSONを書き出しました" }
+                    .onFailure { if (it is CancellationException) throw it; status = "エクスポートに失敗しました" }
+            }
         }
     }
 
@@ -234,9 +245,16 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
         syncStatus = "バックアップ中…"
         try {
             syncStatus = BackupCoordinator.synchronize(context, force)
+            ownershipConflict = syncStatus == BackupCoordinator.STATUS_OTHER_ACCOUNT
             lastBackupAt = BackupCoordinator.lastSuccessAt(context)
         } catch (cancelled: CancellationException) {
             throw cancelled
+        } catch (_: SessionExpiredException) {
+            // The session ended (expired, or signed out everywhere): say so
+            // instead of looking offline, and offer to sign in again.
+            syncStatus = "再ログインが必要です"
+            status = "ログインの有効期限が切れました。設定からもう一度ログインしてください"
+            onSessionExpired()
         } catch (_: Exception) {
             syncStatus = "オフライン · 端末に保存済み"
         } finally {
@@ -258,7 +276,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                         ?: error("ファイルを開けませんでした")
                 }
                 val imported = withContext(Dispatchers.Default) { decodeTimelineImport(payload) }
-                imported.forEach { store.upsert(it) }
+                store.importAll(imported)
                 imported.maxByOrNull(LogEntry::startedAt)?.let { selectedDate = dayKey(it.startedAt) }
                 sync()
                 imported.size
@@ -271,12 +289,14 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
         if (!photoAccess || photoIndexing) return
         photoIndexing = true
         val generation = store.generation
-        val hadSelectedDay = store.logs.any { dayKey(it.startedAt) == selectedDate }
         try {
-            val result = PhotoLibrary.indexAll(context) { entries ->
-                store.upsertAll(entries, generation)
-            }
-            store.upsertAll(result.entries, generation)
+            val selectedDay = parseDate(selectedDate)
+            val hadSelectedDay = store.hasEntriesBetween(selectedDay.timeInMillis, (selectedDay.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, 1) }.timeInMillis)
+            val photoRecords = store.photoEntries()
+            val result = PhotoLibrary.indexAll(context, photoRecords.mapTo(HashSet()) { it.id })
+            store.upsertAll(inheritPhotoCorrections(result.entries, result.inheritedCorrections, photoRecords), generation)
+            val present = store.photoEntries().mapTo(HashSet()) { it.id }
+            store.deleteAll(result.staleEventIds.filter { it in present }, generation)
             if (result.entries.isNotEmpty() && !hadSelectedDay) {
                 result.entries.maxByOrNull(LogEntry::startedAt)?.let { selectedDate = dayKey(it.startedAt) }
             }
@@ -319,8 +339,10 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
         lastBackupAt = BackupCoordinator.lastSuccessAt(context)
         store.reload()
         BackupWorker.schedule(context)
-        if (autoCapture && requiredLocationPermissions(context).isNotEmpty()) {
-            locationPermission.launch(requiredLocationPermissions(context))
+        if (autoCapture && !hasLocationPermission(context)) {
+            // Explain what is recorded before the system asks; the prompt alone has no context.
+            if (introPreferences.getBoolean("location_intro_shown", false)) locationPermission.launch(requiredLocationPermissions(context))
+            else showLocationIntro = true
         } else if (autoCapture) {
             AutomaticCaptureService.setEnabled(context, true)
         }
@@ -356,12 +378,27 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     LaunchedEffect(dayRange, lifecycleOwner, showSettings) {
         if (showSettings) return@LaunchedEffect
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            snapshotFlow { logsInRange(store.logs, dayRange.first, dayRange.last + 1) }.collectLatest { visible ->
+            // Only the selected day is read into memory; it is read again whenever the stored records change.
+            snapshotFlow { store.revision }.collectLatest {
+                val visible = store.entriesBetween(dayRange.first, dayRange.last + 1)
                 timeline = withContext(Dispatchers.Default) { prepareTimeline(visible) }
             }
         }
     }
-    val stayIndex = rememberStayIndex(context, store.logs)
+    val stayIndex = rememberStayIndex(context, store)
+    LaunchedEffect(store.revision) { NamedPlaces.places = store.places() }
+    // Location samples around the photo being corrected: the suggestion reads the track near it.
+    val nearbyLogs by produceState(emptyList<LogEntry>(), selectedLog?.id, selectedLog?.startedAt, store.revision) {
+        val entry = selectedLog
+        value = if (entry == null) emptyList() else store.entriesBetween(entry.startedAt - NEARBY_WINDOW_MS, entry.startedAt + NEARBY_WINDOW_MS)
+    }
+    val persistenceFailed = RemoApplication.persistenceFailed
+    LaunchedEffect(persistenceFailed) {
+        if (persistenceFailed) {
+            status = "記録を保存できませんでした。端末の空き容量を確認してください"
+            RemoApplication.persistenceFailed = false
+        }
+    }
     val periodStays = remember(stayIndex.stays, placePeriod) { stayIndex.stays?.let { staysInPeriod(it, placePeriod) } }
     val allPlaces by produceState<List<AllTimeStayPlace>?>(null, periodStays) {
         value = periodStays?.let { stays -> withContext(Dispatchers.Default) { buildAllTimeStayPlaces(stays) } }
@@ -378,8 +415,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     fun exportSelectedRange() {
         val from = minOf(exportStartDate, exportEndDate)
         val to = maxOf(exportStartDate, exportEndDate)
-        val selected = store.logs.filter { val date = dayKey(it.startedAt); date >= from && date <= to }.sortedBy(LogEntry::startedAt)
-        pendingExport = encodeTimelineExport(from, to, selected)
+        pendingExport = from to to
         showExportDialog = false
         exportLauncher.launch("remo-timeline-$from-$to.json")
     }
@@ -436,11 +472,26 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     historyTarget?.let { target ->
         // Read from the stay index once it is ready, so the history matches the all-places map.
         val history by produceState<StayVisitHistory?>(null, target, stayIndex.stays) {
+            // Until the index is ready the sheet shows that it is being prepared.
             value = target.visits?.let(::historyOf)
                 ?: stayIndex.stays?.let { stayVisitHistoryFromStays(it, target.coordinate) }
-                ?: withContext(Dispatchers.Default) { buildStayVisitHistory(store.logs, target.coordinate) }
         }
-        PlaceHistorySheet(history, target, onDismiss = { historyTarget = null }) { day ->
+        PlaceHistorySheet(
+            history, target,
+            onDismiss = { historyTarget = null },
+            onRename = { current, name ->
+                scope.launch {
+                    store.putPlace(NamedPlace(
+                        id = current?.id ?: java.util.UUID.randomUUID().toString(),
+                        name = name,
+                        latitude = current?.latitude ?: target.coordinate.latitude,
+                        longitude = current?.longitude ?: target.coordinate.longitude,
+                        deleted = name.isEmpty(),
+                    ))
+                    sync(force = true)
+                }
+            },
+        ) { day ->
             historyTarget = null
             selectedDate = day
             homeMode = HomeMode.DAY
@@ -451,7 +502,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
         PhotoListSheet(photos, libraryPhotos, { selectedPhotos = null }) { photo -> selectedPhotos = null; selectedLog = photo }
     }
     selectedLog?.let { entry ->
-        DetailDialog(entry, store.logs, { selectedLog = null }, ::updateLog) {
+        DetailDialog(entry, nearbyLogs, { selectedLog = null }, ::updateLog) {
             selectedLog = null
             scope.launch { store.delete(entry); sync() }
             status = "記録を削除しました"
@@ -475,27 +526,61 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     if (confirmDelete) {
         ConfirmDeleteDialog(
             title = "すべての記録を削除しますか？",
-            message = "この端末とクラウドのバックアップから、位置と写真の記録をすべて削除します。この操作は元に戻せません。",
+            message = if (user != null && !ownershipConflict) "この端末とクラウドのバックアップから、位置と写真の記録をすべて削除し、位置情報の記録を停止します。他の端末に保存されている記録は、その端末に残ります。この操作は元に戻せません。"
+                else "この端末から、位置と写真の記録をすべて削除し、位置情報の記録を停止します。この操作は元に戻せません。",
             onDismiss = { confirmDelete = false },
             onConfirm = {
                 scope.launch {
                     runCatching { BackupCoordinator.deleteAll(context) }
-                        .onSuccess { autoCapture = false; status = "すべての記録を削除しました" }
+                        .onSuccess { autoCapture = false; status = "すべての記録を削除し、位置情報の記録を停止しました" }
                         .onFailure { status = "クラウドに接続できないため削除できませんでした" }
                 }
             },
             confirmLabel = "すべて削除",
         )
     }
+    if (ownershipConflict && user != null) {
+        OwnershipDialog(
+            email = user.email,
+            onMerge = { ownershipConflict = false; scope.launch { BackupCoordinator.adoptRecords(context); sync(force = true) } },
+            onReplace = {
+                ownershipConflict = false
+                scope.launch {
+                    BackupCoordinator.replaceRecords(context)
+                    refreshPhotos()
+                    sync(force = true)
+                }
+            },
+            onSignOut = { ownershipConflict = false; onSignOut() },
+        )
+    }
+    if (showLocationIntro) {
+        LocationIntroDialog(
+            onStart = {
+                showLocationIntro = false
+                introPreferences.edit().putBoolean("location_intro_shown", true).apply()
+                locationPermission.launch(requiredLocationPermissions(context))
+            },
+            onLater = {
+                showLocationIntro = false
+                introPreferences.edit().putBoolean("location_intro_shown", true).apply()
+                AutomaticCaptureService.setEnabled(context, false)
+                autoCapture = false
+            },
+        )
+    }
     if (showExportDialog) {
         val from = minOf(exportStartDate, exportEndDate)
         val to = maxOf(exportStartDate, exportEndDate)
-        val selected = remember(from, to) { store.logs.filter { val date = dayKey(it.startedAt); date >= from && date <= to } }
+        // Counted by the database; the records themselves are not loaded.
+        val summary by produceState<RangeSummary?>(null, from, to, store.revision) {
+            value = store.summarize(parseDate(from).timeInMillis, parseDate(to).apply { add(Calendar.DAY_OF_MONTH, 1) }.timeInMillis)
+        }
         ExportRangeDialog(
             startDate = exportStartDate,
             endDate = exportEndDate,
-            locationCount = selected.count { it.source != EventSource.PHOTO },
-            photoCount = selected.filter { it.source == EventSource.PHOTO }.sumOf { it.photoCount },
+            locationCount = summary?.locationCount,
+            photoCount = summary?.photoCount,
             onStartDateChange = { exportStartDate = it },
             onEndDateChange = { exportEndDate = it },
             onDismiss = { showExportDialog = false },
@@ -649,10 +734,14 @@ private fun RecordingPill(recording: Boolean, onClick: () -> Unit) {
     }
 }
 
+private const val NEARBY_WINDOW_MS = 60 * 60_000L
+
 private fun requiredLocationPermissions(context: Context): Array<String> = buildList {
     add(Manifest.permission.ACCESS_FINE_LOCATION)
     add(Manifest.permission.ACCESS_COARSE_LOCATION)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) add(Manifest.permission.ACTIVITY_RECOGNITION)
+    // The recording notification is how the user sees (and stops) background recording.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) add(Manifest.permission.POST_NOTIFICATIONS)
 }.filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }.toTypedArray()
 
 private fun openPhotoSettings(context: Context) {
@@ -670,36 +759,96 @@ private fun refreshPhotoState(context: Context, scope: kotlinx.coroutines.Corout
     }
 }
 
-private fun encodeTimelineExport(from: String, to: String, entries: List<LogEntry>): String = JSONObject().apply {
-    put("schemaVersion", 1)
-    put("exportedAt", isoTimestamp(System.currentTimeMillis()))
-    put("range", JSONObject().put("from", from).put("to", to))
-    val photoEntries = entries.filter { it.source == EventSource.PHOTO }
-    put("summary", JSONObject().apply {
-        put("eventCount", entries.size)
-        put("photoRecordCount", photoEntries.size)
-        put("photoCount", photoEntries.sumOf { it.photoCount })
-    })
-    put("events", JSONArray().apply {
-        entries.forEach { entry ->
-            put(JSONObject().apply {
-                put("id", entry.id)
-                put("startedAt", isoTimestamp(entry.startedAt))
-                entry.latitude?.let { put("latitude", it) }
-                entry.longitude?.let { put("longitude", it) }
-                entry.originalLatitude?.let { put("originalLatitude", it) }
-                entry.originalLongitude?.let { put("originalLongitude", it) }
-                entry.locationSource?.let { put("locationSource", it.wireValue) }
-                put("photoLocationAutoPlacementDisabled", entry.photoLocationAutoPlacementDisabled)
-                entry.accuracyMeters?.let { put("accuracyMeters", it) }
-                entry.mediaType?.let { put("mediaType", it.wireValue) }
-                put("photoCount", entry.photoCount)
-                put("source", entry.source.wireValue)
-                put("updatedAt", isoTimestamp(entry.updatedAt))
-            })
+/** Writes a Remo JSON document for the local days [from]..[to], reading one day at a time. */
+internal suspend fun writeTimelineExport(output: java.io.OutputStream, store: LogStore, from: String, to: String) {
+    val writer = android.util.JsonWriter(output.bufferedWriter(Charsets.UTF_8))
+    writer.setIndent("  ")
+    var eventCount = 0
+    var photoRecordCount = 0
+    var photoCount = 0
+    writer.beginObject()
+    writer.name("schemaVersion").value(1)
+    writer.name("exportedAt").value(isoTimestamp(System.currentTimeMillis()))
+    writer.name("range").beginObject().name("from").value(from).name("to").value(to).endObject()
+    writer.name("events").beginArray()
+    var day = from
+    while (day <= to) {
+        for (entry in store.entriesOfDay(day)) {
+            eventCount += 1
+            if (entry.source == EventSource.PHOTO) { photoRecordCount += 1; photoCount += entry.photoCount }
+            writer.beginObject()
+            writer.name("id").value(entry.id)
+            writer.name("startedAt").value(isoTimestamp(entry.startedAt))
+            entry.latitude?.let { writer.name("latitude").value(it) }
+            entry.longitude?.let { writer.name("longitude").value(it) }
+            entry.originalLatitude?.let { writer.name("originalLatitude").value(it) }
+            entry.originalLongitude?.let { writer.name("originalLongitude").value(it) }
+            entry.locationSource?.let { writer.name("locationSource").value(it.wireValue) }
+            writer.name("photoLocationAutoPlacementDisabled").value(entry.photoLocationAutoPlacementDisabled)
+            entry.accuracyMeters?.let { writer.name("accuracyMeters").value(it) }
+            entry.mediaType?.let { writer.name("mediaType").value(it.wireValue) }
+            writer.name("photoCount").value(entry.photoCount.toLong())
+            writer.name("source").value(entry.source.wireValue)
+            writer.name("updatedAt").value(isoTimestamp(entry.updatedAt))
+            writer.endObject()
         }
-    })
-}.toString(2)
+        day = shiftDay(day, 1)
+    }
+    writer.endArray()
+    writer.name("summary").beginObject()
+        .name("eventCount").value(eventCount.toLong())
+        .name("photoRecordCount").value(photoRecordCount.toLong())
+        .name("photoCount").value(photoCount.toLong())
+        .endObject()
+    writer.endObject()
+    writer.flush()
+}
+
+/** The records on this device are backed up to another account than the one that signed in. */
+@Composable
+private fun OwnershipDialog(email: String, onMerge: () -> Unit, onReplace: () -> Unit, onSignOut: () -> Unit) {
+    var confirmReplace by remember { mutableStateOf(false) }
+    if (confirmReplace) {
+        ConfirmDeleteDialog(
+            title = "この端末の記録を削除しますか？",
+            message = "別のアカウントで使っていた記録をこの端末から削除し、ログインしたアカウントの記録を表示します。元のアカウントのバックアップは残ります。",
+            onDismiss = { confirmReplace = false },
+            onConfirm = onReplace,
+            confirmLabel = "削除して切り替える",
+        )
+        return
+    }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onSignOut,
+        title = { Text("別のアカウントの記録があります", style = MaterialTheme.typography.dialogTitle) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("この端末には、別のアカウントでバックアップしていた記録が残っています。${email.ifBlank { "別のアカウント" }} にログインしました。", style = MaterialTheme.typography.bodyMedium, color = AppColors.inkSecondary)
+                Text("「このアカウントに保存」を選ぶと、残っている記録をこのアカウントにもバックアップします。自分の記録でない場合は選ばないでください。", style = MaterialTheme.typography.bodyMedium, color = AppColors.inkSecondary)
+                androidx.compose.material3.TextButton(onClick = { confirmReplace = true }) { Text("記録を削除して切り替える", color = AppColors.danger) }
+            }
+        },
+        confirmButton = { androidx.compose.material3.TextButton(onClick = onMerge) { Text("このアカウントに保存") } },
+        dismissButton = { androidx.compose.material3.TextButton(onClick = onSignOut) { Text("ログアウト") } },
+    )
+}
+
+/** Shown before the system permission prompts, which appear without any context of their own. */
+@Composable
+private fun LocationIntroDialog(onStart: () -> Unit, onLater: () -> Unit) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onLater,
+        title = { Text("位置情報を記録しますか？", style = MaterialTheme.typography.dialogTitle) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("移動中は10秒、静止中は5分ごとに現在地を記録して、1日の移動と滞在を地図にまとめます。アプリを閉じている間も、通知を表示して記録を続けます。", style = MaterialTheme.typography.bodyMedium, color = AppColors.inkSecondary)
+                Text("記録は端末に保存され、ログインしたときだけバックアップされます。次に、位置情報・身体活動（静止の判定に使用）・通知の許可を確認します。記録は設定からいつでも停止できます。", style = MaterialTheme.typography.bodyMedium, color = AppColors.inkSecondary)
+            }
+        },
+        confirmButton = { androidx.compose.material3.TextButton(onClick = onStart) { Text("記録を始める") } },
+        dismissButton = { androidx.compose.material3.TextButton(onClick = onLater) { Text("あとで") } },
+    )
+}
 
 private fun isoTimestamp(value: Long): String = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
     timeZone = TimeZone.getTimeZone("UTC")

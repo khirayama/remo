@@ -26,12 +26,12 @@ class TimelineRenderingInstrumentedTest {
         runBlocking {
             store.reload()
             store.clearAll()
-            store.upsertAll((0 until 2_000).map { index ->
+            store.importAll((0 until 2_000).map { index ->
                 LogEntry(id = "render-$index", startedAt = start + index * 10_000L,
                     latitude = 35.0 + index * 0.0001, longitude = 139.0, accuracyMeters = 5.0, updatedAt = start)
             })
         }
-        compose.setContent { MaterialTheme { TrackerHome(null, {}, {}) } }
+        compose.setContent { MaterialTheme { TrackerHome(null, {}, { null }) {} } }
         compose.waitUntil(30_000) {
             compose.onAllNodes(androidx.compose.ui.test.hasText("移動", substring = false)).fetchSemanticsNodes().isNotEmpty()
         }

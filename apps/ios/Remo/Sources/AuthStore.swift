@@ -17,6 +17,8 @@ enum AuthPhase: Equatable {
 @MainActor
 final class AuthStore: ObservableObject {
     private nonisolated static let accountIDKey = "remo.auth.account-id"
+    private nonisolated static let accountEmailKey = "remo.auth.account-email"
+    private nonisolated static let accountNameKey = "remo.auth.account-name"
 
     @Published private(set) var phase: AuthPhase = .loading
     @Published private(set) var user: RemoUser?
@@ -53,16 +55,23 @@ final class AuthStore: ObservableObject {
             let (data, response) = try await AppConfig.session.data(for: request)
             let http = try httpResponse(response)
             guard (200..<300).contains(http.statusCode) else {
-                throw AuthError.server(message(from: data) ?? "認証に失敗しました")
+                // The server may require a confirmed address before the first sign-in.
+                if topLevelCode(from: data) == "EMAIL_NOT_VERIFIED" {
+                    throw AuthError.server("メールアドレスの確認が必要です。届いた確認メールのリンクを開いてから、もう一度ログインしてください")
+                }
+                if http.statusCode == 429 { throw AuthError.server("試行回数が多すぎます。しばらくしてから再度お試しください") }
+                throw AuthError.server(message(from: data) ?? topLevelMessage(from: data) ?? "認証に失敗しました")
             }
             guard let value = http.value(forHTTPHeaderField: "set-auth-token"), !value.isEmpty else {
-                throw AuthError.server("認証トークンを取得できませんでした")
+                throw AuthError.server(signUp
+                    ? "確認メールを送信しました。メール内のリンクを開いてからログインしてください"
+                    : "認証トークンを取得できませんでした")
             }
             token = value
             KeychainToken.save(value)
             let currentUser = try await fetchCurrentUser(token: value)
             user = currentUser
-            Self.storeUserID(currentUser.id)
+            Self.storeUser(currentUser)
             phase = .signedIn
         } catch {
             token = nil
@@ -124,28 +133,59 @@ final class AuthStore: ObservableObject {
             return
         }
         do {
-            user = try await fetchCurrentUser(token: token)
-            if let user { Self.storeUserID(user.id) }
+            let current = try await fetchCurrentUser(token: token)
+            user = current
+            Self.storeUser(current)
             phase = .signedIn
+        } catch AuthError.unauthorized {
+            expireSession()
         } catch {
-            self.token = nil
-            user = nil
-            KeychainToken.remove()
-            Self.clearStoredUserID()
-            phase = .signedOut
+            // Only the server rejecting the session signs the user out.
+            // Starting offline (or during an outage) keeps the session and
+            // its backup; the stored account is shown until the API answers.
+            if let cached = Self.storedUser() {
+                user = cached
+                phase = .signedIn
+            } else {
+                expireSession()
+            }
         }
+    }
+
+    /// The server no longer accepts the stored session: sign out locally so
+    /// the settings screen offers to log in again.
+    func expireSession() {
+        token = nil
+        user = nil
+        KeychainToken.remove()
+        Self.clearStoredUserID()
+        phase = .signedOut
     }
 
     nonisolated static func storedUserID() -> String? {
         UserDefaults.standard.string(forKey: accountIDKey)?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
     }
 
-    private nonisolated static func storeUserID(_ id: String) {
-        UserDefaults.standard.set(id, forKey: accountIDKey)
+    private nonisolated static func storeUser(_ user: RemoUser) {
+        UserDefaults.standard.set(user.id, forKey: accountIDKey)
+        UserDefaults.standard.set(user.email, forKey: accountEmailKey)
+        UserDefaults.standard.set(user.name, forKey: accountNameKey)
+    }
+
+    /// The signed-in user as last confirmed by the API.
+    private nonisolated static func storedUser() -> RemoUser? {
+        guard let id = storedUserID() else { return nil }
+        return RemoUser(
+            id: id,
+            email: UserDefaults.standard.string(forKey: accountEmailKey) ?? "",
+            name: UserDefaults.standard.string(forKey: accountNameKey) ?? ""
+        )
     }
 
     private nonisolated static func clearStoredUserID() {
         UserDefaults.standard.removeObject(forKey: accountIDKey)
+        UserDefaults.standard.removeObject(forKey: accountEmailKey)
+        UserDefaults.standard.removeObject(forKey: accountNameKey)
     }
 
     private func fetchCurrentUser(token: String) async throws -> RemoUser {
@@ -153,6 +193,7 @@ final class AuthStore: ObservableObject {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await AppConfig.session.data(for: request)
         let http = try httpResponse(response)
+        if http.statusCode == 401 { throw AuthError.unauthorized }
         guard (200..<300).contains(http.statusCode) else {
             throw AuthError.server(message(from: data) ?? "セッションが無効です")
         }
@@ -174,6 +215,15 @@ final class AuthStore: ObservableObject {
         return error["code"] as? String
     }
 
+    /// Better Auth reports its own errors as `{ code, message }` at the top level.
+    private func topLevelCode(from data: Data) -> String? {
+        (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["code"] as? String
+    }
+
+    private func topLevelMessage(from data: Data) -> String? {
+        (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["message"] as? String
+    }
+
     private func message(from data: Data) -> String? {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let error = object["error"] as? [String: Any] else { return nil }
@@ -191,10 +241,13 @@ private struct APIResponse<T: Decodable>: Decodable {
 
 private enum AuthError: LocalizedError {
     case server(String)
+    case unauthorized
 
     var errorDescription: String? {
-        if case let .server(message) = self { return message }
-        return nil
+        switch self {
+        case let .server(message): return message
+        case .unauthorized: return "セッションが無効です"
+        }
     }
 }
 

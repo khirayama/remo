@@ -3,16 +3,17 @@ import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { authClient } from "./auth-client";
 import { deleteAccount, deleteAllCloudData, synchronizeEvents } from "./life-api";
-import { clearEvents, clearSyncState, dateKey, downloadExport, enqueueSync, eventsInRange, ExportRange, LifeEvent, loadEvents, loadSyncQueue, prepareLocalStorage, readImport, saveEvents, sortNewest } from "./life-log";
+import { claimRecords, clearEvents, countUnsavedEvents, dateKey, downloadExport, ExportRange, ExportSummary, forgetAccount, lastBackupKey, LifeEvent, loadDayEvents, loadUploadedPhotos, localDeviceStorageId, migrateLegacyTimeline, Ownership, ownershipFor, Place, readImport, rememberUploadedPhoto, replaceRecords, storeImported, summarizeRange } from "./life-log";
+import { clearDirtyDays, countEvents, deleteLocalEvents, listRecordedDays, loadDirtyDays, loadEvent, loadEventsInRange, loadStoredPlaces, putLocalEvents, putLocalPlace, requestPersistentStorage, storageUsage, StorageUsage } from "./timeline-db";
 import { readPhotoMetadata } from "./photo-metadata";
 import { deleteAllPhotoPreviews, deletePhotoPreview, listLocalPhotoPreviewIds, loadPhotoPreview, makePhotoThumbnail, migratePhotoPreviews, savePhotoPreview } from "./photo-storage";
 import { loadRemotePhotoPreview, loadRemotePhotoPreviews, uploadPhotoPreview } from "./photo-api";
-import { buildStayVisitHistory, buildTimelineSnapshot, distanceMeters, PhotoCluster, StayCluster, StayPlace, StayVisit, StayVisitHistory, TimelineActivity, TimelineRenderSnapshot, stayCircleRadiusMeters, suggestPhotoLocation } from "./timeline-map";
-import { AllTimeStayPlace, buildAllTimeStayPlaces, historyOf, parseStayIndexCache, StayIndexCache, StaySummary, stayVisitHistoryFromStays, updateStayIndex } from "./stay-index";
+import { buildTimelineSnapshot, distanceMeters, PHOTO_LOCATION_SUGGESTION_WINDOW_MS, PhotoCluster, StayCluster, StayPlace, StayVisit, StayVisitHistory, STAY_PLACE_RADIUS_METERS, TimelineActivity, TimelineRenderSnapshot, stayCircleRadiusMeters, suggestPhotoLocation } from "./timeline-map";
+import { allStays, AllTimeStayPlace, buildAllTimeStayPlaces, detectDayStays, historyOf, parseStayIndexCache, refreshStayIndex, StayIndexCache, StaySummary, stayVisitHistoryFromStays } from "./stay-index";
 import { deleteStayIndexCache, loadStayIndexCache, saveStayIndexCache } from "./stay-index-storage";
 import { isFreshFix, isStationary } from "./capture-policy";
 import { IconName } from "./icons";
-import { activityDurationLabel, AppMark, ConfirmDeleteDialog, Dialog, dayDate, elapsedStayLabel, formatBackupTime, formatDate, formatDayTime, formatDayTitle, formatDistance, formatTime, Icon, IconBadge, IconButton, mediaSummary, SheetHandle, Spinner, Switch, TextField, useEscape } from "./ui";
+import { activityDurationLabel, AppMark, ConfirmDeleteDialog, Dialog, dayDate, elapsedStayLabel, formatBackupTime, formatDate, formatDayTime, formatDayTitle, formatDistance, formatTime, Icon, IconBadge, IconButton, mediaSummary, SheetHandle, Spinner, Switch, TextField, useEscape, useModalFocus } from "./ui";
 
 const NORMAL_INTERVAL_SECONDS = 10;
 const STATIONARY_INTERVAL_SECONDS = 300; // 5 minutes
@@ -22,12 +23,20 @@ const MOVEMENT_SPEED_MPS = 1.2;
 const CAPTURE_RUNNING_STATUS = "通常10秒／静止時5分で記録中";
 
 // Map colors shared with apps/android TimelineMap.kt / RouteRenderPath.kt.
-const ROUTE_COLOR = "rgb(14, 133, 119)";
-const FOCUS_ROUTE_COLOR = "rgb(8, 94, 84)";
-const STAY_COLOR = "rgb(47, 90, 69)";
+// The dark map needs lighter marks to keep the same contrast.
+const MAP_COLORS = {
+  light: { route: "rgb(14, 133, 119)", focusRoute: "rgb(8, 94, 84)", stay: "rgb(47, 90, 69)" },
+  dark: { route: "rgb(88, 203, 185)", focusRoute: "rgb(160, 235, 222)", stay: "rgb(134, 211, 169)" },
+};
+const DARK_QUERY = "(prefers-color-scheme: dark)";
 const DEFAULT_CENTER: [number, number] = [35.6812, 139.7671];
 const MAP_MAX_ZOOM = 19;
-const TILE_URL = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
+// OpenStreetMap's own tile servers are for light use only; a production
+// deployment sets VITE_MAP_TILE_URL (and its attribution) to a tile provider.
+const TILE_URL = import.meta.env.VITE_MAP_TILE_URL || "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
+const TILE_ATTRIBUTION = import.meta.env.VITE_MAP_TILE_ATTRIBUTION || "© OpenStreetMap";
+/** Remote previews are fetched a few at a time so a day with many photos does not flood the API. */
+const REMOTE_PREVIEW_CONCURRENCY = 4;
 
 /** Unassigned photos taken within this gap of each other share one timeline row. */
 const PHOTO_GROUP_GAP_MS = 30 * 60 * 1000;
@@ -56,6 +65,26 @@ function coordinates(event: { latitude?: number; longitude?: number }) {
   return hasUsableCoordinates(event) ? `${event.latitude.toFixed(5)}, ${event.longitude.toFixed(5)}` : "位置情報なし";
 }
 
+/** The name the user gave to the place at [coordinate], if there is one within the stay-place radius. */
+function namedPlaceAt(places: Place[], coordinate: { latitude: number; longitude: number }): Place | undefined {
+  let nearest: Place | undefined;
+  let nearestDistance = STAY_PLACE_RADIUS_METERS;
+  for (const place of places) {
+    if (place.deleted) continue;
+    const distance = distanceMeters(place, coordinate);
+    if (distance <= nearestDistance) {
+      nearest = place;
+      nearestDistance = distance;
+    }
+  }
+  return nearest;
+}
+
+/** A place's name, or its coordinate when it has none. */
+function placeLabel(places: Place[], coordinate: { latitude: number; longitude: number }) {
+  return namedPlaceAt(places, coordinate)?.name ?? coordinates(coordinate);
+}
+
 function eventMediaSummary(event: Pick<LifeEvent, "mediaType" | "photoCount">) {
   return event.mediaType === "video" ? `動画 ${event.photoCount}本` : `写真 ${event.photoCount}枚`;
 }
@@ -78,19 +107,31 @@ function AuthScreen({ onClose }: { onClose: () => void }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState<string>();
+  const [notice, setNotice] = useState<string>();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const modalRef = useModalFocus<HTMLElement>();
   useEscape(onClose);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsSubmitting(true);
     setMessage(undefined);
+    setNotice(undefined);
     try {
       const result = signUp
         ? await authClient.signUp.email({ email, password, name: email.split("@")[0] || "Remo user" })
         : await authClient.signIn.email({ email, password });
-      if (result.error) setMessage(result.error.message ?? "認証に失敗しました。");
+      if (result.error) {
+        // The server may require a confirmed address before the first sign-in.
+        setMessage(result.error.code === "EMAIL_NOT_VERIFIED"
+          ? "メールアドレスの確認が必要です。届いた確認メールのリンクを開いてから、もう一度ログインしてください。"
+          : result.error.status === 429 ? "試行回数が多すぎます。しばらくしてから再度お試しください。"
+          : result.error.message ?? "認証に失敗しました。");
+      } else if (signUp && !(result.data as { token?: string | null } | null)?.token) {
+        setSignUp(false);
+        setNotice("確認メールを送信しました。メール内のリンクを開いてからログインしてください。");
+      }
     } catch {
       setMessage("接続できませんでした。通信環境を確認してください。");
     } finally {
@@ -103,7 +144,7 @@ function AuthScreen({ onClose }: { onClose: () => void }) {
     setMessage(undefined);
   }
 
-  return <main className="auth-screen" role="dialog" aria-modal="true" aria-label="ログイン">
+  return <main ref={modalRef} data-modal tabIndex={-1} className="auth-screen" role="dialog" aria-modal="true" aria-label="ログイン">
     <div className="auth-column">
       <div className="auth-top"><IconButton icon="close" label="閉じる" onClick={onClose}/></div>
       <div className="auth-brand"><span className="auth-brand-mark"><AppMark size={30}/></span><span>remo</span></div>
@@ -132,6 +173,7 @@ function AuthScreen({ onClose }: { onClose: () => void }) {
           required
           trailing={<IconButton icon={showPassword ? "visibilityOff" : "visibility"} label={showPassword ? "パスワードを隠す" : "パスワードを表示"} onClick={() => setShowPassword((value) => !value)}/>}
         />
+        {notice && <p className="notice-container" role="status"><Icon name="email" size={20}/><span>{notice}</span></p>}
         {message && <p className="error-container" role="alert"><Icon name="errorOutline" size={20}/><span>{message}</span></p>}
         <button className="filled-button wide" disabled={isSubmitting}>{isSubmitting ? <Spinner size={20} light/> : signUp ? "アカウントを作成" : "ログイン"}</button>
       </form>
@@ -202,7 +244,7 @@ function placeMarkerOpacity(lastVisitedAt: string, now: number) {
 
 type SavedView = { center: L.LatLng; zoom: number };
 
-function LeafletMap({ timeline, previews, viewKey, focus, currentLocation, places, selectedPlaceId, getInsets, onSelectPhotos, onSelectPlace }: { timeline: TimelineRenderSnapshot; previews: Map<string, string>; viewKey: string; focus?: MapFocus; currentLocation?: CurrentLocation; places?: AllTimeStayPlace[]; selectedPlaceId?: string; getInsets: () => MapInsets; onSelectPhotos: (photos: LifeEvent[]) => void; onSelectPlace: (place: AllTimeStayPlace) => void }) {
+function LeafletMap({ timeline, previews, viewKey, focus, currentLocation, places, placeNames, selectedPlaceId, getInsets, onSelectPhotos, onSelectPlace }: { timeline: TimelineRenderSnapshot; previews: Map<string, string>; viewKey: string; focus?: MapFocus; currentLocation?: CurrentLocation; places?: AllTimeStayPlace[]; placeNames: Place[]; selectedPlaceId?: string; getInsets: () => MapInsets; onSelectPhotos: (photos: LifeEvent[]) => void; onSelectPlace: (place: AllTimeStayPlace) => void }) {
   const mapElementRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const layerRef = useRef<L.LayerGroup | null>(null);
@@ -217,6 +259,7 @@ function LeafletMap({ timeline, previews, viewKey, focus, currentLocation, place
   const [ready, setReady] = useState(false);
   const { movementSegments, stayClusters, photoClusters, mapNodes } = timeline;
   const allPlaces = places !== undefined;
+  const { route: ROUTE_COLOR, focusRoute: FOCUS_ROUTE_COLOR, stay: STAY_COLOR } = MAP_COLORS[useMediaQuery(DARK_QUERY) ? "dark" : "light"];
   useEffect(() => { onSelectPhotosRef.current = onSelectPhotos; }, [onSelectPhotos]);
   useEffect(() => { onSelectPlaceRef.current = onSelectPlace; }, [onSelectPlace]);
   const isToday = !allPlaces && viewKey === dateKey(new Date());
@@ -230,7 +273,7 @@ function LeafletMap({ timeline, previews, viewKey, focus, currentLocation, place
     if (!element) return;
     const map = L.map(element, { attributionControl: true, zoomControl: false, minZoom: 2, maxZoom: MAP_MAX_ZOOM, worldCopyJump: true }).setView(DEFAULT_CENTER, 11);
     map.attributionControl.setPrefix(false);
-    L.tileLayer(TILE_URL, { maxZoom: MAP_MAX_ZOOM, attribution: "© OpenStreetMap" }).addTo(map);
+    L.tileLayer(TILE_URL, { maxZoom: MAP_MAX_ZOOM, attribution: TILE_ATTRIBUTION }).addTo(map);
     mapRef.current = map;
     layerRef.current = L.layerGroup().addTo(map);
     // Hundreds of place circles draw far faster on one canvas than as SVG nodes.
@@ -264,7 +307,7 @@ function LeafletMap({ timeline, previews, viewKey, focus, currentLocation, place
       }).addTo(layer);
       marker.on("click", () => onSelectPlaceRef.current(place));
     });
-  }, [places, ready, selectedPlaceId]);
+  }, [STAY_COLOR, places, ready, selectedPlaceId]);
 
   useEffect(() => {
     const layer = layerRef.current;
@@ -289,7 +332,7 @@ function LeafletMap({ timeline, previews, viewKey, focus, currentLocation, place
       }).addTo(layer);
       const popupKey = `stay:${stay.events[0]?.event.id ?? stay.id}`;
       (circle as L.Circle & { remoPopupKey?: string }).remoPopupKey = popupKey;
-      circle.bindPopup(`<div class="map-popup"><strong>滞在</strong><span>${escapeHtml(formatTime(stay.startedAt))} – ${escapeHtml(formatTime(stay.endedAt))} · ${escapeHtml(elapsedStayLabel(stay.durationMs))}</span></div>`, { className: "remo-popup", closeButton: false });
+      circle.bindPopup(`<div class="map-popup"><strong>${escapeHtml(namedPlaceAt(placeNames, stay)?.name ?? "滞在")}</strong><span>${escapeHtml(formatTime(stay.startedAt))} – ${escapeHtml(formatTime(stay.endedAt))} · ${escapeHtml(elapsedStayLabel(stay.durationMs))}</span></div>`, { className: "remo-popup", closeButton: false });
       if (openPopupKey === popupKey) popupToRestore = circle;
     });
     if (focus?.kind === "movement" && focus.path.length > 1) {
@@ -302,7 +345,7 @@ function LeafletMap({ timeline, previews, viewKey, focus, currentLocation, place
       marker.on("click", () => onSelectPhotosRef.current(cluster.events));
     });
     popupToRestore?.openPopup();
-  }, [allPlaces, focus, movementSegments, photoClusters, previews, ready, stayClusters]);
+  }, [FOCUS_ROUTE_COLOR, ROUTE_COLOR, STAY_COLOR, allPlaces, focus, movementSegments, photoClusters, placeNames, previews, ready, stayClusters]);
 
   // Current location changes frequently while capturing. Keep it in its own
   // layer so a new GPS sample does not rebuild every route/photo/stay layer.
@@ -474,11 +517,11 @@ function RowTitle({ title, trailing }: { title: string; trailing?: string }) {
   return <span className="row-title"><strong>{title}</strong>{trailing && <span>{trailing}</span>}</span>;
 }
 
-function ActivityRow({ activity, isFirst, isLast, selected, previews, onFocus, onSelectPhotos, onOpenHistory }: { activity: TimelineActivity; isFirst: boolean; isLast: boolean; selected: boolean; previews: Map<string, string>; onFocus: () => void; onSelectPhotos: (photos: LifeEvent[]) => void; onOpenHistory: () => void }) {
+function ActivityRow({ activity, placeName, isFirst, isLast, selected, previews, onFocus, onSelectPhotos, onOpenHistory }: { activity: TimelineActivity; placeName?: string; isFirst: boolean; isLast: boolean; selected: boolean; previews: Map<string, string>; onFocus: () => void; onSelectPhotos: (photos: LifeEvent[]) => void; onOpenHistory: () => void }) {
   const stay = activity.kind === "stay";
   return <TimelineRow startedAt={activity.startedAt} endedAt={activity.endedAt} isFirst={isFirst} isLast={isLast} badge={stay ? <IconBadge name="place" tone="green"/> : <IconBadge name="route" tone="teal"/>}>
     <div className={`row-card ${activity.kind}${selected ? " selected" : ""}`} role="button" tabIndex={0} aria-pressed={selected} onClick={onFocus} onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); onFocus(); } }}>
-      <RowTitle title={stay ? "滞在" : "移動"} trailing={activityDurationLabel(activity.durationMs)}/>
+      <RowTitle title={stay ? placeName ?? "滞在" : "移動"} trailing={activityDurationLabel(activity.durationMs)}/>
       {!stay && <span className="row-subtitle">{formatDistance(activity.distanceMeters)}</span>}
       {activity.photos.length > 0 && <PhotoStrip entries={activity.photos} previews={previews} onOpen={() => onSelectPhotos(activity.photos)}/>}
       {stay && selected && <button type="button" className="text-button row-card-action" onClick={(event) => { event.stopPropagation(); onOpenHistory(); }}><Icon name="restore" size={18}/>この場所の訪問履歴</button>}
@@ -498,7 +541,7 @@ function PhotoGroupRow({ entries, isFirst, isLast, previews, onOpen }: { entries
   </TimelineRow>;
 }
 
-function StayPlacesSection({ places, onOpenHistory }: { places: StayPlace[]; onOpenHistory: (place: MapCoordinate) => void }) {
+function StayPlacesSection({ places, placeNames, onOpenHistory }: { places: StayPlace[]; placeNames: Place[]; onOpenHistory: (place: MapCoordinate) => void }) {
   const [expanded, setExpanded] = useState(false);
   const ordered = useMemo(() => [...places].sort((a, b) => b.visitCount - a.visitCount || b.totalDurationMs - a.totalDurationMs), [places]);
   return <section className="stay-places">
@@ -507,17 +550,33 @@ function StayPlacesSection({ places, onOpenHistory }: { places: StayPlace[]; onO
       <Icon name={expanded ? "expandLess" : "expandMore"}/>
     </button>
     {expanded && <ul>{ordered.map((place) => <li key={place.id}>
-      <button type="button" className="stay-place-row" onClick={() => onOpenHistory(place)} aria-label={`${coordinates(place)}の訪問履歴`}>
+      <button type="button" className="stay-place-row" onClick={() => onOpenHistory(place)} aria-label={`${placeLabel(placeNames, place)}の訪問履歴`}>
         <IconBadge name="place" tone="green"/>
-        <div><strong>{coordinates(place)}</strong><small>{place.visitCount}回 · 合計{activityDurationLabel(place.totalDurationMs)} · {place.visits.map((visit: StayCluster) => formatTime(visit.startedAt)).join(" / ")}</small></div>
+        <div><strong>{placeLabel(placeNames, place)}</strong><small>{place.visitCount}回 · 合計{activityDurationLabel(place.totalDurationMs)} · {place.visits.map((visit: StayCluster) => formatTime(visit.startedAt)).join(" / ")}</small></div>
         <Icon name="chevronRight" className="stay-place-chevron"/>
       </button>
     </li>)}</ul>}
   </section>;
 }
 
+/** Names a place, renames it, or removes its name. */
+function PlaceNameDialog({ current, onDismiss, onSave }: { current?: Place; onDismiss: () => void; onSave: (name: string) => void }) {
+  const [name, setName] = useState(current?.name ?? "");
+  const trimmed = name.trim();
+  return <Dialog title={current ? "場所の名前を変更" : "場所に名前を付ける"} onDismiss={onDismiss} actions={<>
+    {current && <button type="button" className="text-button danger" onClick={() => onSave("")}>名前を削除</button>}
+    <button type="button" className="text-button" onClick={onDismiss}>キャンセル</button>
+    <button type="button" className="text-button" disabled={!trimmed || trimmed === current?.name} onClick={() => onSave(trimmed)}>保存</button>
+  </>}>
+    <p>自宅や職場などの名前を付けると、座標の代わりに表示されます。ログイン中は他の端末にも同期されます。</p>
+    <form onSubmit={(event) => { event.preventDefault(); if (trimmed && trimmed !== current?.name) onSave(trimmed); }}>
+      <TextField label="名前" value={name} maxLength={80} onChange={(event) => setName(event.target.value)}/>
+    </form>
+  </Dialog>;
+}
+
 /** All-time visits to one place, grouped by day. Tapping a day opens it. */
-function PlaceHistorySheet({ history, place, onClose, onOpenDay }: { history?: StayVisitHistory; place: MapCoordinate; onClose: () => void; onOpenDay: (day: string) => void }) {
+function PlaceHistorySheet({ history, place, placeNames, onClose, onOpenDay, onRename }: { history?: StayVisitHistory; place: MapCoordinate; placeNames: Place[]; onClose: () => void; onOpenDay: (day: string) => void; onRename: (place: MapCoordinate, current: Place | undefined, name: string) => void }) {
   const days = useMemo(() => {
     const groups: { day: string; visits: StayVisit[] }[] = [];
     history?.visits.forEach((visit) => {
@@ -529,12 +588,16 @@ function PlaceHistorySheet({ history, place, onClose, onOpenDay }: { history?: S
     return groups;
   }, [history]);
   const first = history?.visits.at(-1);
+  const named = namedPlaceAt(placeNames, place);
+  const [naming, setNaming] = useState(false);
+  const modalRef = useModalFocus<HTMLElement>();
   useEscape(onClose);
   return <div className="scrim sheet-scrim" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-    <section className="modal-sheet" role="dialog" aria-modal="true" aria-label="訪問履歴">
+    <section ref={modalRef} data-modal tabIndex={-1} className="modal-sheet" role="dialog" aria-modal="true" aria-label="訪問履歴">
       <SheetHandle/>
       <header className="modal-sheet-header">
-        <div><h2>訪問履歴</h2><p>{coordinates(place)} · 100m以内の滞在</p></div>
+        <div><h2>{named?.name ?? "訪問履歴"}</h2><p>{coordinates(place)} · 100m以内の滞在</p></div>
+        <IconButton icon="edit" label={named ? "場所の名前を変更" : "場所に名前を付ける"} onClick={() => setNaming(true)}/>
         <IconButton icon="close" label="閉じる" onClick={onClose}/>
       </header>
       {history ? <>
@@ -555,6 +618,7 @@ function PlaceHistorySheet({ history, place, onClose, onOpenDay }: { history?: S
         </li>)}</ol>
       </> : <div className="all-places-status"><Spinner size={20}/><span>過去の記録を集計しています…</span></div>}
     </section>
+    {naming && <PlaceNameDialog current={named} onDismiss={() => setNaming(false)} onSave={(name) => { setNaming(false); onRename(place, named, name); }}/>}
   </div>;
 }
 
@@ -567,7 +631,7 @@ const PLACE_PERIODS: { value: PlacePeriod; label: string; days?: number }[] = [
 const PLACE_LIST_PAGE = 50;
 
 /** Sheet content of the all-places map: every place ever stayed at, most visited first. */
-function AllPlacesSheetContent({ places, stays, progress, period, selectedPlaceId, onPeriodChange, onSelectPlace }: { places?: AllTimeStayPlace[]; stays?: StaySummary[]; progress?: StayIndexProgress; period: PlacePeriod; selectedPlaceId?: string; onPeriodChange: (period: PlacePeriod) => void; onSelectPlace: (place: AllTimeStayPlace) => void }) {
+function AllPlacesSheetContent({ places, placeNames, stays, progress, period, selectedPlaceId, onPeriodChange, onSelectPlace }: { places?: AllTimeStayPlace[]; placeNames: Place[]; stays?: StaySummary[]; progress?: StayIndexProgress; period: PlacePeriod; selectedPlaceId?: string; onPeriodChange: (period: PlacePeriod) => void; onSelectPlace: (place: AllTimeStayPlace) => void }) {
   const [limit, setLimit] = useState(PLACE_LIST_PAGE);
   useEffect(() => setLimit(PLACE_LIST_PAGE), [period]);
   const dayCount = useMemo(() => new Set(stays?.map((stay) => dateKey(stay.startedAt))).size, [stays]);
@@ -592,9 +656,9 @@ function AllPlacesSheetContent({ places, stays, progress, period, selectedPlaceI
     {places && places.length > 0 && <>
       <div className="section-label-row all-places-label"><span>訪問回数の多い順</span><small>100m以内は同じ場所</small></div>
       <ul className="all-places-list">{places.slice(0, limit).map((place) => <li key={place.id}>
-        <button type="button" className={`stay-place-row${place.id === selectedPlaceId ? " selected" : ""}`} onClick={() => onSelectPlace(place)} aria-label={`${coordinates(place)}の訪問履歴`}>
+        <button type="button" className={`stay-place-row${place.id === selectedPlaceId ? " selected" : ""}`} onClick={() => onSelectPlace(place)} aria-label={`${placeLabel(placeNames, place)}の訪問履歴`}>
           <IconBadge name="place" tone="green"/>
-          <div><strong>{coordinates(place)}</strong><small>{place.visits.length}回 · {place.dayCount}日 · 合計{activityDurationLabel(place.totalDurationMs)} · 最終 {formatDate(place.lastVisitedAt)}</small></div>
+          <div><strong>{placeLabel(placeNames, place)}</strong><small>{place.visits.length}回 · {place.dayCount}日 · 合計{activityDurationLabel(place.totalDurationMs)} · 最終 {formatDate(place.lastVisitedAt)}</small></div>
           <Icon name="chevronRight" className="stay-place-chevron"/>
         </button>
       </li>)}</ul>
@@ -625,8 +689,7 @@ function periodStart(period: PlacePeriod, now = Date.now()) {
   return days === undefined ? undefined : new Date(now - days * 86_400_000).toISOString();
 }
 
-function TimelineHome({ events, stayIndex, previews, selectedDate, currentLocation, autoCapture, onDateChange, onSelectPhotos, onOpenSettings }: { events: LifeEvent[]; stayIndex: StayIndexState; previews: Map<string, string>; selectedDate: string; currentLocation?: CurrentLocation; autoCapture: boolean; onDateChange: (value: string) => void; onSelectPhotos: (photos: LifeEvent[]) => void; onOpenSettings: () => void }) {
-  const dayEvents = useMemo(() => events.filter((event) => dateKey(event.startedAt) === selectedDate).sort((a, b) => a.startedAt.localeCompare(b.startedAt)), [events, selectedDate]);
+function TimelineHome({ dayEvents, loadedDate, stayIndex, placeNames, previews, selectedDate, currentLocation, autoCapture, onDateChange, onSelectPhotos, onOpenSettings, onRenamePlace }: { dayEvents: LifeEvent[]; /** The day [dayEvents] belong to; it trails `selectedDate` while a day loads. */ loadedDate: string; stayIndex: StayIndexState; placeNames: Place[]; previews: Map<string, string>; selectedDate: string; currentLocation?: CurrentLocation; autoCapture: boolean; onDateChange: (value: string) => void; onSelectPhotos: (photos: LifeEvent[]) => void; onOpenSettings: () => void; onRenamePlace: (place: MapCoordinate, current: Place | undefined, name: string) => void }) {
   const timeline = useMemo(() => buildTimelineSnapshot(dayEvents), [dayEvents]);
   const items = useMemo(() => buildSheetItems(timeline), [timeline]);
   const summary = useMemo(() => daySummary(timeline), [timeline]);
@@ -647,11 +710,12 @@ function TimelineHome({ events, stayIndex, previews, selectedDate, currentLocati
   }, [period, stayIndex.stays]);
   const places = useMemo(() => periodStays && buildAllTimeStayPlaces(periodStays), [periodStays]);
   const selectedPlace = places?.find((place) => place.id === selectedPlaceId);
-  // A day's stay history reads the index once it is ready, so it matches the all-places map.
+  // A day's stay history is read from the index, so it matches the all-places
+  // map; until the index is ready the sheet shows that it is being prepared.
   const dayHistory = useMemo(() => {
-    if (!historyPlace) return undefined;
-    return stayIndex.stays ? stayVisitHistoryFromStays(stayIndex.stays, historyPlace) : buildStayVisitHistory(events, historyPlace);
-  }, [events, historyPlace, stayIndex.stays]);
+    if (!historyPlace || !stayIndex.stays) return undefined;
+    return stayVisitHistoryFromStays(stayIndex.stays, historyPlace);
+  }, [historyPlace, stayIndex.stays]);
 
   useEffect(() => {
     setFocus(undefined);
@@ -696,7 +760,7 @@ function TimelineHome({ events, stayIndex, previews, selectedDate, currentLocati
   }
 
   return <section className={`timeline-home${desktop ? " desktop" : ""}`}>
-    <LeafletMap timeline={timeline} previews={previews} viewKey={selectedDate} focus={focus} currentLocation={currentLocation} places={mode === "all" ? places ?? [] : undefined} selectedPlaceId={selectedPlaceId} getInsets={getInsets} onSelectPhotos={onSelectPhotos} onSelectPlace={selectPlace}/>
+    <LeafletMap timeline={timeline} previews={previews} viewKey={loadedDate} focus={focus} currentLocation={currentLocation} places={mode === "all" ? places ?? [] : undefined} placeNames={placeNames} selectedPlaceId={selectedPlaceId} getInsets={getInsets} onSelectPhotos={onSelectPhotos} onSelectPlace={selectPlace}/>
     <div className="map-controls map-controls-start">
       <div className="map-controls-row">
         <MapControlButton icon="settings" label="設定" onClick={onOpenSettings}/>
@@ -723,7 +787,7 @@ function TimelineHome({ events, stayIndex, previews, selectedDate, currentLocati
       ><SheetHandle/></div>}
       <div ref={scrollRef} className="sheet-scroll">
         {mode === "all"
-          ? <AllPlacesSheetContent places={places} stays={periodStays} progress={stayIndex.progress} period={period} selectedPlaceId={selectedPlaceId} onPeriodChange={setPeriod} onSelectPlace={(place) => { selectPlace(place); if (!desktop) setExpanded(false); }}/>
+          ? <AllPlacesSheetContent places={places} placeNames={placeNames} stays={periodStays} progress={stayIndex.progress} period={period} selectedPlaceId={selectedPlaceId} onPeriodChange={setPeriod} onSelectPlace={(place) => { selectPlace(place); if (!desktop) setExpanded(false); }}/>
           : <>
             <DayHeader selectedDate={selectedDate} onDateChange={onDateChange}/>
             <div className="day-summary">
@@ -738,29 +802,33 @@ function TimelineHome({ events, stayIndex, previews, selectedDate, currentLocati
             {items.length ? <>
               <div className="section-label-row"><span>タイムライン</span><small>{items.length}件</small></div>
               <ol className="timeline-list">{items.map((item, index) => item.kind === "activity"
-                ? <ActivityRow key={item.id} activity={item.activity} isFirst={index === 0} isLast={index === items.length - 1} selected={focus?.activityId === item.id} previews={previews} onFocus={() => { toggleFocus(item.activity); if (!desktop) setExpanded(true); }} onSelectPhotos={onSelectPhotos} onOpenHistory={() => item.activity.kind === "stay" && setHistoryPlace({ latitude: item.activity.latitude, longitude: item.activity.longitude })}/>
+                ? <ActivityRow key={item.id} activity={item.activity} placeName={item.activity.kind === "stay" ? namedPlaceAt(placeNames, item.activity)?.name : undefined} isFirst={index === 0} isLast={index === items.length - 1} selected={focus?.activityId === item.id} previews={previews} onFocus={() => { toggleFocus(item.activity); if (!desktop) setExpanded(true); }} onSelectPhotos={onSelectPhotos} onOpenHistory={() => item.activity.kind === "stay" && setHistoryPlace({ latitude: item.activity.latitude, longitude: item.activity.longitude })}/>
                 : <PhotoGroupRow key={item.id} entries={item.entries} isFirst={index === 0} isLast={index === items.length - 1} previews={previews} onOpen={() => onSelectPhotos(item.entries)}/>)}</ol>
             </> : <EmptyTimeline autoCapture={autoCapture}/>}
-            {timeline.stayPlaces.length > 0 && <StayPlacesSection key={selectedDate} places={timeline.stayPlaces} onOpenHistory={(place) => setHistoryPlace({ latitude: place.latitude, longitude: place.longitude })}/>}
+            {timeline.stayPlaces.length > 0 && <StayPlacesSection key={selectedDate} places={timeline.stayPlaces} placeNames={placeNames} onOpenHistory={(place) => setHistoryPlace({ latitude: place.latitude, longitude: place.longitude })}/>}
           </>}
       </div>
     </section>
-    {mode === "day" && historyPlace && <PlaceHistorySheet history={dayHistory} place={historyPlace} onClose={() => setHistoryPlace(undefined)} onOpenDay={openDay}/>}
-    {mode === "all" && showPlaceHistory && selectedPlace && <PlaceHistorySheet history={historyOf(selectedPlace.visits)} place={selectedPlace} onClose={() => setShowPlaceHistory(false)} onOpenDay={openDay}/>}
+    {mode === "day" && historyPlace && <PlaceHistorySheet history={dayHistory} place={historyPlace} placeNames={placeNames} onClose={() => setHistoryPlace(undefined)} onOpenDay={openDay} onRename={onRenamePlace}/>}
+    {mode === "all" && showPlaceHistory && selectedPlace && <PlaceHistorySheet history={historyOf(selectedPlace.visits)} place={selectedPlace} placeNames={placeNames} onClose={() => setShowPlaceHistory(false)} onOpenDay={openDay} onRename={onRenamePlace}/>}
   </section>;
 }
 
 // ---- Photos ---------------------------------------------------------------
 
-function PhotoListSheet({ photos, previews, onClose, onEditLocation }: { photos: LifeEvent[]; previews: Map<string, string>; onClose: () => void; onEditLocation: (photo: LifeEvent) => void }) {
+function PhotoListSheet({ photos, previews, signedIn, onClose, onEditLocation }: { photos: LifeEvent[]; previews: Map<string, string>; signedIn: boolean; onClose: () => void; onEditLocation: (photo: LifeEvent) => void }) {
   const [selectedPhoto, setSelectedPhoto] = useState<{ photo: LifeEvent; url?: string }>();
   const [remotePhotos, setRemotePhotos] = useState<Map<string, string[]>>(new Map());
   const sorted = useMemo(() => [...photos].sort((a, b) => a.startedAt.localeCompare(b.startedAt)), [photos]);
   useEffect(() => {
+    // Without an account there is no backup to read the other previews from.
+    if (!signedIn) return;
     let cancelled = false;
     const urls: string[] = [];
     void (async () => {
       for (const photo of sorted) {
+        // Videos have no backed-up preview.
+        if (photo.mediaType === "video") continue;
         const blobs = await loadRemotePhotoPreviews(photo.id).catch(() => []);
         if (cancelled) break;
         const images = blobs.map((blob) => URL.createObjectURL(blob));
@@ -769,19 +837,21 @@ function PhotoListSheet({ photos, previews, onClose, onEditLocation }: { photos:
       }
     })();
     return () => { cancelled = true; urls.forEach(URL.revokeObjectURL); };
-  }, [sorted]);
+  }, [signedIn, sorted]);
   const first = formatTime(sorted[0].startedAt);
   const last = formatTime(sorted.at(-1)!.startedAt);
+  const modalRef = useModalFocus<HTMLElement>();
   useEscape(onClose);
   return <div className="scrim sheet-scrim" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-    <section className="modal-sheet" role="dialog" aria-modal="true" aria-label="写真と動画">
+    <section ref={modalRef} data-modal tabIndex={-1} className="modal-sheet" role="dialog" aria-modal="true" aria-label="写真と動画">
       <SheetHandle/>
       <header className="modal-sheet-header">
         <div><h2>写真と動画</h2><p>{mediaSummaryOf(sorted)} · {first === last ? first : `${first}–${last}`}</p></div>
         <IconButton icon="close" label="閉じる" onClick={onClose}/>
       </header>
       <div className="photo-grid">{sorted.flatMap((photo) => {
-        const images = remotePhotos.get(photo.id) ?? [previews.get(photo.id)];
+        const remote = remotePhotos.get(photo.id);
+        const images = remote?.length ? remote : [previews.get(photo.id)];
         return images.map((url, index) => <div className="photo-grid-tile" key={`${photo.id}:${index}`}>
           <PhotoThumb event={photo} preview={url} onClick={() => setSelectedPhoto({ photo, url })} large/>
           <span className="photo-grid-meta"><time>{formatTime(photo.startedAt)}</time>{index === 0 && photo.photoCount > 1 && <small>{photo.photoCount}</small>}</span>
@@ -794,8 +864,9 @@ function PhotoListSheet({ photos, previews, onClose, onEditLocation }: { photos:
 
 function PhotoViewer({ photo, imageUrl, onClose, onEdit }: { photo: LifeEvent; imageUrl?: string; onClose: () => void; onEdit: () => void }) {
   const isVideo = photo.mediaType === "video";
+  const modalRef = useModalFocus<HTMLDivElement>();
   useEscape(onClose);
-  return <div className="photo-viewer" role="dialog" aria-modal="true" aria-label="メディアを拡大表示">
+  return <div ref={modalRef} data-modal tabIndex={-1} className="photo-viewer" role="dialog" aria-modal="true" aria-label="メディアを拡大表示">
     {imageUrl
       ? <img src={imageUrl} alt={isVideo ? "選択した動画のサムネイル" : "選択した写真"}/>
       : <div className="photo-viewer-missing"><Icon name="imageNotSupported" size={40}/><strong>この端末に画像がありません</strong><span>撮影日時と位置の記録だけが残っています</span></div>}
@@ -820,8 +891,9 @@ function LocationPicker({ value, onChange }: { value?: MapCoordinate; onChange: 
   useEffect(() => {
     const element = elementRef.current;
     if (!element) return;
-    const map = L.map(element, { attributionControl: false, zoomControl: false, minZoom: 2, maxZoom: MAP_MAX_ZOOM }).setView(value ? [value.latitude, value.longitude] : DEFAULT_CENTER, value ? 16 : 11);
-    L.tileLayer(TILE_URL, { maxZoom: MAP_MAX_ZOOM }).addTo(map);
+    const map = L.map(element, { attributionControl: true, zoomControl: false, minZoom: 2, maxZoom: MAP_MAX_ZOOM }).setView(value ? [value.latitude, value.longitude] : DEFAULT_CENTER, value ? 16 : 11);
+    map.attributionControl.setPrefix(false);
+    L.tileLayer(TILE_URL, { maxZoom: MAP_MAX_ZOOM, attribution: TILE_ATTRIBUTION }).addTo(map);
     map.on("click", (event) => onChangeRef.current({ latitude: Number(event.latlng.lat.toFixed(6)), longitude: Number(event.latlng.lng.toFixed(6)) }));
     mapRef.current = map;
     window.setTimeout(() => map.invalidateSize(), 0);
@@ -883,6 +955,7 @@ function PhotoLocationScreen({ event, events, onClose, onUpdate, onDelete }: { e
     setLatitudeText(editableCoordinate(event.latitude));
     setLongitudeText(editableCoordinate(event.longitude));
   }, [event.id, event.latitude, event.longitude]);
+  const modalRef = useModalFocus<HTMLDivElement>();
   useEscape(onClose);
   const coordinate = useMemo(() => {
     const latitude = Number(latitudeText.trim());
@@ -913,7 +986,7 @@ function PhotoLocationScreen({ event, events, onClose, onUpdate, onDelete }: { e
     onUpdate(updated);
   }
 
-  return <div className="full-screen" role="dialog" aria-modal="true" aria-label="写真の位置">
+  return <div ref={modalRef} data-modal tabIndex={-1} className="full-screen" role="dialog" aria-modal="true" aria-label="写真の位置">
     <header className="screen-header">
       <IconButton icon="close" label="閉じる" onClick={onClose}/>
       <div><h2>写真の位置</h2><p>{formatDayTime(event.startedAt)} · {eventMediaSummary(event)}</p></div>
@@ -974,12 +1047,27 @@ function SettingsGroup({ title, children }: { title: string; children: ReactNode
 
 const Chevron = () => <Icon name="chevronRight" size={20} className="chevron"/>;
 
-function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBackupAt, onBack, onToggleCapture, onAddPhotos, onExport, onImport, onDeleteAll, onBackup, onOpenAuth, onSignOut, onDeleteAccount }: {
+function formatBytes(bytes: number) {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function storageSubtitle(usage: StorageUsage | undefined, eventCount: number) {
+  const records = `${eventCount.toLocaleString("ja-JP")}件の記録`;
+  if (!usage) return records;
+  const used = `${records} · ${formatBytes(usage.usageBytes)} / ${formatBytes(usage.quotaBytes)}使用`;
+  return usage.persisted ? used : `${used}（ブラウザが容量不足時に削除する可能性があります。エクスポートかバックアップをおすすめします）`;
+}
+
+function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBackupAt, eventCount, storage, onBack, onToggleCapture, onAddPhotos, onExport, onImport, onDeleteAll, onBackup, onOpenAuth, onSignOut, onDeleteAccount }: {
   user?: { id: string; email: string };
   captureEnabled: boolean;
   captureIssue?: string;
   syncState: string;
   lastBackupAt?: string;
+  eventCount: number;
+  storage?: StorageUsage;
   onBack: () => void;
   onToggleCapture: () => void;
   onAddPhotos: (event: ChangeEvent<HTMLInputElement>) => void;
@@ -991,8 +1079,9 @@ function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBac
   onSignOut: () => void;
   onDeleteAccount: () => void;
 }) {
+  const modalRef = useModalFocus<HTMLDivElement>();
   useEscape(onBack);
-  return <div className="settings-screen">
+  return <div ref={modalRef} data-modal tabIndex={-1} className="settings-screen" role="dialog" aria-modal="true" aria-label="設定">
     <header className="top-app-bar"><IconButton icon="arrowBack" label="戻る" onClick={onBack}/><h1>設定</h1></header>
     <div className="settings-content">
       <SettingsGroup title="記録">
@@ -1008,6 +1097,7 @@ function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBac
         <button type="button" className="filled-button wide" onClick={onOpenAuth}>ログイン・新規登録</button>
       </div></section>}
       <SettingsGroup title="データ">
+        <ActionRow icon="storage" title="このブラウザの保存容量" subtitle={storageSubtitle(storage, eventCount)}/>
         <ActionRow icon="iosShare" title="JSONをエクスポート" subtitle="期間を指定して位置と写真の情報を書き出します" trailing={<Chevron/>} onClick={onExport}/>
         <ActionRow icon="fileOpen" title="JSONをインポート" subtitle="書き出したファイルから記録を読み込みます" as="label" trailing={<Chevron/>}><input type="file" accept="application/json,.json" hidden onChange={onImport}/></ActionRow>
       </SettingsGroup>
@@ -1015,7 +1105,7 @@ function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBac
         <ActionRow icon="deleteOutline" title="すべての記録を削除" danger onClick={onDeleteAll}/>
         {user && <ActionRow icon="personRemove" title="アカウントを削除" danger onClick={onDeleteAccount}/>}
       </SettingsGroup>
-      <p className="settings-footnote">Remo Web<br/>記録はこのブラウザに保存され、写真は外部に送信されません</p>
+      <p className="settings-footnote">Remo Web<br/>記録はこのブラウザに保存されます。ログイン中は、記録と写真の縮小画像をバックアップします</p>
     </div>
   </div>;
 }
@@ -1054,20 +1144,26 @@ function DateField({ label, value, onChange }: { label: string; value: string; o
   </button>;
 }
 
-function ExportRangeDialog({ events, range, onChange, onClose, onExport }: { events: LifeEvent[]; range: ExportRange; onChange: (range: ExportRange) => void; onClose: () => void; onExport: () => void }) {
-  const selected = eventsInRange(events, range);
-  const locationCount = selected.filter((event) => event.source !== "photo").length;
-  const photoCount = selected.filter((event) => event.source === "photo").reduce((sum, event) => sum + event.photoCount, 0);
+function ExportRangeDialog({ storageId, range, exporting, onChange, onClose, onExport }: { storageId: string; range: ExportRange; exporting: boolean; onChange: (range: ExportRange) => void; onClose: () => void; onExport: () => void }) {
   const invalid = range.from > range.to;
+  // Counted from storage a day at a time; the records are not kept in memory.
+  const [summary, setSummary] = useState<ExportSummary>();
+  useEffect(() => {
+    setSummary(undefined);
+    if (invalid) return;
+    const controller = new AbortController();
+    void summarizeRange(storageId, range, controller.signal).then((result) => { if (result) setSummary(result); }).catch(() => undefined);
+    return () => controller.abort();
+  }, [invalid, range, storageId]);
   return <Dialog title="JSONをエクスポート" onDismiss={onClose} actions={<>
     <button type="button" className="text-button" onClick={onClose}>キャンセル</button>
-    <button type="button" className="text-button" disabled={invalid} onClick={onExport}>書き出す</button>
+    <button type="button" className="text-button" disabled={invalid || exporting} onClick={onExport}>{exporting ? "書き出し中…" : "書き出す"}</button>
   </>}>
     <div className="date-fields">
       <DateField label="開始日" value={range.from} onChange={(from) => onChange({ ...range, from })}/>
       <DateField label="終了日" value={range.to} onChange={(to) => onChange({ ...range, to })}/>
     </div>
-    <p className={`export-summary${invalid ? " invalid" : ""}`}>{invalid ? "終了日は開始日以降にしてください" : `位置 ${locationCount}件 · 写真と動画 ${photoCount}件`}</p>
+    <p className={`export-summary${invalid ? " invalid" : ""}`}>{invalid ? "終了日は開始日以降にしてください" : summary ? `位置 ${summary.locationCount}件 · 写真と動画 ${summary.photoCount}件` : "件数を確認しています…"}</p>
   </Dialog>;
 }
 
@@ -1084,10 +1180,12 @@ function currentTimeZone() {
 }
 
 /**
- * Every stay across all days. Past days come from the device-local cache and
- * only days whose records changed are detected again; today is always fresh.
+ * Every stay across all days. Past days come from the device-local cache; the
+ * storage layer records which days had a record written or removed, and only
+ * those are detected again. Today is always fresh. [revision] changes whenever
+ * the stored records change.
  */
-function useStayIndex(storageId: string, events: LifeEvent[]): StayIndexState {
+function useStayIndex(storageId: string, revision: number): StayIndexState {
   const [state, setState] = useState<StayIndexState>({});
   const cacheRef = useRef<StayIndexCache | undefined>(undefined);
   useEffect(() => {
@@ -1095,46 +1193,128 @@ function useStayIndex(storageId: string, events: LifeEvent[]): StayIndexState {
     const timer = window.setTimeout(() => {
       void (async () => {
         const timeZone = currentTimeZone();
+        const today = dateKey(new Date());
         let cache = cacheRef.current;
         if (!cache || cache.timeZone !== timeZone) {
-          cache = parseStayIndexCache(await loadStayIndexCache(storageId), timeZone);
+          cache = parseStayIndexCache(await loadStayIndexCache(storageId), timeZone).cache;
           if (controller.signal.aborted) return;
           cacheRef.current = cache;
         }
-        const result = await updateStayIndex(events, cache, {
-          today: dateKey(new Date()),
+        const dirty = await loadDirtyDays(storageId);
+        // The first pass covers every recorded day; an interrupted pass
+        // continues with the days it has not reached.
+        const days = cache.complete
+          ? dirty.map((entry) => entry.day)
+          : [...(await listRecordedDays(storageId)).filter((day) => !cache.days[day]), ...dirty.map((entry) => entry.day)];
+        if (controller.signal.aborted) return;
+        const result = await refreshStayIndex(cache, days, (day) => loadDayEvents(storageId, day), {
+          today,
           signal: controller.signal,
           onProgress: (done, total) => setState((current) => ({ ...current, progress: { done, total } })),
         });
-        if (!result) return;
-        setState({ stays: result.stays });
-        if (result.changed) void saveStayIndexCache(storageId, JSON.stringify(result.cache));
-      })();
+        const processed = new Set(result.processed);
+        await clearDirtyDays(storageId, dirty.filter((entry) => processed.has(entry.day)));
+        let changed = result.changed;
+        if (!result.aborted && !cache.complete) {
+          cache.complete = true;
+          changed = true;
+        }
+        if (changed) void saveStayIndexCache(storageId, JSON.stringify(cache));
+        if (result.aborted || controller.signal.aborted) return;
+        // Today (and any record dated later) is detected on every update.
+        const openDays = [...new Set([today, ...dirty.map((entry) => entry.day).filter((day) => day > today)])];
+        const openStays = (await Promise.all(openDays.map(async (day) => detectDayStays(await loadDayEvents(storageId, day))))).flat();
+        if (!controller.signal.aborted) setState({ stays: allStays(cache, openStays) });
+      })().catch(() => undefined);
     }, cacheRef.current ? STAY_INDEX_DEBOUNCE_MS : 0);
     return () => { controller.abort(); window.clearTimeout(timer); };
-  }, [events, storageId]);
+  }, [revision, storageId]);
   return state;
 }
 
 // ---- Home -----------------------------------------------------------------
 
+const SYNC_SESSION_EXPIRED = "再ログインが必要です";
+const CAPTURE_PREFERENCE_KEY = "remo:location-capture";
+
+function storedCapturePreference(): "on" | "off" | undefined {
+  try {
+    const value = localStorage.getItem(CAPTURE_PREFERENCE_KEY);
+    return value === "on" || value === "off" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Shown before the browser's own permission prompt, so it does not appear without context. */
+function LocationIntroDialog({ onStart, onLater }: { onStart: () => void; onLater: () => void }) {
+  return <Dialog title="位置情報を記録しますか？" onDismiss={onLater} actions={<>
+    <button type="button" className="text-button" onClick={onLater}>あとで</button>
+    <button type="button" className="text-button" onClick={onStart}>記録を始める</button>
+  </>}>
+    <p>このタブを開いている間、現在地を記録して1日の移動と滞在を地図にまとめます。記録はこのブラウザに保存され、ログインしたときだけバックアップされます。</p>
+    <p>次にブラウザが位置情報の許可を確認します。記録は設定からいつでも停止できます。</p>
+  </Dialog>;
+}
+
+/** The records in this browser belong to another account than the one that signed in. */
+function OwnershipDialog({ email, onMerge, onReplace, onSignOut }: { email: string; onMerge: () => void; onReplace: () => void; onSignOut: () => void }) {
+  const [confirmReplace, setConfirmReplace] = useState(false);
+  if (confirmReplace) {
+    return <ConfirmDeleteDialog title="このブラウザの記録を削除しますか？" message="別のアカウントで使っていた記録をこのブラウザから削除し、ログインしたアカウントの記録を表示します。元のアカウントのバックアップは残ります。" confirmLabel="削除して切り替える" onDismiss={() => setConfirmReplace(false)} onConfirm={onReplace}/>;
+  }
+  return <Dialog title="別のアカウントの記録があります" onDismiss={onSignOut} actions={<>
+    <button type="button" className="text-button" onClick={onSignOut}>ログアウト</button>
+    <button type="button" className="text-button danger" onClick={() => setConfirmReplace(true)}>記録を削除して切り替える</button>
+    <button type="button" className="text-button" onClick={onMerge}>このアカウントに保存</button>
+  </>}>
+    <p>このブラウザには、別のアカウントでバックアップしていた記録が残っています。{email} にログインしました。</p>
+    <p>「このアカウントに保存」を選ぶと、残っている記録をこのアカウントにもバックアップします。自分の記録でない場合は選ばないでください。</p>
+  </Dialog>;
+}
+
+/** On a shared computer the records should not stay behind after signing out. */
+function SignOutDialog({ unsaved, onDismiss, onSignOut }: { unsaved: number; onDismiss: () => void; onSignOut: (removeRecords: boolean) => void }) {
+  return <Dialog icon="logout" title="ログアウトしますか？" onDismiss={onDismiss} actions={<>
+    <button type="button" className="text-button" onClick={onDismiss}>キャンセル</button>
+    <button type="button" className="text-button danger" onClick={() => onSignOut(true)}>記録を削除してログアウト</button>
+    <button type="button" className="text-button" onClick={() => onSignOut(false)}>ログアウト</button>
+  </>}>
+    <p>ログアウトしても、記録はこのブラウザに残り、誰でも見られます。共有のパソコンでは「記録を削除してログアウト」を選んでください。クラウドのバックアップは残ります。</p>
+    {unsaved > 0 && <p className="dialog-strong">まだバックアップされていない記録が{unsaved.toLocaleString("ja-JP")}件あります。削除すると元に戻せません。</p>}
+  </Dialog>;
+}
+
 function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOpenAuth: () => void }) {
-  const [storageId] = useState(() => prepareLocalStorage());
+  const [storageId] = useState(() => localDeviceStorageId());
   const accountId = user?.id;
   const [lastBackupAt, setLastBackupAt] = useState<string>();
   const [syncState, setSyncState] = useState("バックアップ待ち");
-  const [events, setEvents] = useState<LifeEvent[]>(() => loadEvents(storageId));
-  const stayIndex = useStayIndex(storageId, events);
+  // Only the selected day is kept in memory; everything else is read from
+  // IndexedDB when it is needed. `revision` changes whenever stored records do.
+  const [dayRecords, setDayRecords] = useState<{ date: string; events: LifeEvent[] }>({ date: "", events: [] });
+  const dayEvents = dayRecords.events;
+  const [revision, setRevision] = useState(0);
+  const [eventCount, setEventCount] = useState(0);
+  const [placeNames, setPlaceNames] = useState<Place[]>([]);
+  const [storage, setStorage] = useState<StorageUsage>();
+  const stayIndex = useStayIndex(storageId, revision);
   const [selectedDate, setSelectedDate] = useState(() => dateKey(new Date()));
   const [selected, setSelected] = useState<{ event: LifeEvent }>();
+  const [nearbyEvents, setNearbyEvents] = useState<LifeEvent[]>([]);
   const [selectedPhotos, setSelectedPhotos] = useState<LifeEvent[]>();
   const [photoPreviews, setPhotoPreviews] = useState<Map<string, string>>(() => new Map());
   const [showSettings, setShowSettings] = useState(false);
   const [exportRange, setExportRange] = useState<ExportRange>(() => { const today = dateKey(new Date()); return { from: today, to: today }; });
   const [showExportDialog, setShowExportDialog] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [showAccountDeletion, setShowAccountDeletion] = useState(false);
-  const [captureEnabled, setCaptureEnabled] = useState(() => localStorage.getItem("remo:location-capture") !== "off");
+  const [signOutRequest, setSignOutRequest] = useState<{ unsaved: number }>();
+  // Recording is opt-out, but the browser is only asked after the user chose to start.
+  const [capturePreference, setCapturePreference] = useState(storedCapturePreference);
+  const captureEnabled = capturePreference === "on";
+  const [ownership, setOwnership] = useState<Ownership>();
   const [currentLocation, setCurrentLocation] = useState<CurrentLocation>();
   const [captureStatus, setCaptureStatus] = useState(CAPTURE_RUNNING_STATUS);
   const [photoStatus, setPhotoStatus] = useState<string>();
@@ -1144,109 +1324,238 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
   const lastObservedLocationRef = useRef<{ latitude: number; longitude: number; speedMps: number | null; accuracyMeters: number | null; receivedAt: number } | undefined>(undefined);
   const lastAcceptedFixRef = useRef<{ timestamp: number; accuracyMeters: number } | undefined>(undefined);
   const lastLoggedRef = useRef<{ receivedAt: number; event: LifeEvent } | undefined>(undefined);
-  const eventsRef = useRef(events);
   const syncInFlightRef = useRef(false);
   const lastSyncAttemptRef = useRef<{ accountId: string; at: number } | undefined>(undefined);
   const lastPullAtRef = useRef<{ accountId: string; at: number } | undefined>(undefined);
   const photoPreviewsRef = useRef(photoPreviews);
+  const channelRef = useRef<BroadcastChannel | undefined>(undefined);
+
+  function saveCapturePreference(next: "on" | "off") {
+    setCapturePreference(next);
+    try {
+      localStorage.setItem(CAPTURE_PREFERENCE_KEY, next);
+    } catch {
+      // The preference is non-essential; the capture state still updates in memory.
+    }
+  }
 
   useEffect(() => {
-    setLastBackupAt(accountId ? localStorage.getItem(`remo:backup:last-success:${accountId}`) ?? undefined : undefined);
+    setLastBackupAt(accountId ? localStorage.getItem(lastBackupKey(accountId)) ?? undefined : undefined);
     setSyncState(accountId ? "バックアップ待ち" : "端末に保存済み");
   }, [accountId]);
 
   useEffect(() => () => { photoPreviewsRef.current.forEach((url) => URL.revokeObjectURL(url)); }, []);
 
+  // Other tabs of this browser share the storage: tell them when it changed
+  // and reload when they did.
   useEffect(() => {
-    if (saveEvents(storageId, events)) {
+    let channel: BroadcastChannel;
+    try { channel = new BroadcastChannel(`remo-timeline:${storageId}`); } catch { return; }
+    channelRef.current = channel;
+    channel.onmessage = () => setRevision((value) => value + 1);
+    return () => { channel.close(); channelRef.current = undefined; };
+  }, [storageId]);
+
+  /** Marks the stored records as changed: this tab reloads what it shows and other tabs are told. */
+  const recordsChanged = useCallback(() => {
+    setRevision((value) => value + 1);
+    try { channelRef.current?.postMessage("changed"); } catch { /* single-tab browsers */ }
+  }, []);
+
+  /**
+   * Runs a change to the stored records. When storage refuses the write,
+   * recording stops rather than showing records that would be lost on reload.
+   */
+  const commit = useCallback(async (work: () => Promise<unknown>, fromCapture = false): Promise<boolean> => {
+    try {
+      await work();
       setStorageStatus(undefined);
-      return;
+      recordsChanged();
+      return true;
+    } catch {
+      setStorageStatus("記録を保存できませんでした。保存容量がいっぱいの場合は、データを出力してから不要な記録を削除してください。");
+      if (fromCapture) {
+        setCapturePreference("off");
+        setCaptureStatus("保存できないため停止中");
+      }
+      return false;
     }
-    // Keep the current in-memory timeline visible and stop adding records that
-    // cannot be persisted. The user can export or clear data from Data Management.
-    setStorageStatus("端末の保存容量がいっぱいです。データを出力してから不要な記録を削除してください。");
-    setCaptureEnabled(false);
-    setCaptureStatus("保存容量がいっぱいのため停止中");
-  }, [events, storageId]);
-  useEffect(() => { void migratePhotoPreviews(storageId); }, [storageId]);
-  useEffect(() => { eventsRef.current = events; }, [events]);
+  }, [recordsChanged]);
+
+  useEffect(() => {
+    void requestPersistentStorage();
+    void migratePhotoPreviews(storageId);
+    void migrateLegacyTimeline(storageId).then(recordsChanged).catch(() => undefined);
+  }, [recordsChanged, storageId]);
+
+  // The selected day.
   useEffect(() => {
     let cancelled = false;
-    const missing = events.filter((event) => event.source === "photo" && !photoPreviewsRef.current.has(event.id));
-    if (!missing.length) return;
-    void Promise.all(missing.map(async (event) => {
-      const blob = await loadPhotoPreview(storageId, event.id) ?? (accountId ? await loadRemotePhotoPreview(event.id).catch(() => undefined) : undefined);
-      return blob ? { id: event.id, url: URL.createObjectURL(blob) } : undefined;
-    })).then((loaded) => {
-      const urls = loaded.flatMap((entry) => entry ? [entry] : []);
-      if (cancelled) {
-        urls.forEach(({ url }) => URL.revokeObjectURL(url));
-        return;
+    loadDayEvents(storageId, selectedDate).then((events) => {
+      if (!cancelled) setDayRecords({ date: selectedDate, events });
+    }).catch(() => {
+      if (!cancelled) setStorageStatus("このブラウザでは記録を保存できません。プライベートブラウズやサイトデータのブロックを解除してください。");
+    });
+    return () => { cancelled = true; };
+  }, [revision, selectedDate, storageId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadStoredPlaces(storageId).then((places) => { if (!cancelled) setPlaceNames(places); }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [revision, storageId]);
+
+  useEffect(() => {
+    if (!showSettings) return;
+    void storageUsage().then(setStorage);
+    void countEvents(storageId).then(setEventCount).catch(() => undefined);
+  }, [revision, showSettings, storageId]);
+
+  // Location samples near the photo being corrected: the suggestion reads the
+  // track around the photo, which can cross midnight.
+  const selectedPhoto = selected?.event.source === "photo" ? selected.event : undefined;
+  const selectedPhotoTime = selectedPhoto?.startedAt;
+  useEffect(() => {
+    if (!selectedPhotoTime) { setNearbyEvents([]); return; }
+    let cancelled = false;
+    const time = Date.parse(selectedPhotoTime);
+    const margin = PHOTO_LOCATION_SUGGESTION_WINDOW_MS * 4;
+    void loadEventsInRange(storageId, time - margin, time + margin).then((events) => { if (!cancelled) setNearbyEvents(events); }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [revision, selectedPhotoTime, storageId]);
+
+  // Whose records these are. Records of another account are not uploaded
+  // until the user says they should be.
+  useEffect(() => {
+    setOwnership(undefined);
+    if (!accountId) return;
+    let cancelled = false;
+    void (async () => {
+      let next = await ownershipFor(storageId, accountId);
+      if (next === "unclaimed") {
+        await claimRecords(storageId, accountId);
+        next = "owned";
       }
+      if (!cancelled) setOwnership(next);
+    })().catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [accountId, storageId]);
+
+  // Previews are loaded only for the photos on screen: the selected day and an
+  // open photo list. Each record is tried once per account, including records
+  // that have no preview (videos, photos never uploaded), so a new location
+  // sample does not re-request every missing preview.
+  const previewAttemptsRef = useRef<{ accountId?: string; ids: Set<string> }>({ ids: new Set() });
+  const visiblePhotos = useMemo(() => {
+    const visible = new Map<string, LifeEvent>();
+    dayEvents.forEach((event) => { if (event.source === "photo") visible.set(event.id, event); });
+    selectedPhotos?.forEach((event) => visible.set(event.id, event));
+    return [...visible.values()];
+  }, [dayEvents, selectedPhotos]);
+  // A new location sample changes the day's records but not the photos on screen.
+  const visiblePhotoKey = visiblePhotos.map((event) => `${event.id}:${event.mediaType ?? ""}`).join("|");
+  const visiblePhotosRef = useRef(visiblePhotos);
+  visiblePhotosRef.current = visiblePhotos;
+  const previewAccountId = ownership === "owned" ? accountId : undefined;
+  useEffect(() => {
+    let cancelled = false;
+    if (previewAttemptsRef.current.accountId !== previewAccountId) previewAttemptsRef.current = { accountId: previewAccountId, ids: new Set() };
+    const attempted = previewAttemptsRef.current.ids;
+    const missing = visiblePhotosRef.current.filter((event) => !photoPreviewsRef.current.has(event.id) && !attempted.has(event.id));
+    if (!missing.length) return;
+    missing.forEach((event) => attempted.add(event.id));
+    const settled = new Set<string>();
+    const publish = (loaded: { id: string; blob?: Blob }[]) => {
+      if (cancelled) return;
       const next = new Map(photoPreviewsRef.current);
-      urls.forEach(({ id, url }) => {
-        if (next.has(id)) URL.revokeObjectURL(url);
-        else next.set(id, url);
+      loaded.forEach(({ id, blob }) => {
+        settled.add(id);
+        if (blob && !next.has(id)) next.set(id, URL.createObjectURL(blob));
       });
       photoPreviewsRef.current = next;
       setPhotoPreviews(next);
-    });
-    return () => { cancelled = true; };
-  }, [events, storageId, accountId]);
+    };
+    void (async () => {
+      const localIds = await listLocalPhotoPreviewIds(storageId);
+      publish(await Promise.all(missing.filter((event) => localIds.has(event.id))
+        .map(async (event) => ({ id: event.id, blob: await loadPhotoPreview(storageId, event.id) }))));
+      // Videos are never uploaded, so only photos are looked up in the cloud.
+      const remote = missing.filter((event) => !localIds.has(event.id));
+      if (!previewAccountId) { publish(remote.map((event) => ({ id: event.id }))); return; }
+      publish(remote.filter((event) => event.mediaType === "video").map((event) => ({ id: event.id })));
+      const photos = remote.filter((event) => event.mediaType !== "video");
+      for (let index = 0; index < photos.length && !cancelled; index += REMOTE_PREVIEW_CONCURRENCY) {
+        publish(await Promise.all(photos.slice(index, index + REMOTE_PREVIEW_CONCURRENCY)
+          .map(async (event) => ({ id: event.id, blob: await loadRemotePhotoPreview(event.id).catch(() => undefined) }))));
+      }
+    })();
+    return () => {
+      cancelled = true;
+      // Records not finished before cancellation are tried again next time.
+      missing.forEach((event) => { if (!settled.has(event.id)) attempted.delete(event.id); });
+    };
+  }, [visiblePhotoKey, storageId, previewAccountId]);
+
+  function forgetPreviews(ids: Iterable<string>) {
+    for (const id of ids) {
+      const url = photoPreviewsRef.current.get(id);
+      if (url) URL.revokeObjectURL(url);
+      photoPreviewsRef.current.delete(id);
+      void deletePhotoPreview(storageId, id);
+    }
+    setPhotoPreviews(new Map(photoPreviewsRef.current));
+  }
 
   const syncNow = useCallback(async (force = false) => {
-    if (!accountId) return;
+    if (!accountId || ownership !== "owned") return;
     if (syncInFlightRef.current) return;
     const now = Date.now();
     const lastAttempt = lastSyncAttemptRef.current;
     if (!force && lastAttempt?.accountId === accountId && now - lastAttempt.at < 60_000) return;
     // The interval and visibilitychange listener can fire close together.
-    // Keep the latest local state, but do not start another round-trip inside
-    // the same minute just because the tab became visible again.
+    // Do not start another round-trip inside the same minute just because
+    // the tab became visible again.
     lastSyncAttemptRef.current = { accountId, at: now };
     syncInFlightRef.current = true;
     setSyncState("バックアップ中…");
     try {
-      const localAtStart = eventsRef.current;
       const lastPull = lastPullAtRef.current;
       const pull = force
         || lastPull?.accountId !== accountId
         || now - lastPull.at >= 2 * 60_000;
-      const result = await synchronizeEvents(accountId, localAtStart, { pull });
+      const result = await synchronizeEvents(storageId, accountId, { pull });
       if (pull && result.online) lastPullAtRef.current = { accountId, at: Date.now() };
-      // A location/photo can arrive while the network request is in flight.
-      // Keep the newest local value so a refresh can never hide a live record.
-      const merged = new Map(result.events.map((event) => [event.id, event]));
-      const pendingDeleteIds = new Set(loadSyncQueue(accountId).filter((operation) => operation.kind === "delete").map((operation) => operation.eventId));
-      const deletedIds = new Set([...result.deletedIds, ...pendingDeleteIds]);
-      for (const id of deletedIds) merged.delete(id);
-      const startedByID = new Map(localAtStart.map((event) => [event.id, event]));
-      for (const local of eventsRef.current) {
-        if (deletedIds.has(local.id)) continue;
-        const remote = merged.get(local.id);
-        if (remote && new Date(local.updatedAt).getTime() > new Date(remote.updatedAt).getTime()) merged.set(local.id, local);
-        else if (!remote && !startedByID.has(local.id)) merged.set(local.id, local);
+      if (result.removedIds.length) forgetPreviews(result.removedIds);
+      if (result.changed) recordsChanged();
+      if (result.unauthorized) {
+        // The session ended (expired, or signed out everywhere): say so
+        // instead of looking offline, and let the session state catch up.
+        setSyncState(SYNC_SESSION_EXPIRED);
+        setPhotoStatus("ログインの有効期限が切れました。設定からもう一度ログインしてください");
+        authClient.$store.notify("$sessionSignal");
+        return;
       }
-      const nextEvents = [...merged.values()].sort(sortNewest);
-      eventsRef.current = nextEvents;
-      setEvents(nextEvents);
       let photoBackupPending = false;
       if (result.online) {
         const localPhotos = await listLocalPhotoPreviewIds(storageId);
-        const pendingPhotos = nextEvents.filter((item) => item.source === "photo" && item.mediaType !== "video" && localPhotos.has(item.id) && !localStorage.getItem(`remo:photo-uploaded:${accountId}:${item.id}`));
-        for (const event of pendingPhotos.slice(0, 20)) {
-          const marker = `remo:photo-uploaded:${accountId}:${event.id}`;
-          if (await uploadPhotoPreview(storageId, event.id).catch(() => false)) localStorage.setItem(marker, "1");
+        const uploaded = await loadUploadedPhotos(accountId);
+        const waiting = [...localPhotos].filter((id) => !uploaded.has(id));
+        for (const id of waiting.slice(0, 20)) {
+          const event = await loadEvent(storageId, id);
+          // A preview without its record, or of a video, is never uploaded.
+          if (!event || event.source !== "photo" || event.mediaType === "video") continue;
+          if (await uploadPhotoPreview(storageId, id).catch(() => false)) await rememberUploadedPhoto(accountId, id);
+          else photoBackupPending = true;
         }
-        photoBackupPending = pendingPhotos.some((item) => !localStorage.getItem(`remo:photo-uploaded:${accountId}:${item.id}`));
+        photoBackupPending ||= waiting.length > 20;
       }
       if (result.online && result.pending === 0 && !photoBackupPending) {
         const completedAt = new Date().toISOString();
-        localStorage.setItem(`remo:backup:last-success:${accountId}`, completedAt);
+        try { localStorage.setItem(lastBackupKey(accountId), completedAt); } catch { /* shown in memory */ }
         setLastBackupAt(completedAt);
         setSyncState("バックアップ済み");
       } else {
-        setSyncState("バックアップ待ち");
+        setSyncState(result.online ? "バックアップ待ち" : "オフライン · 端末に保存済み");
       }
     } catch {
       // The periodic and visibility-based retries handle temporary sync failures.
@@ -1254,20 +1563,17 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
     } finally {
       syncInFlightRef.current = false;
     }
-  }, [accountId, storageId]);
+  // forgetPreviews only touches refs and stable setters.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountId, ownership, recordsChanged, storageId]);
 
   useEffect(() => {
     void syncNow();
-    const timer = window.setInterval(() => void syncNow(), 60_000);
+    const timer = window.setInterval(() => { if (document.visibilityState === "visible") void syncNow(); }, 60_000);
     const refreshWhenVisible = () => { if (document.visibilityState === "visible") void syncNow(); };
     document.addEventListener("visibilitychange", refreshWhenVisible);
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", refreshWhenVisible); };
   }, [syncNow]);
-  useEffect(() => {
-    const refreshFromAnotherTab = () => setEvents(loadEvents(storageId));
-    window.addEventListener("storage", refreshFromAnotherTab);
-    return () => window.removeEventListener("storage", refreshFromAnotherTab);
-  }, [storageId]);
   useEffect(() => {
     if (!captureEnabled || !navigator.geolocation) return;
     let cancelled = false;
@@ -1371,8 +1677,7 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
           updatedAt: new Date().toISOString(),
         };
         lastLoggedRef.current = { receivedAt: lastLogged?.receivedAt ?? receivedAt, event };
-        setEvents((current) => [event, ...current].sort(sortNewest));
-        if (accountId) enqueueSync(accountId, { id: crypto.randomUUID(), kind: "upsert", event });
+        void commit(() => putLocalEvents(storageId, [event]), true);
         sampleInFlight = false;
         setCaptureStatus("通常10秒／静止時5分で記録中");
         scheduleNext(nextMode === "stationary" ? STATIONARY_INTERVAL_SECONDS * 1000 : NORMAL_INTERVAL_SECONDS * 1000);
@@ -1398,38 +1703,47 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
       if (timer) window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [captureEnabled, accountId]);
-  useEffect(() => { if (!photoStatus) return; const timer = window.setTimeout(() => setPhotoStatus(undefined), 3000); return () => window.clearTimeout(timer); }, [photoStatus]);
+  }, [captureEnabled, commit, storageId]);
+
+  useEffect(() => { if (!photoStatus) return; const timer = window.setTimeout(() => setPhotoStatus(undefined), 4000); return () => window.clearTimeout(timer); }, [photoStatus]);
 
   function openExport(range: ExportRange = { from: selectedDate, to: selectedDate }) {
     setExportRange(range);
     setShowExportDialog(true);
   }
 
+  async function exportSelectedRange() {
+    setExporting(true);
+    try {
+      await downloadExport(storageId, exportRange);
+      setShowExportDialog(false);
+    } catch {
+      setPhotoStatus("エクスポートに失敗しました");
+    } finally {
+      setExporting(false);
+    }
+  }
 
-  function exportSelectedRange() {
-    downloadExport(storageId, events, exportRange);
-    setShowExportDialog(false);
+  function stopCapture() {
+    saveCapturePreference("off");
+    setCaptureStatus("停止中");
+    setCurrentLocation(undefined);
+    captureModeRef.current = "normal";
+    locationHistoryRef.current = [];
+    lastObservedLocationRef.current = undefined;
+    lastAcceptedFixRef.current = undefined;
+    lastLoggedRef.current = undefined;
   }
 
   function toggleCapture() {
-    const next = !captureEnabled;
-    setCaptureEnabled(next);
-    try {
-      localStorage.setItem("remo:location-capture", next ? "on" : "off");
-    } catch {
-      // The preference is non-essential; the capture state still updates in memory.
-    }
-    setCaptureStatus(next ? "通常10秒／静止時5分で記録中" : "停止中");
-    if (!next) {
-      setCurrentLocation(undefined);
-      captureModeRef.current = "normal";
-      locationHistoryRef.current = [];
-      lastObservedLocationRef.current = undefined;
-      lastAcceptedFixRef.current = undefined;
-      lastLoggedRef.current = undefined;
+    if (captureEnabled) {
+      stopCapture();
+    } else {
+      saveCapturePreference("on");
+      setCaptureStatus(CAPTURE_RUNNING_STATUS);
     }
   }
+
   async function addPhotos(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []).filter((file) => file.type.startsWith("image/") || file.type.startsWith("video/"));
     if (!files.length) {
@@ -1438,97 +1752,148 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
       return;
     }
     setPhotoStatus("写真を読み込み中…");
-    const prepared = files.map((file) => {
-      const id = crypto.randomUUID();
-      const imageUrl = URL.createObjectURL(file);
-      return { file, id, imageUrl, mediaType: file.type.startsWith("video/") ? "video" as const : "photo" as const };
-    });
-    const immediatePreviews = new Map(photoPreviewsRef.current);
-    prepared.forEach(({ id, imageUrl }) => immediatePreviews.set(id, imageUrl));
-    photoPreviewsRef.current = immediatePreviews;
-    setPhotoPreviews(immediatePreviews);
+    const added: string[] = [];
     try {
-      const importedWithPreviews = await Promise.all(prepared.map(async ({ file, id, imageUrl }) => {
+      const imported: LifeEvent[] = [];
+      const nextPreviews = new Map(photoPreviewsRef.current);
+      // One file at a time: decoding many camera originals at once can exhaust memory.
+      for (const file of files) {
+        const id = crypto.randomUUID();
         const metadata = await readPhotoMetadata(file);
         const startedAt = metadata?.takenAt ?? (file.lastModified > 0 ? new Date(file.lastModified).toISOString() : new Date().toISOString());
         const photoLocation = metadata && hasUsableCoordinates(metadata) ? { latitude: metadata.latitude, longitude: metadata.longitude, locationSource: "exif" as const } : undefined;
         const thumbnail = await makePhotoThumbnail(file);
-        return { event: { id, startedAt, ...photoLocation, mediaType: file.type.startsWith("video/") ? "video" as const : "photo" as const, photoCount: 1, source: "photo", updatedAt: new Date().toISOString() } satisfies LifeEvent, file, imageUrl, thumbnail };
-      }));
-      const imported = importedWithPreviews.map(({ event: importedEvent }) => importedEvent);
-      setEvents((current) => [...imported, ...current].sort(sortNewest));
-      if (accountId) imported.forEach((item) => enqueueSync(accountId, { id: crypto.randomUUID(), kind: "upsert", event: item }));
-      const nextPreviews = new Map(photoPreviewsRef.current);
-      importedWithPreviews.forEach(({ event: importedEvent, file, imageUrl, thumbnail }) => {
-        if (file.type.startsWith("video/")) {
-          URL.revokeObjectURL(imageUrl);
-          nextPreviews.set(importedEvent.id, URL.createObjectURL(thumbnail));
-        }
-        void savePhotoPreview(storageId, importedEvent.id, thumbnail);
-      });
+        imported.push({ id, startedAt, ...photoLocation, mediaType: file.type.startsWith("video/") ? "video" : "photo", photoCount: 1, source: "photo", updatedAt: new Date().toISOString() });
+        // The thumbnail, not the original, is what stays on screen.
+        nextPreviews.set(id, URL.createObjectURL(thumbnail));
+        added.push(id);
+        await savePhotoPreview(storageId, id, thumbnail);
+      }
       photoPreviewsRef.current = nextPreviews;
       setPhotoPreviews(nextPreviews);
+      if (!await commit(() => putLocalEvents(storageId, imported))) throw new Error("storage");
       const latest = imported.reduce((current, item) => item.startedAt > current.startedAt ? item : current);
       setSelectedDate(dateKey(latest.startedAt));
       const importedPhotoCount = imported.filter((item) => item.mediaType !== "video").length;
       const importedVideoCount = imported.filter((item) => item.mediaType === "video").length;
       setPhotoStatus(`${mediaSummary(importedPhotoCount, importedVideoCount)}を追加しました`);
+      void syncNow(true);
     } catch {
-      prepared.forEach(({ id, imageUrl }) => {
-        URL.revokeObjectURL(imageUrl);
-        photoPreviewsRef.current.delete(id);
-      });
-      setPhotoPreviews(new Map(photoPreviewsRef.current));
+      forgetPreviews(added);
       setPhotoStatus("写真を読み込めませんでした");
     }
     event.target.value = "";
   }
-  function remove(event: LifeEvent, relatedIds = [event.id]) {
-    const ids = new Set(relatedIds);
-    setEvents((current) => current.filter((item) => !ids.has(item.id)));
-    ids.forEach((id) => { const url = photoPreviewsRef.current.get(id); if (url) URL.revokeObjectURL(url); photoPreviewsRef.current.delete(id); void deletePhotoPreview(storageId, id); });
-    setPhotoPreviews(new Map(photoPreviewsRef.current));
-    if (accountId) relatedIds.forEach((eventId) => enqueueSync(accountId, { id: crypto.randomUUID(), kind: "delete", eventId }));
+
+  async function remove(event: LifeEvent) {
     setSelected(undefined);
+    if (!await commit(() => deleteLocalEvents(storageId, [event.id]))) return;
+    forgetPreviews([event.id]);
     setPhotoStatus("記録を削除しました");
+    void syncNow(true);
   }
-  function updateEvent(updated: LifeEvent) {
-    setEvents((current) => current.map((event) => event.id === updated.id ? updated : event).sort(sortNewest));
-    if (accountId) enqueueSync(accountId, { id: crypto.randomUUID(), kind: "upsert", event: updated });
+
+  async function updateEvent(updated: LifeEvent) {
     setSelected({ event: updated });
+    if (await commit(() => putLocalEvents(storageId, [updated]))) void syncNow(true);
   }
+
+  async function renamePlace(coordinate: MapCoordinate, current: Place | undefined, name: string) {
+    const place: Place = {
+      id: current?.id ?? crypto.randomUUID(),
+      name,
+      latitude: current?.latitude ?? coordinate.latitude,
+      longitude: current?.longitude ?? coordinate.longitude,
+      updatedAt: Date.now(),
+      deleted: name === "",
+    };
+    if (await commit(() => putLocalPlace(storageId, place))) void syncNow(true);
+  }
+
   async function importFile(input: ChangeEvent<HTMLInputElement>) {
     const file = input.target.files?.[0];
     input.target.value = "";
     if (!file) return;
+    setPhotoStatus("JSONを読み込み中…");
     try {
       const imported = await readImport(file);
-      setEvents((current) => [...new Map([...current, ...imported].map((item) => [item.id, item])).values()].sort(sortNewest));
-      if (accountId) imported.forEach((item) => enqueueSync(accountId, { id: crypto.randomUUID(), kind: "upsert", event: item }));
+      if (!await commit(() => storeImported(storageId, imported))) return;
       const latest = imported.reduce<LifeEvent | undefined>((current, item) => !current || item.startedAt > current.startedAt ? item : current, undefined);
       if (latest) setSelectedDate(dateKey(latest.startedAt));
       setPhotoStatus(`${imported.length}件の記録を読み込みました`);
+      void syncNow(true);
     } catch (error) {
       setPhotoStatus(error instanceof Error ? error.message : "インポートに失敗しました");
     }
   }
-  async function removeAll() {
-    if (accountId) {
-      try { await deleteAllCloudData(); } catch { setPhotoStatus("クラウドに接続できないため削除できませんでした"); return; }
-    }
-    clearEvents(storageId, accountId);
-    setEvents([]);
-    void deleteAllPhotoPreviews(storageId);
-    void deleteStayIndexCache(storageId);
+
+  /** Removes everything this browser holds: records, previews and the derived stay index. */
+  async function clearLocalRecords() {
+    await clearEvents(storageId);
+    await deleteAllPhotoPreviews(storageId);
+    await deleteStayIndexCache(storageId);
     photoPreviewsRef.current.forEach((url) => URL.revokeObjectURL(url));
     photoPreviewsRef.current.clear();
     setPhotoPreviews(new Map());
-    setStorageStatus(undefined);
-    setPhotoStatus("すべての記録を削除しました");
+    recordsChanged();
   }
+
+  async function removeAll() {
+    if (accountId && ownership === "owned") {
+      try { await deleteAllCloudData(); } catch { setPhotoStatus("クラウドに接続できないため削除できませんでした"); return; }
+    }
+    // Recording stops with the deletion, as on Android and iOS: otherwise the
+    // next sample would start a new timeline seconds after everything was removed.
+    stopCapture();
+    try {
+      await clearLocalRecords();
+      setStorageStatus(undefined);
+      setPhotoStatus("すべての記録を削除し、位置情報の記録を停止しました");
+    } catch {
+      setPhotoStatus("記録を削除できませんでした");
+    }
+  }
+
+  async function requestSignOut() {
+    setSignOutRequest({ unsaved: await countUnsavedEvents(storageId).catch(() => 0) });
+  }
+
+  async function signOut(removeRecords: boolean) {
+    setSignOutRequest(undefined);
+    if (removeRecords) {
+      stopCapture();
+      await clearLocalRecords().catch(() => undefined);
+    }
+    await authClient.signOut();
+    if (removeRecords) setPhotoStatus("このブラウザの記録を削除してログアウトしました");
+  }
+
+  async function resolveOwnership(mode: "merge" | "replace") {
+    if (!accountId) return;
+    if (mode === "replace") {
+      await replaceRecords(storageId, accountId);
+      await deleteAllPhotoPreviews(storageId);
+      await deleteStayIndexCache(storageId);
+      photoPreviewsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      photoPreviewsRef.current.clear();
+      setPhotoPreviews(new Map());
+      recordsChanged();
+    } else {
+      await claimRecords(storageId, accountId);
+    }
+    setOwnership("owned");
+  }
+
+  const syncAfterOwnershipRef = useRef(false);
+  useEffect(() => {
+    // The first backup right after the user decided whose records these are.
+    if (ownership === "owned" && syncAfterOwnershipRef.current) { syncAfterOwnershipRef.current = false; void syncNow(true); }
+  }, [ownership, syncNow]);
+
   const captureIssue = captureStatus !== CAPTURE_RUNNING_STATUS && captureStatus !== "停止中" ? captureStatus : undefined;
   const closeSettings = useCallback(() => setShowSettings(false), []);
   const closePhotos = useCallback(() => setSelectedPhotos(undefined), []);
+  const sessionExpired = syncState === SYNC_SESSION_EXPIRED;
 
   return <div className="app">
     {showSettings
@@ -1538,6 +1903,8 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
         captureIssue={captureIssue}
         syncState={syncState}
         lastBackupAt={lastBackupAt}
+        eventCount={eventCount}
+        storage={storage}
         onBack={closeSettings}
         onToggleCapture={toggleCapture}
         onAddPhotos={(event) => { setShowSettings(false); void addPhotos(event); }}
@@ -1546,27 +1913,39 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
         onDeleteAll={() => setConfirmDeleteAll(true)}
         onBackup={() => void syncNow(true)}
         onOpenAuth={onOpenAuth}
-        onSignOut={() => void authClient.signOut()}
+        onSignOut={() => void requestSignOut()}
         onDeleteAccount={() => setShowAccountDeletion(true)}
       />
-      : <TimelineHome events={events} stayIndex={stayIndex} previews={photoPreviews} selectedDate={selectedDate} currentLocation={currentLocation} autoCapture={captureEnabled} onDateChange={setSelectedDate} onSelectPhotos={(photos) => { setSelected(undefined); setSelectedPhotos(photos); }} onOpenSettings={() => setShowSettings(true)}/>}
+      : <TimelineHome dayEvents={dayEvents} loadedDate={dayRecords.date} stayIndex={stayIndex} placeNames={placeNames} previews={photoPreviews} selectedDate={selectedDate} currentLocation={currentLocation} autoCapture={captureEnabled} onDateChange={setSelectedDate} onSelectPhotos={(photos) => { setSelected(undefined); setSelectedPhotos(photos); }} onOpenSettings={() => setShowSettings(true)} onRenamePlace={(place, current, name) => void renamePlace(place, current, name)}/>}
     <div className="snackbar-host" aria-live="polite">
       {storageStatus && <div className="snackbar" role="alert">{storageStatus}</div>}
       {photoStatus && <div className="snackbar" role="status">{photoStatus}</div>}
     </div>
-    {selectedPhotos && <PhotoListSheet photos={selectedPhotos} previews={photoPreviews} onClose={closePhotos} onEditLocation={(photo) => { setSelectedPhotos(undefined); setSelected({ event: photo }); }}/>}
+    {selectedPhotos && <PhotoListSheet photos={selectedPhotos} previews={photoPreviews} signedIn={previewAccountId !== undefined && !sessionExpired} onClose={closePhotos} onEditLocation={(photo) => { setSelectedPhotos(undefined); setSelected({ event: photo }); }}/>}
     {selected && (selected.event.source === "photo"
-      ? <PhotoLocationScreen event={selected.event} events={events} onClose={() => setSelected(undefined)} onDelete={() => remove(selected.event)} onUpdate={updateEvent}/>
-      : <LocationRecordDialog event={selected.event} onClose={() => setSelected(undefined)} onDelete={() => remove(selected.event)}/>)}
-    {showExportDialog && <ExportRangeDialog events={events} range={exportRange} onChange={setExportRange} onClose={() => setShowExportDialog(false)} onExport={exportSelectedRange}/>}
-    {confirmDeleteAll && <ConfirmDeleteDialog title="すべての記録を削除しますか？" message={accountId ? "このブラウザとクラウドのバックアップから、位置と写真の記録をすべて削除します。この操作は元に戻せません。" : "このブラウザから、位置と写真の記録をすべて削除します。この操作は元に戻せません。"} confirmLabel="すべて削除" onDismiss={() => setConfirmDeleteAll(false)} onConfirm={() => void removeAll()}/>}
+      ? <PhotoLocationScreen event={selected.event} events={nearbyEvents} onClose={() => setSelected(undefined)} onDelete={() => void remove(selected.event)} onUpdate={(updated) => void updateEvent(updated)}/>
+      : <LocationRecordDialog event={selected.event} onClose={() => setSelected(undefined)} onDelete={() => void remove(selected.event)}/>)}
+    {showExportDialog && <ExportRangeDialog storageId={storageId} range={exportRange} exporting={exporting} onChange={setExportRange} onClose={() => setShowExportDialog(false)} onExport={() => void exportSelectedRange()}/>}
+    {confirmDeleteAll && <ConfirmDeleteDialog title="すべての記録を削除しますか？" message={accountId && ownership === "owned" ? "このブラウザとクラウドのバックアップから、位置と写真の記録をすべて削除し、位置情報の記録を停止します。他の端末に保存されている記録は、その端末に残ります。この操作は元に戻せません。" : "このブラウザから、位置と写真の記録をすべて削除し、位置情報の記録を停止します。この操作は元に戻せません。"} confirmLabel="すべて削除" onDismiss={() => setConfirmDeleteAll(false)} onConfirm={() => void removeAll()}/>}
     {showAccountDeletion && accountId && <AccountDeletionDialog onDismiss={() => setShowAccountDeletion(false)} onDeleted={() => {
-      // The backup no longer exists, so nothing is left to upload or resume.
-      clearSyncState(accountId);
+      // The backup no longer exists: the records here count as not backed up,
+      // so a later account receives all of them.
+      void forgetAccount(storageId, accountId);
       setShowAccountDeletion(false);
       setPhotoStatus("アカウントとクラウドのバックアップを削除しました");
       authClient.$store.notify("$sessionSignal");
     }}/>}
+    {signOutRequest && <SignOutDialog unsaved={signOutRequest.unsaved} onDismiss={() => setSignOutRequest(undefined)} onSignOut={(removeRecords) => void signOut(removeRecords)}/>}
+    {user && ownership === "other" && <OwnershipDialog
+      email={user.email}
+      onMerge={() => { syncAfterOwnershipRef.current = true; void resolveOwnership("merge"); }}
+      onReplace={() => { syncAfterOwnershipRef.current = true; void resolveOwnership("replace"); }}
+      onSignOut={() => void authClient.signOut()}
+    />}
+    {capturePreference === undefined && <LocationIntroDialog
+      onStart={() => { saveCapturePreference("on"); setCaptureStatus(CAPTURE_RUNNING_STATUS); }}
+      onLater={() => saveCapturePreference("off")}
+    />}
   </div>;
 }
 

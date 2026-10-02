@@ -127,11 +127,11 @@ private fun placeMarkerBitmap(radiusPx: Float, fillAlpha: Float, selected: Boole
     val center = size / 2f
     val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     paint.style = Paint.Style.FILL
-    paint.color = android.graphics.Color.argb(((if (selected) 0.9f else fillAlpha) * 255).toInt(), 47, 90, 69)
+    paint.color = MapColors.argb(((if (selected) 0.9f else fillAlpha) * 255).toInt(), MapColors.stayRgb)
     canvas.drawCircle(center, center, radiusPx, paint)
     paint.style = Paint.Style.STROKE
     paint.strokeWidth = stroke
-    paint.color = if (selected) android.graphics.Color.WHITE else android.graphics.Color.argb((min(1f, fillAlpha + 0.3f) * 255).toInt(), 47, 90, 69)
+    paint.color = if (selected) android.graphics.Color.WHITE else MapColors.argb((min(1f, fillAlpha + 0.3f) * 255).toInt(), MapColors.stayRgb)
     canvas.drawCircle(center, center, radiusPx, paint)
     return bitmap
 }
@@ -303,7 +303,7 @@ internal fun AllPlacesSheetContent(
             items(places, key = { it.id }) { place ->
                 AllTimePlaceRow(
                     place = place,
-                    label = labels[place.id],
+                    resolvedLabel = labels[place.id],
                     selected = place.id == selectedPlaceId,
                     onLabel = { labels = labels + (place.id to it) },
                 ) { onSelectPlace(place, labels[place.id]) }
@@ -331,12 +331,13 @@ private fun PeriodSelector(period: PlacePeriod, onChange: (PlacePeriod) -> Unit)
 }
 
 @Composable
-private fun AllTimePlaceRow(place: AllTimeStayPlace, label: StayPlaceLabel?, selected: Boolean, onLabel: (StayPlaceLabel) -> Unit, onClick: () -> Unit) {
+private fun AllTimePlaceRow(place: AllTimeStayPlace, resolvedLabel: StayPlaceLabel?, selected: Boolean, onLabel: (StayPlaceLabel) -> Unit, onClick: () -> Unit) {
     val context = LocalContext.current
     // Lazily resolved, so only places scrolled into view hit the geocoder.
     LaunchedEffect(place.id) {
-        if (label == null) resolveStayPlaceLabel(context, place.coordinate)?.let(onLabel)
+        if (resolvedLabel == null) resolveStayPlaceLabel(context, place.coordinate)?.let(onLabel)
     }
+    val label = resolvedLabel.named(place.coordinate)
     Row(
         Modifier.fillMaxWidth()
             .background(if (selected) AppColors.greenContainer else AppColors.surface)

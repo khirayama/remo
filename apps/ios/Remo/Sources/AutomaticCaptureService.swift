@@ -123,6 +123,13 @@ final class AutomaticCaptureService: NSObject, ObservableObject, CLLocationManag
         }
     }
 
+    /// Starts recording without any UI, when the app was launched in the
+    /// background. Never prompts for permission.
+    func resumeInBackground() {
+        guard isEnabled, manager.authorizationStatus == .authorizedAlways || manager.authorizationStatus == .authorizedWhenInUse else { return }
+        start()
+    }
+
     func startIfPossible() {
         guard isEnabled else { return }
         guard CLLocationManager.locationServicesEnabled() else { status = "位置情報サービスがオフです"; return }
@@ -167,11 +174,15 @@ final class AutomaticCaptureService: NSObject, ObservableObject, CLLocationManag
             status = "設定から位置情報を許可してください"
             return
         }
-        manager.startUpdatingLocation()
+        manager.desiredAccuracy = kCLLocationAccuracyBest
         manager.distanceFilter = kCLDistanceFilterNone
+        manager.startUpdatingLocation()
         stationaryTimer?.invalidate()
         stationaryTimer = nil
-        manager.stopMonitoringSignificantLocationChanges()
+        // Kept on in every mode: it is what makes the system relaunch the app
+        // after it was terminated or the phone restarted, so recording resumes
+        // without the app being opened.
+        manager.startMonitoringSignificantLocationChanges()
         startActivityMonitoring()
         status = "通常10秒／静止時5分で記録中"
     }
@@ -285,7 +296,7 @@ final class AutomaticCaptureService: NSObject, ObservableObject, CLLocationManag
         )
         if !withinInterval { lastLoggedUptime = nowUptime }
         lastLoggedEntry = entry
-        LogStore().add(entry)
+        LogStore.shared.add(entry)
         UserDefaults.standard.set(now.timeIntervalSince1970, forKey: lastSampleKey)
         NotificationCenter.default.post(name: .remoAutomaticLogSaved, object: nil)
     }
@@ -329,8 +340,10 @@ final class AutomaticCaptureService: NSObject, ObservableObject, CLLocationManag
     private func enterStationaryMode() {
         guard mode != .stationary else { return }
         mode = .stationary
+        // The best accuracy keeps the GPS radio on. While staying in one place
+        // a coarser fix is enough to notice leaving, and it lets the radio rest.
+        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
         manager.distanceFilter = 50
-        manager.startMonitoringSignificantLocationChanges()
         stationaryTimer?.invalidate()
         stationaryTimer = Timer.scheduledTimer(withTimeInterval: Double(Self.stationaryIntervalSeconds), repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -345,7 +358,7 @@ final class AutomaticCaptureService: NSObject, ObservableObject, CLLocationManag
         mode = .normal
         stationaryTimer?.invalidate()
         stationaryTimer = nil
-        manager.stopMonitoringSignificantLocationChanges()
+        manager.desiredAccuracy = kCLLocationAccuracyBest
         manager.distanceFilter = kCLDistanceFilterNone
         manager.startUpdatingLocation()
         status = "通常10秒／静止時5分で記録中"

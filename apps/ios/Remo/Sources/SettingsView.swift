@@ -92,7 +92,7 @@ struct SettingsView: View {
                         }
                     }
 
-                    Text("Remo \(version)\n記録は端末に保存され、写真は外部に送信されません")
+                    Text("Remo \(version)\n記録は端末に保存されます。ログイン中は、記録と写真の縮小画像をバックアップします")
                         .font(RemoFont.bodySmall)
                         .foregroundStyle(RemoStyle.inkTertiary)
                         .multilineTextAlignment(.center)

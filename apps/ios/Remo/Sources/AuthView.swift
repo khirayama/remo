@@ -90,7 +90,7 @@ struct AuthView: View {
                         .background(RemoStyle.dangerContainer, in: RoundedRectangle(cornerRadius: RemoRadius.medium, style: .continuous))
                     }
                     Button(action: submit) {
-                        if auth.isSubmitting { ProgressView().tint(.white) } else { Text(signUp ? "アカウントを作成" : "ログイン") }
+                        if auth.isSubmitting { ProgressView().tint(RemoStyle.onGreen) } else { Text(signUp ? "アカウントを作成" : "ログイン") }
                     }
                     .buttonStyle(PrimaryButtonStyle())
                     .disabled(auth.isSubmitting)

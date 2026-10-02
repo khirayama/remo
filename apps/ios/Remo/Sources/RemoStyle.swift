@@ -6,38 +6,61 @@ import UIKit
 /// reserved for small "live" accents. Movement, stays and photos each own one
 /// hue so the map and the timeline read the same way.
 enum RemoStyle {
-    static let background = Color(hex: 0xF4F5F1)
-    static let surface = Color.white
-    static let surfaceMuted = Color(hex: 0xF0F2EE)
-    static let outline = Color(hex: 0xE2E7E1)
-    static let outlineStrong = Color(hex: 0xC9D2C9)
+    static let background = Color(light: 0xF4F5F1, dark: 0x0F1512)
+    static let surface = Color(light: 0xFFFFFF, dark: 0x18201C)
+    static let surfaceMuted = Color(light: 0xF0F2EE, dark: 0x222C27)
+    static let outline = Color(light: 0xE2E7E1, dark: 0x2C3832)
+    static let outlineStrong = Color(light: 0xC9D2C9, dark: 0x46564D)
 
-    static let ink = Color(hex: 0x14291F)
-    static let inkSecondary = Color(hex: 0x55635A)
-    static let inkTertiary = Color(hex: 0x7E8A82)
+    static let ink = Color(light: 0x14291F, dark: 0xE6ECE7)
+    static let inkSecondary = Color(light: 0x55635A, dark: 0xB6C1B9)
+    static let inkTertiary = Color(light: 0x7E8A82, dark: 0x8D9A91)
 
-    static let green = Color(hex: 0x2F5A45)
-    static let greenContainer = Color(hex: 0xDFECE2)
-    static let onGreenContainer = Color(hex: 0x16352A)
+    static let green = Color(light: 0x2F5A45, dark: 0x86D3A9)
+    /// Text and icons on a `green` fill.
+    static let onGreen = Color(light: 0xFFFFFF, dark: 0x0F2A1D)
+    static let greenContainer = Color(light: 0xDFECE2, dark: 0x264536)
+    static let onGreenContainer = Color(light: 0x16352A, dark: 0xCFE9D8)
     static let mint = Color(hex: 0x1FCFA8)
 
-    static let teal = Color(hex: 0x0E8577)
-    static let tealDark = Color(hex: 0x085E54)
-    static let tealContainer = Color(hex: 0xD9F0EB)
-    static let amber = Color(hex: 0x9E6A2C)
-    static let amberContainer = Color(hex: 0xF5EADB)
+    static let teal = Color(light: 0x0E8577, dark: 0x58CBB9)
+    static let tealDark = Color(light: 0x085E54, dark: 0xA0EBDE)
+    static let tealContainer = Color(light: 0xD9F0EB, dark: 0x173F39)
+    static let amber = Color(light: 0x9E6A2C, dark: 0xE3B578)
+    static let amberContainer = Color(light: 0xF5EADB, dark: 0x47361E)
 
-    static let danger = Color(hex: 0xB3261E)
-    static let dangerContainer = Color(hex: 0xFBEAE8)
+    static let danger = Color(light: 0xB3261E, dark: 0xF2B8B5)
+    static let dangerContainer = Color(light: 0xFBEAE8, dark: 0x5C2420)
 
-    static let night = Color(hex: 0x10261D)
+    // The sign-in hero is dark in both appearances.
+    static let night = Color(light: 0x10261D, dark: 0x0B1410)
     static let onNight = Color(hex: 0xF2F5F0)
     static let onNightMuted = Color(hex: 0xF2F5F0).opacity(0.7)
+}
+
+/// Colors drawn on the map. They follow the appearance like the rest of the
+/// app: lighter marks keep their contrast on the dark map.
+enum RemoMapColor {
+    static let route = UIColor(light: 0x0E8577, dark: 0x58CBB9)
+    static let focusRoute = UIColor(light: 0x085E54, dark: 0xA0EBDE)
+    static let stay = UIColor(light: 0x2F5A45, dark: 0x86D3A9)
 }
 
 extension Color {
     init(hex: UInt32) {
         self.init(red: Double((hex >> 16) & 0xFF) / 255, green: Double((hex >> 8) & 0xFF) / 255, blue: Double(hex & 0xFF) / 255)
+    }
+
+    /// A color that follows the system appearance.
+    init(light: UInt32, dark: UInt32) {
+        self.init(uiColor: UIColor(light: light, dark: dark))
+    }
+}
+
+extension UIColor {
+    /// A color that follows the system appearance.
+    convenience init(light: UInt32, dark: UInt32) {
+        self.init { $0.userInterfaceStyle == .dark ? UIColor(hex: dark) : UIColor(hex: light) }
     }
 }
 
@@ -221,7 +244,7 @@ struct PrimaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(RemoFont.labelLarge)
-            .foregroundStyle(isEnabled ? Color.white : RemoStyle.ink.opacity(0.38))
+            .foregroundStyle(isEnabled ? RemoStyle.onGreen : RemoStyle.ink.opacity(0.38))
             .frame(maxWidth: .infinity)
             .frame(height: 48)
             .background(isEnabled ? RemoStyle.green : RemoStyle.ink.opacity(0.12), in: Capsule())

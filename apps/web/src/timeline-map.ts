@@ -838,14 +838,21 @@ export function buildTimelineActivities(events: LifeEvent[], analysis?: Timeline
     if (node.kind === "stay") activities.push({ ...node.activity, photos: [] });
   });
 
+  // Location samples that fall inside a stay's time range but not in the stay
+  // (spikes, points outside its radius) start a movement that overlaps the
+  // stay, so boundaries do not always meet exactly. After ordering, any two
+  // movements that end up next to each other are one movement in the sheet.
+  activities.sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+  const merged = mergeAdjacentMovements(activities);
+
   const photos = events.filter((event) => event.source === "photo").sort((a, b) => a.startedAt.localeCompare(b.startedAt));
   photos.forEach((photo) => {
     const photoTime = timestamp(photo.startedAt);
     if (!Number.isFinite(photoTime)) return;
-    const stay = activities.find((activity) => activity.kind === "stay"
+    const stay = merged.find((activity) => activity.kind === "stay"
       && photoTime >= timestamp(activity.startedAt)
       && photoTime <= timestamp(activity.endedAt));
-    const movement = stay ? undefined : activities.find((activity) => activity.kind === "movement"
+    const movement = stay ? undefined : merged.find((activity) => activity.kind === "movement"
       && photoTime >= timestamp(activity.startedAt)
       && photoTime <= timestamp(activity.endedAt));
     const activity = stay ?? movement;
@@ -853,7 +860,30 @@ export function buildTimelineActivities(events: LifeEvent[], analysis?: Timeline
     activity.photos.push(photo);
   });
 
-  return activities.sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+  return merged;
+}
+
+/** Joins movements that are adjacent in time order into one movement. */
+export function mergeAdjacentMovements(activities: TimelineActivity[]): TimelineActivity[] {
+  const result: TimelineActivity[] = [];
+  for (const activity of activities) {
+    const previous = result.at(-1);
+    if (previous?.kind === "movement" && activity.kind === "movement") {
+      const endedAt = activity.endedAt > previous.endedAt ? activity.endedAt : previous.endedAt;
+      result[result.length - 1] = {
+        ...previous,
+        endedAt,
+        durationMs: Math.max(0, timestamp(endedAt) - timestamp(previous.startedAt)),
+        to: activity.endedAt > previous.endedAt ? activity.to : previous.to,
+        path: [...previous.path, ...activity.path.slice(1)],
+        distanceMeters: previous.distanceMeters + activity.distanceMeters,
+        photos: [...previous.photos, ...activity.photos],
+      };
+    } else {
+      result.push(activity);
+    }
+  }
+  return result;
 }
 
 /** Geographic stay circle radius in meters, shared with Android's stayCircleRadiusMeters. */

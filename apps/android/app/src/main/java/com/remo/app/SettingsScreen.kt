@@ -143,7 +143,7 @@ internal fun SettingsScreen(state: SettingsState, actions: SettingsActions) {
                         onClick = null,
                     )
                     GroupDivider()
-                    ActionRow(Icons.Outlined.Person, state.user.email, subtitle = "ログイン中", onClick = null)
+                    ActionRow(Icons.Outlined.Person, state.user.email.ifBlank { "アカウント" }, subtitle = "ログイン中", onClick = null)
                     GroupDivider()
                     ActionRow(Icons.AutoMirrored.Outlined.Logout, "ログアウト", onClick = actions.onSignOut)
                 }
@@ -166,7 +166,7 @@ internal fun SettingsScreen(state: SettingsState, actions: SettingsActions) {
             }
             item {
                 Text(
-                    "Remo ${BuildConfig.VERSION_NAME}\n記録は端末に保存され、写真は外部に送信されません",
+                    "Remo ${BuildConfig.VERSION_NAME}\n記録は端末に保存されます。ログイン中は、記録と写真の縮小画像をバックアップします",
                     style = MaterialTheme.typography.bodySmall,
                     color = AppColors.inkTertiary,
                     textAlign = TextAlign.Center,
@@ -264,8 +264,9 @@ internal fun AccountDeletionDialog(onDismiss: () -> Unit, onDelete: suspend (Str
 internal fun ExportRangeDialog(
     startDate: String,
     endDate: String,
-    locationCount: Int,
-    photoCount: Int,
+    /** Null while the records of the range are being counted. */
+    locationCount: Int?,
+    photoCount: Int?,
     onStartDateChange: (String) -> Unit,
     onEndDateChange: (String) -> Unit,
     onDismiss: () -> Unit,
@@ -281,7 +282,7 @@ internal fun ExportRangeDialog(
                 DateField("開始日", startDate) { editing = "start" }
                 DateField("終了日", endDate) { editing = "end" }
                 Text(
-                    if (invalid) "終了日は開始日以降にしてください" else "位置 ${locationCount}件 · 写真と動画 ${photoCount}件",
+                    if (invalid) "終了日は開始日以降にしてください" else if (locationCount == null || photoCount == null) "件数を確認しています…" else "位置 ${locationCount}件 · 写真と動画 ${photoCount}件",
                     style = MaterialTheme.typography.bodySmall,
                     color = if (invalid) AppColors.danger else AppColors.inkSecondary,
                     modifier = Modifier.padding(top = 4.dp, start = 4.dp),

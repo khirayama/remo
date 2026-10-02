@@ -7,7 +7,7 @@
  * (sans) face; headings get their hierarchy from weight rather than a second family.
  */
 :root {
-  color-scheme: light;
+  color-scheme: light dark;
   --background: #f4f5f1;
   --surface: #ffffff;
   --surface-muted: #f0f2ee;
@@ -31,6 +31,16 @@
   --on-night-muted: rgba(242, 245, 240, .7);
   --state-hover: rgba(20, 41, 31, .06);
   --state-press: rgba(20, 41, 31, .1);
+  /* Text on a --green fill, and the fill's hover shade. */
+  --on-green: #ffffff;
+  --green-hover: #2a523f;
+  --disabled-ink: rgba(20, 41, 31, .38);
+  --disabled-container: rgba(20, 41, 31, .12);
+  --surface-hover: #f3f5f2;
+  --surface-muted-hover: #e8ebe6;
+  --surface-translucent: rgba(255, 255, 255, .94);
+  --map-background: #e8ece6;
+  --scrim: rgba(0, 0, 0, .32);
 
   --font-sans: "Roboto", "Noto Sans JP", "Hiragino Sans", system-ui, sans-serif;
   --type-display: 700 30px/40px var(--font-sans);
@@ -97,11 +107,11 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 .text-button:active:not(:disabled) { background: rgba(47, 90, 69, .12); }
 .text-button.danger { color: var(--danger); }
 .text-button.danger:hover:not(:disabled) { background: rgba(179, 38, 30, .08); }
-.text-button:disabled { color: rgba(20, 41, 31, .38); }
+.text-button:disabled { color: var(--disabled-ink); }
 
-.filled-button { display: inline-flex; height: 48px; align-items: center; justify-content: center; gap: 8px; padding: 0 24px; border-radius: 24px; background: var(--green); color: #fff; font-size: 14px; font-weight: 500; transition: box-shadow .15s ease, background-color .15s ease; }
-.filled-button:hover:not(:disabled) { box-shadow: var(--elevation-1); background: #2a523f; }
-.filled-button:disabled { background: rgba(20, 41, 31, .12); color: rgba(20, 41, 31, .38); }
+.filled-button { display: inline-flex; height: 48px; align-items: center; justify-content: center; gap: 8px; padding: 0 24px; border-radius: 24px; background: var(--green); color: var(--on-green); font-size: 14px; font-weight: 500; transition: box-shadow .15s ease, background-color .15s ease; }
+.filled-button:hover:not(:disabled) { box-shadow: var(--elevation-1); background: var(--green-hover); }
+.filled-button:disabled { background: var(--disabled-container); color: var(--disabled-ink); }
 .filled-button.wide { width: 100%; }
 
 .tonal-button { display: inline-flex; height: 40px; align-items: center; gap: 8px; padding: 0 16px 0 12px; border-radius: 20px; font-size: 14px; font-weight: 500; }
@@ -141,7 +151,7 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 .text-field-supporting { padding: 0 16px; color: var(--ink-2); font-size: 12px; line-height: 16px; }
 .text-field.invalid .text-field-supporting { color: var(--danger); }
 
-.scrim { position: fixed; inset: 0; z-index: 1200; background: rgba(0, 0, 0, .32); animation: fade-in .15s ease; }
+.scrim { position: fixed; inset: 0; z-index: 1200; background: var(--scrim); animation: fade-in .15s ease; }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes rise-in { from { transform: translateY(24px); opacity: 0; } }
 @keyframes pop-in { from { transform: scale(.94); opacity: 0; } }
@@ -155,11 +165,12 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 .alert-dialog.with-icon h2 { text-align: center; }
 .alert-dialog-text { display: grid; gap: 12px; margin-top: 16px; color: var(--ink-2); font-size: 14px; line-height: 20px; }
 .alert-dialog-text .dialog-strong { color: var(--ink); }
-.alert-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin: 24px -12px -8px 0; }
+.alert-dialog-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin: 24px -12px -8px 0; }
 
 .error-container { display: flex; gap: 8px; padding: 12px; border-radius: var(--shape-m); background: var(--danger-container); color: var(--danger); font-size: 12px; line-height: 17px; }
 .error-container svg { flex: 0 0 auto; }
 .error-container span { padding-top: 1px; }
+.notice-container { display: flex; gap: 8px; padding: 12px; border-radius: var(--shape-m); background: var(--green-container); color: var(--on-green-container); font-size: 12px; line-height: 17px; }
 .field-error { padding: 0 4px; color: var(--danger); font-size: 12px; line-height: 17px; }
 
 .loading-screen { display: grid; height: 100dvh; place-items: center; background: var(--background); }
@@ -190,11 +201,11 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 /* ---- Timeline home ------------------------------------------------------- */
 
 .app { position: fixed; inset: 0; overflow: hidden; }
-.timeline-home { position: absolute; inset: 0; overflow: hidden; background: #e8ece6; }
+.timeline-home { position: absolute; inset: 0; overflow: hidden; background: var(--map-background); }
 .leaflet-map-shell, .leaflet-map { position: absolute; inset: 0; }
-.leaflet-map.leaflet-container, .leaflet-map .leaflet-container { background: #e8ece6; font-family: var(--font-sans); }
+.leaflet-map.leaflet-container, .leaflet-map .leaflet-container { background: var(--map-background); font-family: var(--font-sans); }
 .timeline-home .leaflet-bottom { bottom: var(--sheet-inset, 0px); z-index: 850; }
-.leaflet-control-attribution { margin: 0 !important; padding: 0 6px !important; border-top-left-radius: var(--shape-xs); background: rgba(255, 255, 255, .8) !important; color: var(--ink-3) !important; font-size: 10px; line-height: 16px; }
+.leaflet-control-attribution { margin: 0 !important; padding: 0 6px !important; border-top-left-radius: var(--shape-xs); background: var(--surface-translucent) !important; color: var(--ink-3) !important; font-size: 10px; line-height: 16px; }
 .leaflet-control-attribution a { color: var(--ink-2) !important; }
 
 .map-controls { position: absolute; top: calc(12px + var(--safe-top)); z-index: 800; display: flex; align-items: center; gap: 8px; }
@@ -202,10 +213,10 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 .map-controls-row { display: flex; align-items: center; gap: 8px; }
 .map-controls-end { right: calc(12px + var(--safe-right)); }
 .map-control-button { display: grid; width: 48px; height: 48px; place-items: center; border-radius: 50%; background: var(--surface); color: var(--ink); box-shadow: var(--elevation-3); transition: background-color .15s ease; }
-.map-control-button:hover:not(:disabled) { background: #f3f5f2; }
+.map-control-button:hover:not(:disabled) { background: var(--surface-hover); }
 .map-control-button:disabled { color: var(--outline-strong); }
 .recording-pill { display: inline-flex; height: 36px; align-items: center; gap: 8px; padding: 0 14px 0 12px; border-radius: 18px; background: var(--surface); color: var(--ink); box-shadow: var(--elevation-3); font-size: 14px; font-weight: 500; white-space: nowrap; }
-.recording-pill:hover { background: #f3f5f2; }
+.recording-pill:hover { background: var(--surface-hover); }
 .recording-pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--outline-strong); }
 .recording-pill i.live { background: var(--mint); }
 .mode-toggle { display: inline-flex; height: 36px; padding: 3px; border-radius: 18px; background: var(--surface); box-shadow: var(--elevation-3); }
@@ -368,8 +379,8 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 .screen-footer .filled-button { display: flex; max-width: 640px; margin: 0 auto; }
 
 .location-picker { position: relative; height: 240px; overflow: hidden; border-radius: var(--shape-l); isolation: isolate; }
-.location-picker-map { position: absolute; inset: 0; background: #e8ece6; cursor: crosshair; }
-.location-picker-hint { position: absolute; top: 12px; left: 50%; z-index: 500; padding: 6px 12px; border-radius: 16px; background: rgba(255, 255, 255, .94); color: var(--ink); font-size: 12px; font-weight: 500; line-height: 16px; white-space: nowrap; pointer-events: none; transform: translateX(-50%); }
+.location-picker-map { position: absolute; inset: 0; background: var(--map-background); cursor: crosshair; }
+.location-picker-hint { position: absolute; top: 12px; left: 50%; z-index: 500; padding: 6px 12px; border-radius: 16px; background: var(--surface-translucent); color: var(--ink); font-size: 12px; font-weight: 500; line-height: 16px; white-space: nowrap; pointer-events: none; transform: translateX(-50%); }
 .location-source { display: grid; padding: 0 4px; }
 .location-source strong { color: var(--ink); font-size: 15px; font-weight: 600; line-height: 20px; }
 .location-source span { color: var(--ink-2); font-size: 12px; line-height: 17px; font-variant-numeric: tabular-nums; }
@@ -414,7 +425,7 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 
 .date-fields { display: grid; gap: 8px; }
 .date-field { position: relative; display: flex; width: 100%; align-items: center; padding: 12px 16px; border-radius: var(--shape-m); background: var(--surface-muted); color: var(--ink-2); text-align: left; transition: background-color .15s ease; }
-.date-field:hover { background: #e8ebe6; }
+.date-field:hover { background: var(--surface-muted-hover); }
 .date-field > span { display: grid; flex: 1; }
 .date-field small { color: var(--ink-2); font-size: 12px; font-weight: 500; line-height: 16px; }
 .date-field strong { color: var(--ink); font-size: 16px; font-weight: 400; line-height: 24px; }
@@ -424,4 +435,50 @@ ol, ul { margin: 0; padding: 0; list-style: none; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+/*
+ * Dark appearance follows the system setting. Only the tokens change; the map
+ * tiles are drawn for a light map, so they are inverted and re-tinted instead
+ * of requesting a second tile set.
+ */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0f1512;
+    --surface: #18201c;
+    --surface-muted: #222c27;
+    --outline: #2c3832;
+    --outline-strong: #46564d;
+    --ink: #e6ece7;
+    --ink-2: #b6c1b9;
+    --ink-3: #8d9a91;
+    --green: #86d3a9;
+    --green-container: #264536;
+    --on-green-container: #cfe9d8;
+    --mint: #1fcfa8;
+    --teal: #58cbb9;
+    --teal-container: #173f39;
+    --amber: #e3b578;
+    --amber-container: #47361e;
+    --danger: #f2b8b5;
+    --danger-container: #5c2420;
+    --night: #0b1410;
+    --state-hover: rgba(230, 236, 231, .08);
+    --state-press: rgba(230, 236, 231, .12);
+    --on-green: #0f2a1d;
+    --green-hover: #9adcb8;
+    --disabled-ink: rgba(230, 236, 231, .38);
+    --disabled-container: rgba(230, 236, 231, .12);
+    --surface-hover: #212b26;
+    --surface-muted-hover: #2a3630;
+    --surface-translucent: rgba(24, 32, 28, .92);
+    --map-background: #1b2420;
+    --scrim: rgba(0, 0, 0, .56);
+    --elevation-1: 0 1px 3px rgba(0, 0, 0, .5), 0 1px 2px rgba(0, 0, 0, .4);
+    --elevation-3: 0 3px 8px rgba(0, 0, 0, .5), 0 1px 3px rgba(0, 0, 0, .4);
+    --elevation-8: 0 -2px 16px rgba(0, 0, 0, .5), 0 -1px 4px rgba(0, 0, 0, .3);
+  }
+  .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(.92) contrast(.9) saturate(.7); }
+  .switch.checked > span { background: var(--on-green); }
+  .photo-marker-count { color: var(--on-green); }
 }

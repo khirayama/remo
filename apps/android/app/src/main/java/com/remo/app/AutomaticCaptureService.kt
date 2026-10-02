@@ -208,13 +208,10 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         val store = LogStore.get(this)
         val generation = store.generation
         RemoApplication.enqueuePersistence {
-            try {
-                store.add(entry, generation)
-                state.edit { putLong(KEY_LAST_LOGGED_AT, now) }
-                sendBroadcast(Intent(ACTION_AUTOMATIC_LOG_SAVED).setPackage(packageName))
-            } catch (error: Exception) {
-                Log.e(TAG, "Unable to persist location", error)
-            }
+            // A failure propagates to the persistence queue, which reports it to the user.
+            store.add(entry, generation)
+            state.edit { putLong(KEY_LAST_LOGGED_AT, now) }
+            sendBroadcast(Intent(ACTION_AUTOMATIC_LOG_SAVED).setPackage(packageName))
         }
     }
 

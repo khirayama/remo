@@ -32,14 +32,17 @@ struct PlaceHistoryTarget: Identifiable {
 struct TimelineHomeView: View {
     @Binding var date: Date
     let logs: [LogEntry]
-    /// Every recorded day, for the revisit history of a place.
-    let allLogs: [LogEntry]
+    /// The day `logs` belong to; it trails `date` while a day is being read.
+    let logsDate: Date?
     let assets: [PHAsset]
     let isCapturing: Bool
     let canLocate: Bool
     let onEditPhoto: (LogEntry) -> Void
     let onOpenSettings: () -> Void
+    /// Names the place at a coordinate; an empty name removes it.
+    let onRenamePlace: (CLLocationCoordinate2D, String) -> Void
     @ObservedObject var stayIndex: StayIndexStore
+    @ObservedObject private var namedPlaces = NamedPlaces.shared
 
     @State private var snapshot = TimelineRenderSnapshot(logs: [])
     @State private var snapshotRevision = 0
@@ -115,7 +118,9 @@ struct TimelineHomeView: View {
                     .ignoresSafeArea(edges: .bottom)
             }
         }
-        .task(id: logs.map { "\($0.id):\($0.updatedAt.timeIntervalSince1970)" }.joined(separator: "|") + "@\(date.timeIntervalSince1970)") {
+        .task(id: logs.map { "\($0.id):\($0.updatedAt.timeIntervalSince1970)" }.joined(separator: "|") + "@\(date.timeIntervalSince1970)@\(logsDate?.timeIntervalSince1970 ?? 0)") {
+            // The records of the previous day are still shown while the new day is read.
+            guard logsDate == date else { return }
             let requestedDate = date
             let logs = logs
             let next = await Task.detached(priority: .userInitiated) { TimelineRenderSnapshot(logs: logs) }.value
@@ -126,6 +131,11 @@ struct TimelineHomeView: View {
             await placeResolver.resolve(next.stayPlaces)
         }
         .onChange(of: date) { _, _ in focus = nil }
+        // A renamed place shows its new name everywhere at once.
+        .onChange(of: namedPlaces.places) { _, _ in
+            allPlaceLabels = [:]
+            Task { await placeResolver.resolve(snapshot.stayPlaces) }
+        }
         // A camera request belongs to the map it was made on.
         .onChange(of: mode) { _, _ in cameraRequest = nil }
         .task(id: "\(stayIndex.revision)@\(period.rawValue)") {
@@ -149,7 +159,7 @@ struct TimelineHomeView: View {
             }
         }
         .sheet(item: $historyTarget) { target in
-            PlaceHistorySheet(logs: allLogs, stays: stayIndex.stays, target: target, onClose: { historyTarget = nil }) { day in
+            PlaceHistorySheet(stays: stayIndex.stays, target: target, onClose: { historyTarget = nil }, onRename: { onRenamePlace(target.coordinate, $0) }) { day in
                 historyTarget = nil
                 mode = .day
                 date = day
@@ -719,23 +729,33 @@ private struct StayPlaceRow: View {
 
 /// All-time visits to one place, grouped by day. Tapping a day opens it.
 private struct PlaceHistorySheet: View {
-    let logs: [LogEntry]
     let stays: [StaySummary]?
     let target: PlaceHistoryTarget
     let onClose: () -> Void
+    let onRename: (String) -> Void
     let onOpenDay: (Date) -> Void
     @State private var history: StayVisitHistory?
+    @State private var naming = false
+    @State private var draftName = ""
+    @ObservedObject private var namedPlaces = NamedPlaces.shared
 
     var body: some View {
-        VStack(spacing: 0) {
+        let named = namedPlaces.place(at: target.coordinate)
+        let detail = (named != nil ? target.label?.address ?? target.label?.placeName : target.label?.primary)
+            ?? formatCoordinates(latitude: target.coordinate.latitude, longitude: target.coordinate.longitude)
+        return VStack(spacing: 0) {
             SheetHandle()
             HStack(spacing: 0) {
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("訪問履歴").font(RemoFont.headline).foregroundStyle(RemoStyle.ink)
-                    Text("\(target.label?.primary ?? formatCoordinates(latitude: target.coordinate.latitude, longitude: target.coordinate.longitude)) · 100m以内の滞在")
+                    Text(named?.name ?? "訪問履歴").font(RemoFont.headline).foregroundStyle(RemoStyle.ink).lineLimit(1)
+                    Text("\(detail) · 100m以内の滞在")
                         .font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkSecondary).lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                IconButton(systemName: "pencil", label: named != nil ? "場所の名前を変更" : "場所に名前を付ける") {
+                    draftName = named?.name ?? ""
+                    naming = true
+                }
                 IconButton(systemName: "xmark", label: "閉じる", action: onClose)
             }
             .padding(.leading, 20)
@@ -753,12 +773,22 @@ private struct PlaceHistorySheet: View {
         .presentationDragIndicator(.hidden)
         .presentationCornerRadius(RemoRadius.extraLarge)
         .presentationBackground(RemoStyle.surface)
-        .task(id: logs.count) {
-            // Read from the stay index once it is ready, so the history matches the all-places map.
+        .task(id: stays?.count) {
+            // Read from the stay index, so the history matches the all-places
+            // map; until the index is ready the sheet shows that it is being prepared.
             if let visits = target.visits { return history = stayVisitHistory(visits: visits) }
-            if let stays { return history = stayVisitHistory(from: stays, target: target.coordinate) }
-            let logs = logs, coordinate = target.coordinate
-            history = await Task.detached(priority: .userInitiated) { buildStayVisitHistory(logs, target: coordinate) }.value
+            if let stays { history = stayVisitHistory(from: stays, target: target.coordinate) }
+        }
+        .alert(named != nil ? "場所の名前を変更" : "場所に名前を付ける", isPresented: $naming) {
+            TextField("名前", text: $draftName)
+            Button("保存") {
+                let name = String(draftName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
+                if !name.isEmpty { onRename(name) }
+            }
+            if named != nil { Button("名前を削除", role: .destructive) { onRename("") } }
+            Button("キャンセル", role: .cancel) {}
+        } message: {
+            Text("自宅や職場などの名前を付けると、住所の代わりに表示されます。ログイン中は他の端末にも同期されます。")
         }
     }
 

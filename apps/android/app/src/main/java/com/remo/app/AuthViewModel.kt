@@ -26,16 +26,30 @@ class AuthViewModel : ViewModel() {
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
-            val user = runCatching {
-                if (SecureTokenStore.get() == null) null else ApiClient.currentUser()
-            }.getOrNull()
+            val user = if (SecureTokenStore.get() == null) null else try {
+                ApiClient.currentUser()
+            } catch (error: Exception) {
+                // Only the server rejecting the session signs the user out. Starting
+                // offline (or during an outage) keeps the session and its backup.
+                if (isSessionRejected(error)) null else SecureTokenStore.cachedAccount()
+            }
             if (user == null) {
                 SecureTokenStore.clear()
                 SecureTokenStore.clearAccountId()
             } else {
-                SecureTokenStore.setAccountId(user.id)
+                SecureTokenStore.setAccount(user)
             }
             mutableState.update { it.copy(initialized = true, signedIn = user != null, user = user) }
+        }
+    }
+
+    /** The server no longer accepts the stored session: sign out and ask to log in again. */
+    fun sessionExpired() {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { SecureTokenStore.clear() }
+            SecureTokenStore.clearAccountId()
+            BackupCoordinator.resetSession()
+            mutableState.value = AuthUiState(initialized = true)
         }
     }
 
@@ -54,7 +68,7 @@ class AuthViewModel : ViewModel() {
             runCatching {
                 val token = ApiClient.authenticate(current.email.trim(), current.password, current.signUp)
                 withContext(Dispatchers.IO) { SecureTokenStore.set(token) }
-                ApiClient.currentUser().also { SecureTokenStore.setAccountId(it.id) }
+                ApiClient.currentUser().also(SecureTokenStore::setAccount)
             }.onSuccess { user ->
                 mutableState.update { it.copy(isSubmitting = false, signedIn = true, user = user, password = "") }
             }.onFailure { error ->
@@ -71,10 +85,8 @@ class AuthViewModel : ViewModel() {
         result.exceptionOrNull()?.let { error ->
             return (error as? ApiException)?.message ?: "アカウントを削除できませんでした。通信環境を確認してください"
         }
-        withContext(Dispatchers.IO) {
-            BackupCoordinator.forgetAccount(RemoApplication.context)
-            SecureTokenStore.clear()
-        }
+        BackupCoordinator.forgetAccount(RemoApplication.context)
+        withContext(Dispatchers.IO) { SecureTokenStore.clear() }
         SecureTokenStore.clearAccountId()
         mutableState.value = AuthUiState(initialized = true)
         return null
@@ -91,12 +103,18 @@ class AuthViewModel : ViewModel() {
     }
 }
 
+/** True when the API answered that the session token is not valid (as opposed to being unreachable). */
+internal fun isSessionRejected(error: Throwable): Boolean = (error as? ApiException)?.statusCode == 401
+
 /** Maps API and network failures to messages a person can act on. */
 internal fun authErrorMessage(error: Throwable, signUp: Boolean): String {
     val api = error as? ApiException
     val code = api?.code?.uppercase()
     return when {
         api == null && error is java.io.IOException -> "サーバーに接続できません。通信環境を確認してください"
+        // The server may require a confirmed address before the first sign-in.
+        code == "MISSING_AUTH_TOKEN" && signUp -> "確認メールを送信しました。メール内のリンクを開いてからログインしてください"
+        code == "EMAIL_NOT_VERIFIED" -> "メールアドレスの確認が必要です。届いた確認メールのリンクを開いてから、もう一度ログインしてください"
         code == "USER_ALREADY_EXISTS" || (signUp && api?.statusCode in setOf(409, 422)) -> "このメールアドレスはすでに登録されています"
         code == "INVALID_EMAIL" -> "メールアドレスの形式を確認してください"
         code == "PASSWORD_TOO_SHORT" -> "パスワードは8文字以上で入力してください"

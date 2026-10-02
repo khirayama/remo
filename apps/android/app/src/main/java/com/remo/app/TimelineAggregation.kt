@@ -753,21 +753,45 @@ fun buildTimelineActivities(logs: List<LogEntry>, analysis: TimelineAnalysis): L
         }
     }
 
-    val photosByActivity = activities.associate { it.id to mutableListOf<LogEntry>() }.toMutableMap()
+    // Location samples inside a stay's time range but outside the stay start a
+    // movement that overlaps it, so boundaries do not always meet exactly.
+    // After ordering, movements that end up next to each other are one.
+    val ordered = mergeAdjacentMovements(activities.sortedBy(TimelineActivity::startedAt).map { it.copy(path = it.path.toList()) })
+    val photosByActivity = ordered.associate { it.id to mutableListOf<LogEntry>() }.toMutableMap()
     logs.filter { it.source == EventSource.PHOTO }.sortedBy(LogEntry::startedAt).forEach { photo ->
-        val stay = activities.firstOrNull { activity ->
+        val stay = ordered.firstOrNull { activity ->
             activity.kind == TimelineActivityKind.STAY
                 && photo.startedAt in activity.startedAt..activity.endedAt
         }
-        val movement = stay ?: activities.firstOrNull { activity ->
+        val movement = stay ?: ordered.firstOrNull { activity ->
             activity.kind == TimelineActivityKind.MOVEMENT
                 && photo.startedAt in activity.startedAt..activity.endedAt
         }
         movement?.let { photosByActivity.getValue(it.id).add(photo) }
     }
-    return activities.sortedBy(TimelineActivity::startedAt).map { activity ->
-        activity.copy(photos = photosByActivity.getValue(activity.id).toList(), path = activity.path.toList())
+    return ordered.map { activity -> activity.copy(photos = photosByActivity.getValue(activity.id).toList()) }
+}
+
+/** Joins movements that are adjacent in time order into one movement. */
+internal fun mergeAdjacentMovements(activities: List<TimelineActivity>): List<TimelineActivity> {
+    val result = mutableListOf<TimelineActivity>()
+    activities.forEach { activity ->
+        val previous = result.lastOrNull()
+        if (previous?.kind == TimelineActivityKind.MOVEMENT && activity.kind == TimelineActivityKind.MOVEMENT) {
+            val endedAt = maxOf(previous.endedAt, activity.endedAt)
+            result[result.lastIndex] = previous.copy(
+                endedAt = endedAt,
+                durationMs = (endedAt - previous.startedAt).coerceAtLeast(0L),
+                to = if (activity.endedAt > previous.endedAt) activity.to else previous.to,
+                path = previous.path + activity.path.drop(1),
+                distanceMeters = (previous.distanceMeters ?: 0.0) + (activity.distanceMeters ?: 0.0),
+                photos = previous.photos + activity.photos,
+            )
+        } else {
+            result += activity
+        }
     }
+    return result
 }
 
 fun stayCircleRadiusMeters(durationMs: Long): Double {

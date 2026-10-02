@@ -23,6 +23,43 @@ export function useEscape(onEscape: () => void) {
   }, []);
 }
 
+const FOCUSABLE = "a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]):not([hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
+
+/**
+ * Keeps keyboard focus inside a modal surface while it is open: focus moves
+ * into it, Tab cycles within it, and focus returns to where it was on close.
+ */
+export function useModalFocus<T extends HTMLElement>() {
+  const ref = useRef<T>(null);
+  useEffect(() => {
+    const container = ref.current;
+    if (!container) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
+    const focusable = () => [...container.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((element) => element.offsetParent !== null || element === document.activeElement);
+    if (!container.contains(document.activeElement)) (focusable()[0] ?? container).focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      // Only the topmost modal handles Tab.
+      const modals = document.querySelectorAll("[data-modal]");
+      if (modals[modals.length - 1] !== container) return;
+      const items = focusable();
+      if (!items.length) { event.preventDefault(); return; }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (!container.contains(active)) { event.preventDefault(); first.focus(); }
+      else if (event.shiftKey && active === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && active === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      if (previous?.isConnected) previous.focus();
+    };
+  }, []);
+  return ref;
+}
+
 export function Icon({ name, size = 24, className, style }: { name: IconName; size?: number; className?: string; style?: CSSProperties }) {
   return <svg className={className} style={style} width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={ICON_PATHS[name]}/></svg>;
 }
@@ -76,11 +113,10 @@ export function TextField({ label, leading, trailing, supporting, error, classNa
 
 /** Material 3 AlertDialog: 28px corners, optional icon, text actions. */
 export function Dialog({ icon, iconTone = "neutral", title, children, actions, onDismiss, label }: { icon?: IconName; iconTone?: "danger" | "neutral"; title: string; children?: ReactNode; actions: ReactNode; onDismiss: () => void; label?: string }) {
-  const cardRef = useRef<HTMLElement>(null);
+  const cardRef = useModalFocus<HTMLElement>();
   useEscape(onDismiss);
-  useEffect(() => { cardRef.current?.querySelector<HTMLElement>("input, button:not([disabled])")?.focus(); }, []);
   return <div className="scrim dialog-scrim" onMouseDown={(event) => event.target === event.currentTarget && onDismiss()}>
-    <section ref={cardRef} className={`alert-dialog${icon ? " with-icon" : ""}`} role="dialog" aria-modal="true" aria-label={label ?? title}>
+    <section ref={cardRef} data-modal tabIndex={-1} className={`alert-dialog${icon ? " with-icon" : ""}`} role="dialog" aria-modal="true" aria-label={label ?? title}>
       {icon && <Icon name={icon} className={`alert-dialog-icon ${iconTone}`}/>}
       <h2>{title}</h2>
       {children && <div className="alert-dialog-text">{children}</div>}

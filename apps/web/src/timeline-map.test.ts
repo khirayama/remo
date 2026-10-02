@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import timelineFixture from "../../../fixtures/timeline/remo-timeline-2026-09-01.sample.json";
 import { LifeEvent } from "./life-log";
-import { buildMovementSegments, buildRawRouteSegments, buildStayClusters, buildStayPlaces, buildStayVisitHistory, buildTimelineActivities, clusterPhotoEvents, correctedLocationEvents, displayPhotoEvents, distanceMeters, PHOTO_CLUSTER_RADIUS_METERS, routeOpacity, STAY_CLUSTER_RADIUS_METERS, stayCircleRadiusMeters, suggestPhotoLocation } from "./timeline-map";
+import { buildMovementSegments, buildRawRouteSegments, buildStayClusters, buildStayPlaces, buildStayVisitHistory, buildTimelineActivities, clusterPhotoEvents, mergeAdjacentMovements, correctedLocationEvents, displayPhotoEvents, distanceMeters, PHOTO_CLUSTER_RADIUS_METERS, routeOpacity, STAY_CLUSTER_RADIUS_METERS, stayCircleRadiusMeters, suggestPhotoLocation } from "./timeline-map";
 
 function event(overrides: Partial<LifeEvent> = {}): LifeEvent {
   return {
@@ -26,6 +26,19 @@ function samples(prefix: string, start: string, count: number, stepSeconds: numb
 }
 
 describe("map timeline", () => {
+  it("joins movements that end up next to each other", () => {
+    const movement = (id: string, startedAt: string, endedAt: string, to: [number, number]) => ({
+      kind: "movement" as const, id, startedAt, endedAt, durationMs: Date.parse(endedAt) - Date.parse(startedAt),
+      photos: [], from: [35, 139] as [number, number], to, path: [[35, 139], to] as [number, number][], distanceMeters: 100,
+    });
+    const merged = mergeAdjacentMovements([
+      movement("m1", "2026-08-31T01:00:00.000Z", "2026-08-31T01:10:00.000Z", [35.1, 139]),
+      movement("m2", "2026-08-31T01:05:00.000Z", "2026-08-31T01:20:00.000Z", [35.2, 139]),
+    ]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({ id: "m1", endedAt: "2026-08-31T01:20:00.000Z", durationMs: 20 * 60_000, to: [35.2, 139], distanceMeters: 200 });
+  });
+
   it("keeps every raw location pair, including a spike, in the raw route", () => {
     const spike = event({ id: "spike", startedAt: "2026-08-31T01:01:00.000Z", latitude: 35.7, longitude: 139.8 });
     const segments = buildRawRouteSegments([

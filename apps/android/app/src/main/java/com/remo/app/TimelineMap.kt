@@ -115,7 +115,8 @@ internal fun TimelineMap(
     val paddingState by rememberUpdatedState(padding)
     val processedLocations = timeline.processedLocations
     val routeSegments = timeline.routeSegments
-    val routePaths = remember(routeSegments, focusTarget != null) { routeRenderPaths(routeSegments, focusTarget != null) }
+    val routeRgb = MapColors.routeRgb
+    val routePaths = remember(routeSegments, focusTarget != null, routeRgb) { routeRenderPaths(routeSegments, focusTarget != null, routeRgb) }
     val stayClusters = timeline.stayClusters
     var stayLabels by remember { mutableStateOf<Map<String, StayPlaceLabel>>(emptyMap()) }
     LaunchedEffect(stayClusters) {
@@ -206,13 +207,14 @@ internal fun TimelineMap(
                     stayClusters.forEach { stay ->
                         val popupKey = "stay:${stay.entries.firstOrNull()?.entry?.id ?: stay.id}"
                         val selected = focusTarget?.kind == TimelineActivityKind.STAY && focusTarget.activityId == stay.id
-                        val label = stayLabels[stay.id]
+                        // A name the user gave to the place replaces the geocoder's.
+                        val label = stayLabels[stay.id].named(stay.coordinate)
                         val circle = stayCircles.getOrPut(popupKey) { map.addCircle(CircleOptions().center(stay.coordinate).clickable(true)) }
                         if (renderedStays[popupKey]?.first != stay) circle.center = stay.coordinate
                         circle.radius = stayCircleRadiusMeters(stay.durationMs) + if (selected) 8.0 else 0.0
-                        circle.strokeColor = android.graphics.Color.argb(if (focusTarget == null) 170 else if (selected) 255 else 50, 47, 90, 69)
+                        circle.strokeColor = MapColors.argb(if (focusTarget == null) 170 else if (selected) 255 else 50, MapColors.stayRgb)
                         circle.strokeWidth = (if (selected) 2.5f else 1.5f) * px
-                        circle.fillColor = android.graphics.Color.argb(if (focusTarget == null) 46 else if (selected) 90 else 14, 47, 90, 69)
+                        circle.fillColor = MapColors.argb(if (focusTarget == null) 46 else if (selected) 90 else 14, MapColors.stayRgb)
                         circle.zIndex = if (selected) 1f else 0f
                         circle.tag = popupKey
                         val stayDetails = listOfNotNull(
@@ -251,7 +253,7 @@ internal fun TimelineMap(
                     }
                     if (focusTarget?.kind == TimelineActivityKind.MOVEMENT && focusTarget.path.size > 1) {
                         val line = focusLine[0] ?: map.addPolyline(
-                            PolylineOptions().color(android.graphics.Color.rgb(8, 94, 84)).width(6 * px).zIndex(2f)
+                            PolylineOptions().color(MapColors.argb(255, MapColors.focusRouteRgb)).width(6 * px).zIndex(2f)
                                 .jointType(JointType.ROUND).startCap(RoundCap()).endCap(RoundCap())
                         ).also { focusLine[0] = it }
                         line.points = focusTarget.path

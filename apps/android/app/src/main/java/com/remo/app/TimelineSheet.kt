@@ -31,6 +31,7 @@ import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.EventBusy
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
@@ -39,7 +40,9 @@ import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.Place
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.Route
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -348,6 +351,8 @@ private fun ActivityRow(
     onOpenHistory: () -> Unit,
 ) {
     val isStay = activity.kind == TimelineActivityKind.STAY
+    @Suppress("NAME_SHADOWING")
+    val label = activity.coordinate?.takeIf { isStay }?.let(label::named) ?: label
     TimelineRowFrame(
         startedAt = activity.startedAt,
         endedAt = activity.endedAt,
@@ -459,12 +464,13 @@ private fun LazyListScope.stayPlacesSection(
 }
 
 @Composable
-private fun StayPlaceRow(place: StayPlace, label: StayPlaceLabel?, onLabel: (StayPlaceLabel) -> Unit, onClick: () -> Unit) {
+private fun StayPlaceRow(place: StayPlace, resolvedLabel: StayPlaceLabel?, onLabel: (StayPlaceLabel) -> Unit, onClick: () -> Unit) {
     val context = LocalContext.current
     // Lazily resolved, so only places scrolled into view hit the geocoder.
     LaunchedEffect(place.id, place.coordinate) {
-        if (label == null) resolveStayPlaceLabel(context, place.coordinate)?.let(onLabel)
+        if (resolvedLabel == null) resolveStayPlaceLabel(context, place.coordinate)?.let(onLabel)
     }
+    val label = resolvedLabel.named(place.coordinate)
     Row(
         Modifier.fillMaxWidth().clickable(onClickLabel = "訪問履歴を表示", onClick = onClick).padding(start = 20.dp, end = 16.dp, top = 8.dp, bottom = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -511,8 +517,11 @@ internal data class PlaceHistoryTarget(val coordinate: LatLng, val label: StayPl
 /** All-time visits to one place, grouped by day. Tapping a day opens it. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun PlaceHistorySheet(history: StayVisitHistory?, target: PlaceHistoryTarget, onDismiss: () -> Unit, onOpenDay: (String) -> Unit) {
+internal fun PlaceHistorySheet(history: StayVisitHistory?, target: PlaceHistoryTarget, onDismiss: () -> Unit, onRename: (current: NamedPlace?, name: String) -> Unit, onOpenDay: (String) -> Unit) {
     val days = remember(history) { history?.visits.orEmpty().groupBy { dayKey(it.startedAt) }.toList() }
+    val named = NamedPlaces.at(target.coordinate)
+    var naming by remember { mutableStateOf(false) }
+    if (naming) PlaceNameDialog(named, onDismiss = { naming = false }) { name -> naming = false; onRename(named, name) }
     val maxListHeight = with(LocalDensity.current) { (LocalWindowInfo.current.containerSize.height * 0.6f).toDp() }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -522,15 +531,16 @@ internal fun PlaceHistorySheet(history: StayVisitHistory?, target: PlaceHistoryT
     ) {
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("訪問履歴", style = MaterialTheme.typography.headlineSmall, color = AppColors.ink)
+                Text(named?.name ?: "訪問履歴", style = MaterialTheme.typography.headlineSmall, color = AppColors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
-                    "${target.label?.primary ?: formatCoordinates(target.coordinate.latitude, target.coordinate.longitude)} · 100m以内の滞在",
+                    "${(if (named != null) target.label?.address ?: target.label?.placeName else target.label?.primary) ?: formatCoordinates(target.coordinate.latitude, target.coordinate.longitude)} · 100m以内の滞在",
                     style = MaterialTheme.typography.bodySmall,
                     color = AppColors.inkSecondary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
+            IconButton(onClick = { naming = true }) { Icon(Icons.Outlined.Edit, if (named != null) "場所の名前を変更" else "場所に名前を付ける", tint = AppColors.ink) }
             IconButton(onClick = onDismiss) { Icon(Icons.Outlined.Close, "閉じる", tint = AppColors.ink) }
         }
         val loaded = history
@@ -573,4 +583,24 @@ internal fun PlaceHistorySheet(history: StayVisitHistory?, target: PlaceHistoryT
             }
         }
     }
+}
+
+/** Names a place, renames it, or removes its name (an empty name). */
+@Composable
+private fun PlaceNameDialog(current: NamedPlace?, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var name by remember { mutableStateOf(current?.name.orEmpty()) }
+    val trimmed = name.trim()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (current != null) "場所の名前を変更" else "場所に名前を付ける", style = MaterialTheme.typography.dialogTitle) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("自宅や職場などの名前を付けると、住所の代わりに表示されます。ログイン中は他の端末にも同期されます。", style = MaterialTheme.typography.bodyMedium, color = AppColors.inkSecondary)
+                OutlinedTextField(value = name, onValueChange = { name = it.take(80) }, label = { Text("名前") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                if (current != null) TextButton(onClick = { onSave("") }) { Text("名前を削除", color = AppColors.danger) }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(trimmed) }, enabled = trimmed.isNotEmpty() && trimmed != current?.name) { Text("保存") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("キャンセル") } },
+    )
 }

@@ -155,9 +155,9 @@ private final class PlaceMarkerView: MKAnnotationView {
         let size = (place.radius + stroke) * 2
         image = UIGraphicsImageRenderer(size: CGSize(width: size, height: size)).image { _ in
             let circle = UIBezierPath(ovalIn: CGRect(x: stroke, y: stroke, width: place.radius * 2, height: place.radius * 2))
-            UIColor(hex: 0x2F5A45, alpha: place.selected ? 0.9 : place.opacity).setFill()
+            RemoMapColor.stay.withAlphaComponent(place.selected ? 0.9 : place.opacity).setFill()
             circle.fill()
-            (place.selected ? UIColor.white : UIColor(hex: 0x2F5A45, alpha: min(1, place.opacity + 0.3))).setStroke()
+            (place.selected ? UIColor.white : RemoMapColor.stay.withAlphaComponent(min(1, place.opacity + 0.3))).setStroke()
             circle.lineWidth = stroke
             circle.stroke()
         }
