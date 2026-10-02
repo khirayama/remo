@@ -10,6 +10,8 @@ import java.util.Locale
 import android.os.SystemClock
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 
 private data class CachedPlaceLabel(val label: StayPlaceLabel?, val expiresAt: Long)
 private val labelMutex = Mutex()
@@ -22,6 +24,24 @@ data class StayPlaceLabel(
     val address: String?,
 ) {
     val primary: String get() = placeName ?: address ?: "滞在ポイント"
+}
+
+/** The names the user gave to places, kept current by the home screen. */
+object NamedPlaces {
+    var places: List<NamedPlace> by androidx.compose.runtime.mutableStateOf(emptyList())
+
+    /** The named place at [coordinate], if there is one within the stay-place radius. */
+    fun at(coordinate: LatLng): NamedPlace? = places.asSequence()
+        .filterNot(NamedPlace::deleted)
+        .map { it to distanceMeters(LatLng(it.latitude, it.longitude), coordinate) }
+        .filter { it.second <= STAY_PLACE_RADIUS_METERS }
+        .minByOrNull { it.second }?.first
+}
+
+/** The label to show for a place: the user's name for it when there is one, over the geocoder's. */
+fun StayPlaceLabel?.named(coordinate: LatLng): StayPlaceLabel? {
+    val name = NamedPlaces.at(coordinate)?.name ?: return this
+    return StayPlaceLabel(name, this?.address ?: this?.placeName)
 }
 
 /** Resolve labels locally through the device's configured geocoder. */

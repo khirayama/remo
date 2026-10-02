@@ -46,9 +46,9 @@ internal object StayIndexStorage {
 
     private fun encode(cache: StayIndexCache): String {
         val days = JSONObject()
-        cache.days.forEach { (day, entry) ->
-            days.put(day, JSONObject().put("fingerprint", entry.fingerprint).put("stays", JSONArray().apply {
-                entry.stays.forEach { stay ->
+        cache.days.forEach { (day, stays) ->
+            days.put(day, JSONArray().apply {
+                stays.forEach { stay ->
                     put(JSONObject()
                         .put("id", stay.id)
                         .put("latitude", stay.latitude)
@@ -57,19 +57,20 @@ internal object StayIndexStorage {
                         .put("endedAt", stay.endedAt)
                         .put("durationMs", stay.durationMs))
                 }
-            }))
+            })
         }
-        return JSONObject().put("version", cache.version).put("timeZone", cache.timeZone).put("days", days).toString()
+        return JSONObject().put("version", cache.version).put("timeZone", cache.timeZone).put("complete", cache.complete).put("days", days).toString()
     }
 
     private fun decode(value: String): StayIndexCache {
         val json = JSONObject(value)
+        // A cache from another layout is discarded by `usableFor`; do not parse its days.
+        if (json.getInt("version") != STAY_INDEX_VERSION) return StayIndexCache(json.getInt("version"), json.getString("timeZone"))
         val days = json.getJSONObject("days")
-        val decoded = mutableMapOf<String, StayIndexDay>()
+        val decoded = mutableMapOf<String, List<StaySummary>>()
         days.keys().forEach { day ->
-            val entry = days.getJSONObject(day)
-            val stays = entry.getJSONArray("stays")
-            decoded[day] = StayIndexDay(entry.getString("fingerprint"), (0 until stays.length()).map { index ->
+            val stays = days.getJSONArray(day)
+            decoded[day] = (0 until stays.length()).map { index ->
                 val stay = stays.getJSONObject(index)
                 StaySummary(
                     id = stay.getString("id"),
@@ -79,9 +80,9 @@ internal object StayIndexStorage {
                     endedAt = stay.getLong("endedAt"),
                     durationMs = stay.getLong("durationMs"),
                 )
-            })
+            }
         }
-        return StayIndexCache(json.getInt("version"), json.getString("timeZone"), decoded)
+        return StayIndexCache(json.getInt("version"), json.getString("timeZone"), json.optBoolean("complete", false), decoded)
     }
 }
 
@@ -93,26 +94,52 @@ internal data class StayIndexState(val stays: List<StaySummary>? = null, val pro
 private const val STAY_INDEX_DEBOUNCE_MS = 1_000L
 
 /**
- * Every stay across all days. Past days come from the device-local cache and
- * only days whose records changed are detected again; today is always fresh.
+ * Every stay across all days. Past days come from the device-local cache; the
+ * store records which days had a record written or removed, and only those are
+ * detected again. Today is always fresh.
  */
 @Composable
-internal fun rememberStayIndex(context: Context, logs: List<LogEntry>): StayIndexState {
+internal fun rememberStayIndex(context: Context, store: LogStore): StayIndexState {
     var state by remember { mutableStateOf(StayIndexState()) }
     val holder = remember { StayIndexHolder() }
-    LaunchedEffect(logs) {
+    LaunchedEffect(store.revision) {
         if (holder.cache != null) delay(STAY_INDEX_DEBOUNCE_MS)
         // A superseded update may still be finishing a day; it stops before the next one.
         holder.mutex.withLock {
-            val result = withContext(Dispatchers.Default) {
+            val stays = withContext(Dispatchers.Default) {
                 val timeZone = TimeZone.getDefault().id
                 val cache = holder.cache?.takeIf { it.timeZone == timeZone }
                     ?: StayIndexStorage.load(context, timeZone).also { holder.cache = it }
-                updateStayIndex(logs, cache, dayKey(System.currentTimeMillis())) { done, total ->
-                    withContext(Dispatchers.Main) { state = state.copy(progress = StayIndexProgress(done, total)) }
-                }.also { if (it.changed) StayIndexStorage.save(context, cache) }
+                val today = dayKey(System.currentTimeMillis())
+                val dirty = store.dirtyDays()
+                // The first pass covers every recorded day; an interrupted pass
+                // continues with the days it has not reached.
+                val days = if (cache.complete) dirty.map(DirtyDay::day)
+                    else store.recordedDays().filter { it !in cache.days } + dirty.map(DirtyDay::day)
+                val tokens = dirty.associateBy(DirtyDay::day)
+                var unsaved = 0
+                try {
+                    val result = refreshStayIndex(
+                        cache, days, today,
+                        loadDay = { day -> store.entriesOfDay(day) },
+                        onDay = { day ->
+                            tokens[day]?.let { store.clearDirtyDays(listOf(it)) }
+                            unsaved += 1
+                        },
+                        onProgress = { done, total -> withContext(Dispatchers.Main) { state = state.copy(progress = StayIndexProgress(done, total)) } },
+                    )
+                    if (!cache.complete) cache.complete = true
+                    if (result.changed || unsaved > 0) StayIndexStorage.save(context, cache)
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    // Keep the days that were finished before the update was superseded.
+                    if (unsaved > 0) StayIndexStorage.save(context, cache)
+                    throw cancelled
+                }
+                // Today (and any record dated later) is detected on every update.
+                val openDays = (listOf(today) + dirty.map(DirtyDay::day).filter { it > today }).distinct()
+                allStays(cache, openDays.flatMap { day -> detectDayStays(store.entriesOfDay(day)) })
             }
-            state = StayIndexState(result.stays)
+            state = StayIndexState(stays)
         }
     }
     return state

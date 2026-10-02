@@ -7,7 +7,6 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -29,66 +28,78 @@ class StayIndexTest {
             samples("day3-home", at("2026-08-31T12:00:00Z"), 3, 10 * minute) +
             samples("today-home", at("2026-09-01T12:00:00Z"), 3, 10 * minute)
 
+    private val days = listOf("2026-08-29", "2026-08-30", "2026-08-31", today)
+    private fun byDay(logs: List<LogEntry>): suspend (String) -> List<LogEntry> = { day -> logs.filter { dayKey(it.startedAt) == day } }
+
+    /** Every stay of [logs], the way the app assembles them. */
+    private suspend fun staysOf(logs: List<LogEntry>): List<StaySummary> {
+        val cache = StayIndexCache(timeZone = "Asia/Tokyo")
+        refreshStayIndex(cache, days, today, byDay(logs))
+        return allStays(cache, detectDayStays(byDay(logs)(today)))
+    }
+
     @Test fun cachesPastDaysOnlyAndReturnsEveryStayOldestFirst() = runBlocking {
         val cache = StayIndexCache(timeZone = "Asia/Tokyo")
-        val result = updateStayIndex(history(), cache, today)
+        val result = refreshStayIndex(cache, days, today, byDay(history()))
 
-        assertTrue(result.changed)
+        assertEquals(StayIndexRefresh(listOf("2026-08-29", "2026-08-30", "2026-08-31"), changed = true), result)
         assertEquals(setOf("2026-08-29", "2026-08-30", "2026-08-31"), cache.days.keys)
         assertEquals(
             listOf(at("2026-08-29T12:00:00Z"), at("2026-08-30T12:00:00Z"), at("2026-08-31T12:00:00Z"), at("2026-09-01T12:00:00Z")),
-            result.stays.map(StaySummary::startedAt),
+            staysOf(history()).map(StaySummary::startedAt),
         )
     }
 
-    @Test fun reusesUnchangedDaysAndRecomputesAChangedDay() = runBlocking {
+    @Test fun detectsOnlyTheDaysItIsGiven() = runBlocking {
         val cache = StayIndexCache(timeZone = "Asia/Tokyo")
-        updateStayIndex(history(), cache, today)
-        val workDay = cache.days.getValue("2026-08-30")
-        assertFalse(updateStayIndex(history(), cache, today).changed)
-        assertSame(workDay, cache.days.getValue("2026-08-30"))
-
-        // Moving the work-day records (e.g. a correction) must refresh only that day.
+        refreshStayIndex(cache, days, today, byDay(history()))
         val homeDay = cache.days.getValue("2026-08-29")
-        val edited = history().map { if (it.id.startsWith("day2-work")) it.copy(latitude = 35.7, updatedAt = 1L) else it }
-        assertTrue(updateStayIndex(edited, cache, today).changed)
+        assertFalse(refreshStayIndex(cache, emptyList(), today, byDay(history())).changed)
+
+        // Moving the work-day records (e.g. a correction) refreshes only that day.
+        val edited = history().map { if (it.id.startsWith("day2-work")) it.copy(latitude = 35.7) else it }
+        val loaded = mutableListOf<String>()
+        val finished = mutableListOf<String>()
+        val result = refreshStayIndex(cache, listOf("2026-08-30"), today, loadDay = { day -> loaded += day; byDay(edited)(day) }, onDay = { finished += it })
+        assertTrue(result.changed)
+        assertEquals(listOf("2026-08-30"), loaded)
+        assertEquals(listOf("2026-08-30"), finished)
         assertSame(homeDay, cache.days.getValue("2026-08-29"))
-        assertEquals(35.7, cache.days.getValue("2026-08-30").stays.single().latitude, 1e-6)
+        assertEquals(35.7, cache.days.getValue("2026-08-30").single().latitude, 1e-6)
     }
 
     @Test fun dropsCachedDaysWhoseRecordsWereDeleted() = runBlocking {
         val cache = StayIndexCache(timeZone = "Asia/Tokyo")
-        updateStayIndex(history(), cache, today)
-        assertTrue(updateStayIndex(history().filterNot { it.id.startsWith("day2-work") }, cache, today).changed)
+        refreshStayIndex(cache, days, today, byDay(history()))
+        val remaining = history().filterNot { it.id.startsWith("day2-work") }
+        assertTrue(refreshStayIndex(cache, listOf("2026-08-30"), today, byDay(remaining)).changed)
         assertNull(cache.days["2026-08-30"])
     }
 
-    @Test fun fingerprintChangesWhenARecordIsDeletedOrEdited() {
-        val entries = samples("a", at("2026-08-30T12:00:00Z"), 3, 10 * minute)
-        val base = dayFingerprint(entries)
-        assertEquals(base, dayFingerprint(entries.reversed()))
-        assertNotEquals(base, dayFingerprint(entries.drop(1)))
-        assertNotEquals(base, dayFingerprint(listOf(entries[0].copy(updatedAt = 1L)) + entries.drop(1)))
-    }
-
     @Test fun discardsACacheFromAnotherVersionOrTimeZone() {
-        val cache = StayIndexCache(timeZone = "Asia/Tokyo", days = mutableMapOf("2026-08-30" to StayIndexDay("x", emptyList())))
+        val cache = StayIndexCache(timeZone = "Asia/Tokyo", complete = true, days = mutableMapOf("2026-08-30" to emptyList()))
         assertEquals(setOf("2026-08-30"), cache.usableFor("Asia/Tokyo").days.keys)
+        assertTrue(cache.usableFor("Asia/Tokyo").complete)
         assertTrue(cache.usableFor("Europe/London").days.isEmpty())
+        assertFalse(cache.usableFor("Europe/London").complete)
         assertTrue(StayIndexCache(version = STAY_INDEX_VERSION + 1, timeZone = "Asia/Tokyo", days = cache.days).usableFor("Asia/Tokyo").days.isEmpty())
         assertTrue(null.usableFor("Asia/Tokyo").days.isEmpty())
     }
 
-    @Test fun stopsWhenCancelled() = runBlocking {
-        val job = Job().apply { cancel() }
-        val cancelled = runCatching { withContext(job) { updateStayIndex(history(), StayIndexCache(timeZone = "Asia/Tokyo"), today) } }
+    @Test fun stopsWhenCancelledAndKeepsFinishedDays() = runBlocking {
+        val cache = StayIndexCache(timeZone = "Asia/Tokyo")
+        val job = Job()
+        val cancelled = runCatching {
+            withContext(job) { refreshStayIndex(cache, days, today, byDay(history()), onDay = { job.cancel() }) }
+        }
         assertTrue(cancelled.exceptionOrNull() is CancellationException)
+        assertEquals(setOf("2026-08-29"), cache.days.keys)
     }
 
     @Test fun groupsStaysWithin100mAcrossDaysMostVisitedFirst() = runBlocking {
         // About 90m north of home, on a day that otherwise was at work.
         val logs = history() + samples("day2-near-home", at("2026-08-30T14:00:00Z"), 3, 10 * minute, latitude = 35.6820)
-        val places = buildAllTimeStayPlaces(updateStayIndex(logs, StayIndexCache(timeZone = "Asia/Tokyo"), today).stays)
+        val places = buildAllTimeStayPlaces(staysOf(logs))
 
         assertEquals(2, places.size)
         assertEquals(
@@ -103,7 +114,7 @@ class StayIndexTest {
     @Test fun indexHistoryMatchesDetectingStaysDayByDay() = runBlocking {
         val logs = history()
         val home = LatLng(35.6812, 139.7671)
-        val fromIndex = stayVisitHistoryFromStays(updateStayIndex(logs, StayIndexCache(timeZone = "Asia/Tokyo"), today).stays, home)
+        val fromIndex = stayVisitHistoryFromStays(staysOf(logs), home)
         val direct = buildStayVisitHistory(logs, home)
         assertEquals(direct.visits.map(StaySummary::id), fromIndex.visits.map(StaySummary::id))
         assertEquals(direct.dayCount, fromIndex.dayCount)

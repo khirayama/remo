@@ -4,109 +4,89 @@ import { buildStayClusters, distanceMeters, StayCluster, StayVisit, StayVisitHis
 /** The part of a stay the all-time views need; cached per day. */
 export type StaySummary = StayVisit;
 
-// Bump whenever stay detection changes so every cached day is recomputed.
-export const STAY_INDEX_VERSION = 1;
+// Bump whenever stay detection or the cache layout changes so every cached
+// day is recomputed.
+export const STAY_INDEX_VERSION = 2;
 
 /**
  * Derived, device-local cache of each past day's stays. It is never synced or
- * exported and can be dropped at any time: every day is recomputed from the
- * records when its fingerprint no longer matches.
+ * exported and can be dropped at any time: the storage layer records which
+ * days had a record written or removed, and those days are detected again.
  */
 export type StayIndexCache = {
   version: number;
   timeZone: string;
-  days: Record<string, { fingerprint: string; stays: StaySummary[] }>;
+  /** False while the first pass over every recorded day is still running. */
+  complete: boolean;
+  days: Record<string, StaySummary[]>;
 };
 
 export function emptyStayIndexCache(timeZone: string): StayIndexCache {
-  return { version: STAY_INDEX_VERSION, timeZone, days: {} };
-}
-
-/** Parse a stored cache, discarding it when it is corrupt or from another algorithm or time zone. */
-export function parseStayIndexCache(value: string | undefined, timeZone: string): StayIndexCache {
-  if (!value) return emptyStayIndexCache(timeZone);
-  try {
-    const parsed = JSON.parse(value) as Partial<StayIndexCache>;
-    if (parsed.version !== STAY_INDEX_VERSION || parsed.timeZone !== timeZone || typeof parsed.days !== "object" || parsed.days === null) {
-      return emptyStayIndexCache(timeZone);
-    }
-    return { version: STAY_INDEX_VERSION, timeZone, days: parsed.days };
-  } catch {
-    return emptyStayIndexCache(timeZone);
-  }
+  return { version: STAY_INDEX_VERSION, timeZone, complete: false, days: {} };
 }
 
 /**
- * Identifies one day's records. Edits change `updatedAt` and deletions change
- * the set of IDs, so either invalidates the day.
+ * Parse a stored cache. A corrupt cache, or one from another algorithm or
+ * time zone (days are local calendar days), cannot be reused: `rebuild` says
+ * that every recorded day has to be detected again.
  */
-export function dayFingerprint(events: LifeEvent[]): string {
-  const keys = events.map((event) => `${event.id}@${event.updatedAt}`).sort();
-  // 32-bit FNV-1a; collisions only cost a stale day until its next edit.
-  let hash = 0x811c9dc5;
-  for (const key of keys) {
-    for (let index = 0; index < key.length; index += 1) {
-      hash ^= key.charCodeAt(index);
-      hash = Math.imul(hash, 0x01000193);
+export function parseStayIndexCache(value: string | undefined, timeZone: string): { cache: StayIndexCache; rebuild: boolean } {
+  if (value) {
+    try {
+      const parsed = JSON.parse(value) as Partial<StayIndexCache>;
+      if (parsed.version === STAY_INDEX_VERSION && parsed.timeZone === timeZone && typeof parsed.days === "object" && parsed.days !== null) {
+        const complete = parsed.complete === true;
+        return { cache: { version: STAY_INDEX_VERSION, timeZone, complete, days: parsed.days }, rebuild: !complete };
+      }
+    } catch {
+      // Rebuilt below.
     }
-    hash ^= 0x0a;
-    hash = Math.imul(hash, 0x01000193);
   }
-  return `${events.length}:${(hash >>> 0).toString(16)}`;
-}
-
-function groupEventsByDay(events: LifeEvent[]): Map<string, LifeEvent[]> {
-  const days = new Map<string, LifeEvent[]>();
-  events.forEach((event) => {
-    const day = dateKey(event.startedAt);
-    const dayEvents = days.get(day);
-    if (dayEvents) dayEvents.push(event);
-    else days.set(day, [event]);
-  });
-  return days;
+  return { cache: emptyStayIndexCache(timeZone), rebuild: true };
 }
 
 function summarize(stays: StayCluster[]): StaySummary[] {
   return stays.map(({ id, latitude, longitude, startedAt, endedAt, durationMs }) => ({ id, latitude, longitude, startedAt, endedAt, durationMs }));
 }
 
-export type StayIndexUpdate = {
-  /** Past days only; today is still being recorded and is never cached. */
-  cache: StayIndexCache;
-  /** Every stay including today's, oldest first. */
-  stays: StaySummary[];
-  changed: boolean;
-};
+/** The stays of one day's records. */
+export function detectDayStays(dayEvents: LifeEvent[]): StaySummary[] {
+  return summarize(buildStayClusters(dayEvents));
+}
 
 const YIELD_AFTER_MS = 12;
 
 /**
- * Recompute the days whose records changed since [cache] was written. Work is
- * split into short slices so the map stays responsive; days finished before
- * an abort are kept in [cache], which is updated in place.
+ * Detects the stays of [days] again, reading each day's records through
+ * [loadDay]. Days from today on are skipped: today is still being recorded
+ * and is never cached. Work is split into short slices so the map stays
+ * responsive. Returns the days that were processed and whether the cache,
+ * which is updated in place, changed. When aborted, the days finished before
+ * that are kept and reported.
  */
-export async function updateStayIndex(
-  events: LifeEvent[],
+export async function refreshStayIndex(
   cache: StayIndexCache,
+  days: string[],
+  loadDay: (day: string) => Promise<LifeEvent[]>,
   options: { today: string; signal?: AbortSignal; onProgress?: (done: number, total: number) => void },
-): Promise<StayIndexUpdate | undefined> {
-  const days = groupEventsByDay(events);
+): Promise<{ processed: string[]; changed: boolean; aborted: boolean }> {
+  const stale = [...new Set(days)].filter((day) => day < options.today).sort();
+  const processed: string[] = [];
   let changed = false;
+  // Days recorded as "today" earlier and never finished are not cached.
   for (const day of Object.keys(cache.days)) {
-    if (!days.has(day) || day >= options.today) {
+    if (day >= options.today) {
       delete cache.days[day];
       changed = true;
     }
   }
-  const stale = [...days.entries()]
-    .filter(([day]) => day < options.today)
-    .map(([day, dayEvents]) => ({ day, dayEvents, fingerprint: dayFingerprint(dayEvents) }))
-    .filter(({ day, fingerprint }) => cache.days[day]?.fingerprint !== fingerprint);
-
   let sliceStartedAt = performance.now();
-  for (const [index, { day, dayEvents, fingerprint }] of stale.entries()) {
-    if (options.signal?.aborted) return undefined;
-    cache.days[day] = { fingerprint, stays: summarize(buildStayClusters(dayEvents)) };
+  for (const [index, day] of stale.entries()) {
+    if (options.signal?.aborted) return { processed, changed, aborted: true };
+    const stays = detectDayStays(await loadDay(day));
+    if (stays.length) cache.days[day] = stays;
+    else delete cache.days[day];
+    processed.push(day);
     changed = true;
     if (performance.now() - sliceStartedAt >= YIELD_AFTER_MS) {
       options.onProgress?.(index + 1, stale.length);
@@ -114,14 +94,13 @@ export async function updateStayIndex(
       sliceStartedAt = performance.now();
     }
   }
-  if (options.signal?.aborted) return undefined;
+  return { processed, changed, aborted: options.signal?.aborted === true };
+}
 
-  const todayStays = [...days.entries()]
-    .filter(([day]) => day >= options.today)
-    .flatMap(([, dayEvents]) => summarize(buildStayClusters(dayEvents)));
-  const stays = [...Object.values(cache.days).flatMap((entry) => entry.stays), ...todayStays]
+/** Every cached stay followed by today's, oldest first. */
+export function allStays(cache: StayIndexCache, todayStays: StaySummary[]): StaySummary[] {
+  return [...Object.values(cache.days).flat(), ...todayStays]
     .sort((first, second) => first.startedAt.localeCompare(second.startedAt));
-  return { cache, stays, changed };
 }
 
 /** A place built from every stay within [STAY_PLACE_RADIUS_METERS] across all days. */

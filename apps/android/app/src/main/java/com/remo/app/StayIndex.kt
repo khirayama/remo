@@ -19,76 +19,68 @@ data class StaySummary(
 
 internal fun StayCluster.summary() = StaySummary(id, coordinate.latitude, coordinate.longitude, startedAt, endedAt, durationMs)
 
-// Bump whenever stay detection changes so every cached day is recomputed.
-const val STAY_INDEX_VERSION = 1
-
-data class StayIndexDay(val fingerprint: String, val stays: List<StaySummary>)
+// Bump whenever stay detection or the cache layout changes so every cached
+// day is recomputed.
+const val STAY_INDEX_VERSION = 2
 
 /**
  * Derived, device-local cache of each past day's stays. It is never synced or
- * exported and can be dropped at any time: every day is recomputed from the
- * records when its fingerprint no longer matches.
+ * exported and can be dropped at any time: the store records which days had a
+ * record written or removed, and those days are detected again. [complete] is
+ * false while the first pass over every recorded day is still running.
  */
-class StayIndexCache(val version: Int = STAY_INDEX_VERSION, val timeZone: String, val days: MutableMap<String, StayIndexDay> = mutableMapOf())
+class StayIndexCache(
+    val version: Int = STAY_INDEX_VERSION,
+    val timeZone: String,
+    var complete: Boolean = false,
+    val days: MutableMap<String, List<StaySummary>> = mutableMapOf(),
+)
 
 /** A stored cache is only usable with the same algorithm and time zone (day boundaries). */
 fun StayIndexCache?.usableFor(timeZone: String): StayIndexCache =
     this?.takeIf { it.version == STAY_INDEX_VERSION && it.timeZone == timeZone } ?: StayIndexCache(timeZone = timeZone)
 
-/**
- * Identifies one day's records. Edits change `updatedAt` and deletions change
- * the set of IDs, so either invalidates the day.
- */
-fun dayFingerprint(entries: List<LogEntry>): String {
-    // 32-bit FNV-1a; collisions only cost a stale day until its next edit.
-    var hash = 0x811c9dc5.toInt()
-    entries.map { "${it.id}@${it.updatedAt}" }.sorted().forEach { key ->
-        key.forEach { character ->
-            hash = hash xor character.code
-            hash *= 0x01000193
-        }
-        hash = hash xor 0x0a
-        hash *= 0x01000193
-    }
-    return "${entries.size}:${Integer.toHexString(hash)}"
-}
+/** The stays of one day's records. */
+fun detectDayStays(entries: List<LogEntry>): List<StaySummary> = buildStayClusters(entries).map { it.summary() }
 
-data class StayIndexUpdate(
-    /** Every stay including today's, oldest first. */
-    val stays: List<StaySummary>,
-    val changed: Boolean,
-)
+data class StayIndexRefresh(val processed: List<String>, val changed: Boolean)
 
 /**
- * Recompute the days whose records changed since [cache] was written. Past
- * days are stored in [cache] as they finish, so a cancelled update keeps its
- * work; today is still being recorded and is never cached.
+ * Detects the stays of [days] again, reading each day's records through
+ * [loadDay]. Days from [today] on are skipped: today is still being recorded
+ * and is never cached. Past days are stored in [cache] as they finish, and
+ * [onDay] is told, so a cancelled update keeps its work.
  */
-suspend fun updateStayIndex(
-    logs: List<LogEntry>,
+suspend fun refreshStayIndex(
     cache: StayIndexCache,
+    days: Collection<String>,
     today: String,
+    loadDay: suspend (String) -> List<LogEntry>,
+    onDay: suspend (day: String) -> Unit = {},
     onProgress: suspend (done: Int, total: Int) -> Unit = { _, _ -> },
-): StayIndexUpdate {
-    val days = logs.groupBy { dayKey(it.startedAt) }
+): StayIndexRefresh {
     var changed = false
-    cache.days.keys.filter { it !in days || it >= today }.forEach {
+    cache.days.keys.filter { it >= today }.forEach {
         cache.days.remove(it)
         changed = true
     }
-    val stale = days.filterKeys { it < today }
-        .map { (day, entries) -> Triple(day, entries, dayFingerprint(entries)) }
-        .filter { (day, _, fingerprint) -> cache.days[day]?.fingerprint != fingerprint }
-    stale.forEachIndexed { index, (day, entries, fingerprint) ->
+    val stale = days.filter { it < today }.distinct().sorted()
+    val processed = mutableListOf<String>()
+    stale.forEachIndexed { index, day ->
         currentCoroutineContext().ensureActive()
-        cache.days[day] = StayIndexDay(fingerprint, buildStayClusters(entries).map { it.summary() })
+        val stays = detectDayStays(loadDay(day))
+        if (stays.isEmpty()) cache.days.remove(day) else cache.days[day] = stays
+        processed += day
         changed = true
+        onDay(day)
         if (index % 10 == 9) onProgress(index + 1, stale.size)
     }
-    val todayStays = days.filterKeys { it >= today }.values.flatMap { entries -> buildStayClusters(entries).map { it.summary() } }
-    val stays = (cache.days.values.flatMap(StayIndexDay::stays) + todayStays).sortedBy(StaySummary::startedAt)
-    return StayIndexUpdate(stays, changed)
+    return StayIndexRefresh(processed, changed)
 }
+
+/** Every cached stay followed by today's, oldest first. */
+fun allStays(cache: StayIndexCache, openStays: List<StaySummary>): List<StaySummary> =
+    (cache.days.values.flatten() + openStays).sortedBy(StaySummary::startedAt)
 
 /** A place built from every stay within [STAY_PLACE_RADIUS_METERS] across all days. */
 data class AllTimeStayPlace(

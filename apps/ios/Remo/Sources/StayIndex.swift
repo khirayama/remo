@@ -19,21 +19,20 @@ extension StayCluster {
     }
 }
 
-// Bump whenever stay detection changes so every cached day is recomputed.
-let stayIndexVersion = 1
-
-struct StayIndexDay: Codable, Equatable {
-    let fingerprint: String
-    let stays: [StaySummary]
-}
+// Bump whenever stay detection or the cache layout changes so every cached
+// day is recomputed.
+let stayIndexVersion = 2
 
 /// Derived, device-local cache of each past day's stays. It is never synced or
-/// exported and can be dropped at any time: every day is recomputed from the
-/// records when its fingerprint no longer matches.
+/// exported and can be dropped at any time: the database records which days
+/// had a record written or removed, and those days are detected again.
+/// `complete` is false while the first pass over every recorded day is still
+/// running.
 struct StayIndexCache: Codable, Equatable {
     var version = stayIndexVersion
     var timeZone: String
-    var days: [String: StayIndexDay] = [:]
+    var complete = false
+    var days: [String: [StaySummary]] = [:]
 }
 
 extension StayIndexCache? {
@@ -50,56 +49,52 @@ func stayDayKey(_ date: Date, calendar: Calendar = .current) -> String {
     return String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
 }
 
-/// Identifies one day's records. Edits change `updatedAt` and deletions change
-/// the set of IDs, so either invalidates the day.
-func dayFingerprint(_ entries: [LogEntry]) -> String {
-    // 32-bit FNV-1a; collisions only cost a stale day until its next edit.
-    var hash: UInt32 = 0x811C9DC5
-    for key in entries.map({ "\($0.id)@\($0.updatedAt.timeIntervalSince1970)" }).sorted() {
-        for byte in key.utf8 {
-            hash ^= UInt32(byte)
-            hash &*= 0x0100_0193
-        }
-        hash ^= 0x0A
-        hash &*= 0x0100_0193
-    }
-    return "\(entries.count):\(String(hash, radix: 16))"
+/// The start of the day a `stayDayKey` names.
+func stayDay(_ key: String, calendar: Calendar = .current) -> Date? {
+    let parts = key.split(separator: "-").compactMap { Int($0) }
+    guard parts.count == 3 else { return nil }
+    return calendar.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))
 }
 
-struct StayIndexUpdate {
-    /// Every stay including today's, oldest first.
-    let stays: [StaySummary]
-    let changed: Bool
+/// The stays of one day's records.
+func detectDayStays(_ entries: [LogEntry]) -> [StaySummary] {
+    buildStayClusters(entries).map(\.summary)
 }
 
-/// Recompute the days whose records changed since `cache` was written. Past
-/// days are stored in `cache` as they finish, so a cancelled update keeps its
-/// work; today is still being recorded and is never cached.
-func updateStayIndex(
-    _ logs: [LogEntry],
+/// Detects the stays of `days` again, reading each day's records through
+/// `loadDay`. Days from `today` on are skipped: today is still being recorded
+/// and is never cached. Past days are stored in `cache` as they finish and
+/// `onDay` is told, so a cancelled update keeps its work. Returns whether the
+/// cache changed.
+@discardableResult
+func refreshStayIndex(
     cache: inout StayIndexCache,
+    days: [String],
     today: String,
-    calendar: Calendar = .current,
+    loadDay: (String) -> [LogEntry],
+    onDay: (String) -> Void = { _ in },
     onProgress: (Int, Int) -> Void = { _, _ in },
-) throws -> StayIndexUpdate {
-    let days = Dictionary(grouping: logs) { stayDayKey($0.startedAt, calendar: calendar) }
+) throws -> Bool {
     var changed = false
-    for day in cache.days.keys where days[day] == nil || day >= today {
+    for day in cache.days.keys where day >= today {
         cache.days[day] = nil
         changed = true
     }
-    let stale = days.filter { $0.key < today }
-        .map { (day: $0.key, entries: $0.value, fingerprint: dayFingerprint($0.value)) }
-        .filter { cache.days[$0.day]?.fingerprint != $0.fingerprint }
-    for (index, item) in stale.enumerated() {
+    let stale = Array(Set(days.filter { $0 < today })).sorted()
+    for (index, day) in stale.enumerated() {
         try Task.checkCancellation()
-        cache.days[item.day] = StayIndexDay(fingerprint: item.fingerprint, stays: buildStayClusters(item.entries).map(\.summary))
+        let stays = detectDayStays(loadDay(day))
+        cache.days[day] = stays.isEmpty ? nil : stays
         changed = true
+        onDay(day)
         if index % 10 == 9 { onProgress(index + 1, stale.count) }
     }
-    let todayStays = days.filter { $0.key >= today }.values.flatMap { buildStayClusters($0).map(\.summary) }
-    let stays = (cache.days.values.flatMap(\.stays) + todayStays).sorted { $0.startedAt < $1.startedAt }
-    return StayIndexUpdate(stays: stays, changed: changed)
+    return changed
+}
+
+/// Every cached stay followed by today's, oldest first.
+func allStays(_ cache: StayIndexCache, open: [StaySummary]) -> [StaySummary] {
+    (cache.days.values.flatMap { $0 } + open).sorted { $0.startedAt < $1.startedAt }
 }
 
 /// A place built from every stay within `stayPlaceRadiusMeters` across all days.
@@ -269,20 +264,43 @@ enum StayIndexStorage {
 private actor StayIndexWorker {
     private var cache: StayIndexCache?
 
-    func update(_ logs: [LogEntry], onProgress: @escaping @Sendable (Int, Int) -> Void) throws -> [StaySummary] {
+    func update(database: LogDatabase, onProgress: @escaping @Sendable (Int, Int) -> Void) throws -> [StaySummary] {
         let timeZone = TimeZone.current.identifier
         var working = cache?.timeZone == timeZone ? cache! : StayIndexStorage.load(timeZone: timeZone)
-        defer { cache = working }
-        let result = try updateStayIndex(logs, cache: &working, today: stayDayKey(Date()), onProgress: onProgress)
-        if result.changed { StayIndexStorage.save(working) }
-        return result.stays
+        var unsaved = false
+        defer {
+            cache = working
+            // Keep the days that were finished, also when the update was superseded.
+            if unsaved { StayIndexStorage.save(working) }
+        }
+        let today = stayDayKey(Date())
+        let dirty = database.dirtyDays()
+        let tokens = Dictionary(dirty.map { ($0.day, $0) }, uniquingKeysWith: { first, _ in first })
+        // The first pass covers every recorded day; an interrupted pass
+        // continues with the days it has not reached.
+        let days = working.complete
+            ? dirty.map(\.day)
+            : database.recordedDays().map { stayDayKey($0) }.filter { working.days[$0] == nil } + dirty.map(\.day)
+        let load: (String) -> [LogEntry] = { day in stayDay(day).map { database.entries(onDayOf: $0) } ?? [] }
+        if try refreshStayIndex(cache: &working, days: days, today: today, loadDay: load, onDay: { day in
+            if let token = tokens[day] { database.clearDirtyDays([token]) }
+            unsaved = true
+        }, onProgress: onProgress) { unsaved = true }
+        if !working.complete {
+            working.complete = true
+            unsaved = true
+        }
+        // Today (and any record dated later) is detected on every update.
+        let openDays = Set([today] + dirty.map(\.day).filter { $0 > today })
+        return allStays(working, open: openDays.flatMap { detectDayStays(load($0)) })
     }
 
     func reset() { cache = nil }
 }
 
-/// Every stay across all days. Past days come from the device-local cache and
-/// only days whose records changed are detected again; today is always fresh.
+/// Every stay across all days. Past days come from the device-local cache; the
+/// database records which days had a record written or removed, and only those
+/// are detected again. Today is always fresh.
 @MainActor
 final class StayIndexStore: ObservableObject {
     @Published private(set) var stays: [StaySummary]?
@@ -293,13 +311,13 @@ final class StayIndexStore: ObservableObject {
     private var task: Task<Void, Never>?
 
     /// Continuous capture changes today's records every few seconds; batch those updates.
-    func schedule(_ logs: [LogEntry]) {
+    func schedule(database: LogDatabase = .shared) {
         task?.cancel()
         let debounce = stays != nil
         task = Task { [weak self, worker] in
             if debounce { try? await Task.sleep(for: .seconds(1)) }
             guard !Task.isCancelled else { return }
-            let stays = try? await worker.update(logs) { done, total in
+            let stays = try? await worker.update(database: database) { done, total in
                 Task { @MainActor [weak self] in self?.progress = (done, total) }
             }
             guard let stays, !Task.isCancelled else { return }
