@@ -4,7 +4,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -43,12 +42,13 @@ data class SyncPageCursor(val snapshotAt: Long, val updatedAt: Long, val id: Str
     }
 }
 
-data class EventSnapshot(
+/** One response of the download: the records and deletions to apply and where to continue. */
+data class EventPage(
     val events: List<LogEntry>,
-    val deletedIds: Set<String>,
-    val nextCursor: SyncCursor? = null,
-    val full: Boolean = true,
-    val uploaded: List<LogEntry> = emptyList(),
+    val deletions: List<RemoteDeletion>,
+    val cursor: SyncCursor?,
+    val nextPage: String?,
+    val nextCursorToken: String?,
 )
 
 object ApiClient {
@@ -83,110 +83,54 @@ object ApiClient {
         }
     }
 
-    private fun compareCursors(first: SyncCursor, second: SyncCursor): Int = when {
+    /** The server takes up to 500 records per request. */
+    const val BATCH_SIZE = 400
+
+    fun compareCursors(first: SyncCursor, second: SyncCursor): Int = when {
         first.updatedAt != second.updatedAt -> first.updatedAt.compareTo(second.updatedAt)
         first.id < second.id -> -1
         first.id > second.id -> 1
         else -> 0
     }
 
-    private fun fetchEventHead(token: String?): SyncCursor? {
+    suspend fun fetchEventHead(token: String?): SyncCursor? = withContext(Dispatchers.IO) {
         val response = request("GET", "/api/v1/events/head", token = token)
         requireSuccess(response)
-        val data = JSONObject(response.body).optJSONObject("data") ?: return null
+        val data = JSONObject(response.body).optJSONObject("data") ?: return@withContext null
         val cursor = if (data.isNull("cursor")) null else data.optString("cursor").takeIf(String::isNotBlank)
-        return SyncCursor.parse(cursor)
+        SyncCursor.parse(cursor)
     }
 
-    suspend fun fetchEvents(token: String? = SecureTokenStore.get(), checkpoint: SyncCursor? = null): EventSnapshot = withContext(Dispatchers.IO) {
-        val accountId = SecureTokenStore.accountId()
-        val staging = if (checkpoint == null && accountId != null) loadFullSyncStaging(accountId) else null
-        if (staging?.complete == true) {
-            return@withContext EventSnapshot(
-                events = staging.events,
-                deletedIds = staging.deletedIds,
-                nextCursor = SyncCursor.parse(staging.cursor),
-                full = true,
-            )
-        }
-        if (checkpoint != null) {
-            val head = fetchEventHead(token)
-            if (head == null || compareCursors(head, checkpoint) <= 0) {
-                return@withContext EventSnapshot(events = emptyList(), deletedIds = emptySet(), nextCursor = checkpoint, full = false)
+    /**
+     * One page of the download: everything (paged with [page]) when there is
+     * no [cursor], otherwise the changes after it.
+     */
+    suspend fun fetchEventPage(token: String?, cursor: SyncCursor?, page: String?): EventPage = withContext(Dispatchers.IO) {
+        val path = buildString {
+            append("/api/v1/events?v=2")
+            when {
+                page != null -> append("&page=").append(URLEncoder.encode(page, Charsets.UTF_8.name()))
+                cursor != null -> append("&cursor=").append(URLEncoder.encode(cursor.token(), Charsets.UTF_8.name()))
             }
         }
-        var page: String? = staging?.nextPage
-        var cursor = if (page == null) checkpoint else null
-        val events = staging?.events?.toMutableList() ?: mutableListOf()
-        val deletedIds = staging?.deletedIds?.toMutableSet() ?: mutableSetOf()
-        var full = checkpoint == null || staging != null
-        var firstPage = true
-        var hasNext = true
-
-        while (hasNext) {
-            val path = buildString {
-                append("/api/v1/events?")
-                when {
-                    page != null -> append("v=2&page=").append(URLEncoder.encode(page, Charsets.UTF_8.name()))
-                    cursor != null -> append("v=2&cursor=").append(URLEncoder.encode(cursor.token(), Charsets.UTF_8.name()))
-                    else -> append("v=2")
-                }
-            }
-            val response = request("GET", path, token = token)
-            requireSuccess(response)
-            val payload = JSONObject(response.body)
-            val values = payload.getJSONArray("data")
-            for (index in 0 until values.length()) events += decodeEvent(values.getJSONObject(index))
-            val meta = payload.optJSONObject("meta")
-            val deleted = meta?.optJSONArray("deletedIds")
-            if (deleted != null) for (index in 0 until deleted.length()) deletedIds += deleted.getString(index)
-            if (firstPage) {
-                full = meta?.optBoolean("full", checkpoint == null) ?: (checkpoint == null)
-                firstPage = false
-            }
-            val returnedCursor = SyncCursor.parse(meta?.let { if (it.isNull("cursor")) null else it.optString("cursor") })
-            if (returnedCursor != null) cursor = returnedCursor
-            val nextPage = meta?.let { if (it.isNull("nextPage")) null else it.optString("nextPage").takeIf(String::isNotBlank) }
-            val nextCursorToken = meta?.let { if (it.isNull("nextCursorToken")) null else it.optString("nextCursorToken").takeIf(String::isNotBlank) }
-            if (nextPage != null) {
-                page = nextPage
-                cursor = null
-                if (full && accountId != null && SyncPageCursor.parse(nextPage) != null) {
-                    saveFullSyncStaging(
-                        accountId,
-                        FullSyncStaging(
-                            nextPage = nextPage,
-                            complete = false,
-                            cursor = returnedCursor?.token(),
-                            events = events,
-                            deletedIds = deletedIds,
-                        ),
-                    )
-                }
-                hasNext = true
-            } else if (nextCursorToken != null) {
-                page = null
-                cursor = SyncCursor.parse(nextCursorToken)
-                hasNext = cursor != null
-            } else {
-                hasNext = false
-            }
-        }
-
-        if (full && accountId != null) {
-            saveFullSyncStaging(
-                accountId,
-                FullSyncStaging(
-                    nextPage = null,
-                    complete = true,
-                    cursor = cursor?.token(),
-                    events = events,
-                    deletedIds = deletedIds,
-                ),
-            )
-        }
-
-        EventSnapshot(events = events, deletedIds = deletedIds, nextCursor = cursor, full = full)
+        val response = request("GET", path, token = token)
+        requireSuccess(response)
+        val payload = JSONObject(response.body)
+        val values = payload.getJSONArray("data")
+        val meta = payload.optJSONObject("meta")
+        val deleted = meta?.optJSONArray("deletions")
+        fun text(name: String) = meta?.let { if (it.isNull(name)) null else it.optString(name).takeIf(String::isNotBlank) }
+        EventPage(
+            events = List(values.length()) { decodeEvent(values.getJSONObject(it)) },
+            // Only records deleted one by one are listed; "delete everything"
+            // on another device never removes this device's records.
+            deletions = List(deleted?.length() ?: 0) { index ->
+                deleted!!.getJSONObject(index).let { RemoteDeletion(it.getString("id"), it.optLong("deletedAt")) }
+            },
+            cursor = SyncCursor.parse(text("cursor")),
+            nextPage = text("nextPage"),
+            nextCursorToken = text("nextCursorToken"),
+        )
     }
 
     private fun eventPayload(entry: LogEntry): JSONObject = JSONObject()
@@ -204,25 +148,53 @@ object ApiClient {
             .put("source", entry.source.wireValue)
             .put("updatedAt", entry.updatedAt)
 
+    // A 2xx response means every item was handled: applied, or rejected by the
+    // server as invalid. Either way it is done, so one malformed record cannot
+    // block the rest of the queue forever.
     suspend fun pushEvents(entries: List<LogEntry>, token: String? = SecureTokenStore.get()) = withContext(Dispatchers.IO) {
-        require(entries.isNotEmpty())
+        require(entries.isNotEmpty() && entries.size <= BATCH_SIZE)
         postBatch(JSONObject().put("events", JSONArray().apply { entries.forEach { put(eventPayload(it)) } }), token)
     }
 
     /**
-     * Sends deletions in batches. `deletedAt` is this device's clock, the same clock as
-     * `updatedAt`, so the server resolves a deletion against edits from other devices.
+     * `deletedAt` is this device's clock, the same clock as `updatedAt`, so the
+     * server resolves a deletion against edits from other devices. The start
+     * time and kind tell the server where the record is stored.
      */
-    suspend fun deleteEvents(ids: List<String>, token: String? = SecureTokenStore.get()) = withContext(Dispatchers.IO) {
-        val deletedAt = System.currentTimeMillis()
-        ids.chunked(40).forEach { batch ->
-            val deletions = JSONArray().apply { batch.forEach { put(JSONObject().put("id", it).put("deletedAt", deletedAt)) } }
-            postBatch(JSONObject().put("deletions", deletions), token)
-        }
+    suspend fun pushDeletions(deletions: List<PendingDeletion>, token: String? = SecureTokenStore.get()) = withContext(Dispatchers.IO) {
+        require(deletions.isNotEmpty() && deletions.size <= BATCH_SIZE)
+        postBatch(JSONObject().put("deletions", JSONArray().apply {
+            deletions.forEach {
+                put(JSONObject().put("id", it.id).put("deletedAt", it.deletedAt)
+                    .put("startedAt", it.startedAt ?: JSONObject.NULL)
+                    .put("source", it.source?.wireValue ?: JSONObject.NULL))
+            }
+        }), token)
     }
 
     private fun postBatch(body: JSONObject, token: String?) {
         requireSuccess(request("POST", "/api/v1/events/batch", body.toString(), token))
+    }
+
+    suspend fun fetchPlaces(token: String?): List<NamedPlace> = withContext(Dispatchers.IO) {
+        val response = request("GET", "/api/v1/places", token = token)
+        requireSuccess(response)
+        val values = JSONObject(response.body).optJSONArray("data") ?: JSONArray()
+        List(values.length()) { index ->
+            values.getJSONObject(index).let {
+                NamedPlace(it.getString("id"), it.optString("name"), it.optDouble("latitude", 0.0), it.optDouble("longitude", 0.0), it.optLong("updatedAt"), it.optBoolean("deleted"))
+            }
+        }
+    }
+
+    suspend fun pushPlaces(places: List<NamedPlace>, token: String?) = withContext(Dispatchers.IO) {
+        val body = JSONObject().put("places", JSONArray().apply {
+            places.forEach {
+                put(JSONObject().put("id", it.id).put("name", it.name).put("latitude", it.latitude).put("longitude", it.longitude)
+                    .put("updatedAt", it.updatedAt).put("deleted", it.deleted))
+            }
+        })
+        requireSuccess(request("PUT", "/api/v1/places", body.toString(), token))
     }
 
     suspend fun deleteAllData() = withContext(Dispatchers.IO) {
@@ -241,121 +213,6 @@ object ApiClient {
                 else -> "アカウントを削除できませんでした [HTTP ${response.statusCode}]"
             }
             throw ApiException(response.statusCode, message, code)
-        }
-    }
-
-    /** Drops a partially downloaded full sync that belongs to [accountId]. */
-    fun discardFullSyncStaging(accountId: String) = clearFullSyncStaging(accountId)
-
-    suspend fun synchronizeEvents(
-        local: List<LogEntry>,
-        pendingUpserts: List<LogEntry> = emptyList(),
-        token: String? = SecureTokenStore.get(),
-        checkpoint: SyncCursor? = null,
-        pull: Boolean = true,
-    ): EventSnapshot {
-        if (!pull) {
-            pendingUpserts.chunked(40).forEach { batch -> pushEvents(batch, token) }
-            return EventSnapshot(
-                events = local.sortedByDescending(LogEntry::startedAt),
-                deletedIds = emptySet(),
-                nextCursor = checkpoint,
-                full = false,
-                uploaded = pendingUpserts,
-            )
-        }
-        val snapshot = fetchEvents(token, checkpoint)
-        val localIds = local.mapTo(mutableSetOf(), LogEntry::id)
-        val cloudById = snapshot.events.associateBy(LogEntry::id)
-        val changed = mutableListOf<LogEntry>()
-        val candidates = if (snapshot.full) local else pendingUpserts
-
-        for (localEvent in candidates) {
-            val cloudEvent = cloudById[localEvent.id]
-            val shouldPush = cloudEvent == null || (localEvent.updatedAt >= cloudEvent.updatedAt && cloudEvent != localEvent)
-            if (shouldPush) changed += localEvent
-        }
-
-        changed.chunked(40).forEach { batch -> pushEvents(batch, token) }
-
-        // Writes are already represented by local. A second download would
-        // repeat the same delta and add rows read without improving this merge.
-        val merged = if (snapshot.full) {
-            snapshot.events.associateBy(LogEntry::id).toMutableMap()
-        } else {
-            local.associateBy(LogEntry::id).toMutableMap()
-        }
-        snapshot.events.forEach { remote ->
-            val localEvent = merged[remote.id]
-            if (localEvent == null || remote.updatedAt > localEvent.updatedAt) merged[remote.id] = remote
-        }
-        local.forEach { localEvent -> merged[localEvent.id] = localEvent }
-        if (snapshot.full) SecureTokenStore.accountId()?.let(::clearFullSyncStaging)
-        return EventSnapshot(
-            events = merged.values.sortedByDescending(LogEntry::startedAt),
-            deletedIds = snapshot.deletedIds.filterNot(localIds::contains).toSet(),
-            nextCursor = snapshot.nextCursor,
-            full = snapshot.full,
-            uploaded = changed,
-        )
-    }
-
-    private data class FullSyncStaging(
-        val nextPage: String?,
-        val complete: Boolean,
-        val cursor: String?,
-        val events: List<LogEntry>,
-        val deletedIds: Set<String>,
-    )
-
-    private fun stagingFile(): File = File(RemoApplication.context.filesDir, "remo-full-sync-staging.json")
-
-    private fun loadFullSyncStaging(accountId: String): FullSyncStaging? = runCatching {
-        val file = stagingFile()
-        if (!file.exists()) return@runCatching null
-        val payload = JSONObject(file.readText())
-        if (payload.optString("accountId") != accountId) return@runCatching null
-        val values = payload.optJSONArray("events") ?: JSONArray()
-        val events = buildList {
-            for (index in 0 until values.length()) {
-                add(decodeEvent(values.getJSONObject(index)))
-            }
-        }
-        val deleted = payload.optJSONArray("deletedIds")?.let { array ->
-            buildSet { for (index in 0 until array.length()) add(array.getString(index)) }
-        } ?: emptySet()
-        FullSyncStaging(
-            nextPage = payload.optString("nextPage").takeIf(String::isNotBlank),
-            complete = payload.optBoolean("complete", false),
-            cursor = payload.optString("cursor").takeIf(String::isNotBlank),
-            events = events,
-            deletedIds = deleted,
-        )
-    }.getOrNull()
-
-    private fun saveFullSyncStaging(accountId: String, staging: FullSyncStaging) {
-        runCatching {
-            val payload = JSONObject()
-                .put("accountId", accountId)
-                .put("nextPage", staging.nextPage ?: JSONObject.NULL)
-                .put("complete", staging.complete)
-                .put("cursor", staging.cursor ?: JSONObject.NULL)
-                .put("events", JSONArray().apply { staging.events.forEach { put(eventPayload(it)) } })
-                .put("deletedIds", JSONArray().apply { staging.deletedIds.forEach(::put) })
-            val file = stagingFile()
-            val temporary = File(file.parentFile, "${file.name}.tmp")
-            temporary.writeText(payload.toString())
-            if (file.exists()) file.delete()
-            temporary.renameTo(file)
-        }
-    }
-
-    private fun clearFullSyncStaging(accountId: String) {
-        runCatching {
-            val file = stagingFile()
-            if (!file.exists()) return@runCatching
-            val payload = JSONObject(file.readText())
-            if (payload.optString("accountId") == accountId) file.delete()
         }
     }
 

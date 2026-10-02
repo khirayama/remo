@@ -60,6 +60,18 @@ describe("timeline record validation", () => {
     expect(normalizeEvent({ id: "1", startedAt: 10, accuracyMeters: -1 }).error).toContain("accuracyMeters");
   });
 
+  it("rejects start times outside the plausible range", () => {
+    const now = Date.UTC(2026, 8, 30);
+    expect(normalizeEvent({ id: "1", startedAt: now + 2 * 24 * 60 * 60 * 1000 }, now).error).toContain("startedAt");
+    expect(normalizeEvent({ id: "1", startedAt: Date.UTC(1899, 0, 1) }, now).error).toContain("startedAt");
+    expect(normalizeEvent({ id: "1", startedAt: Date.UTC(1950, 0, 1) }, now).data).toBeDefined();
+  });
+
+  it("caps an update timestamp far ahead of the server clock", () => {
+    const now = Date.UTC(2026, 8, 30);
+    expect(normalizeEvent({ id: "1", startedAt: 10, updatedAt: now + 60 * 60 * 1000 }, now).data?.updatedAt).toBe(now + 5 * 60 * 1000);
+  });
+
   it("ignores the zero coordinate", () => {
     expect(normalizeEvent({ id: "zero", startedAt: 10, latitude: 0, longitude: 0 }).data).toMatchObject({ latitude: null, longitude: null });
   });

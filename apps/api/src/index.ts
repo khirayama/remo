@@ -7,6 +7,7 @@ import { requireUser, type AppContext } from "./lib/auth";
 import { lifeEventRoutes } from "./lib/life-events";
 import { runMaintenance } from "./lib/maintenance";
 import { photoRoutes } from "./lib/photos";
+import { placeRoutes } from "./lib/places";
 
 export const app = new Hono<{ Bindings: Env }>();
 
@@ -52,6 +53,30 @@ const limitCredentialRequests: MiddlewareHandler<{ Bindings: Env }> = async (c, 
   await next();
 };
 
+// Cookie-authenticated writes must come from an allowed web origin as JSON.
+// Browsers attach cookies to cross-site "simple" requests (a form post or a
+// text/plain fetch) without a CORS preflight, so without this check another
+// site could write or delete timeline records with a signed-in user's cookie.
+// Native clients authenticate with a bearer token, which a browser never
+// attaches on its own, so they are not restricted by origin.
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const JSON_BODY_PATHS = new Set(["/api/v1/events/batch", "/api/v1/account/delete", "/api/v1/places"]);
+export const guardCookieWrites: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
+  if (SAFE_METHODS.has(c.req.method)) return next();
+  if (JSON_BODY_PATHS.has(c.req.path) && c.req.header("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
+    return c.json({ error: { code: "unsupported_media_type", message: "Content-Type must be application/json" } }, 415);
+  }
+  const bearer = c.req.header("authorization")?.toLowerCase().startsWith("bearer ");
+  if (!bearer) {
+    const origin = c.req.header("origin");
+    if (!origin || !allowedOrigins(c.env.CORS_ALLOWED_ORIGINS).has(origin)) {
+      return c.json({ error: { code: "forbidden_origin", message: "Request origin is not allowed" } }, 403);
+    }
+  }
+  return next();
+};
+
+app.use("/api/v1/*", guardCookieWrites);
 app.post("/api/auth/*", limitCredentialRequests);
 app.post("/api/v1/account/delete", limitCredentialRequests);
 
@@ -69,24 +94,57 @@ app.on(["GET", "POST"], "/api/auth/*", async (c) => {
 // after the account (and its session) has been deleted.
 app.route("/api/v1", accountRoutes);
 
+// Writes are limited per account: a backup sends a batch a minute and a photo
+// scan up to a few hundred previews, far below the limit, while a runaway or
+// abusive client cannot write without bound.
+export const limitUserWrites: MiddlewareHandler<AppContext> = async (c, next) => {
+  const limiter = c.env.API_RATE_LIMITER;
+  if (limiter && !SAFE_METHODS.has(c.req.method)) {
+    const { success } = await limiter.limit({ key: `user:${c.get("user").id}` });
+    if (!success) {
+      return c.json({ error: { code: "rate_limited", message: "Too many requests. Try again later." } }, 429);
+    }
+  }
+  await next();
+};
+
 const authed = new Hono<AppContext>();
 authed.use("*", requireUser);
+authed.use("*", limitUserWrites);
 authed.get("/me", (c) => c.json({ data: c.get("user") }));
 authed.route("/", lifeEventRoutes);
 authed.route("/", photoRoutes);
+authed.route("/", placeRoutes);
 app.route("/api/v1", authed);
 
 app.notFound((c) => c.json({ error: { code: "not_found", message: "Resource not found" } }, 404));
 
 app.onError((error, c) => {
-  console.error("Unhandled request error", error);
+  // One JSON line per failure, so Workers Logs can filter and alert on it.
+  console.error(JSON.stringify({
+    level: "error",
+    event: "unhandled_request_error",
+    method: c.req.method,
+    path: c.req.path,
+    message: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined,
+  }));
   return c.json({ error: { code: "internal_error", message: "Unexpected server error" } }, 500);
 });
 
 export default {
   fetch: app.fetch,
   async scheduled(controller, env) {
-    const result = await runMaintenance(env.DB, controller.scheduledTime, env.PHOTO_PREVIEWS);
-    console.info("Maintenance finished", result);
+    try {
+      const result = await runMaintenance(env.DB, controller.scheduledTime, env.PHOTO_PREVIEWS);
+      console.info(JSON.stringify({ level: "info", event: "maintenance_finished", ...result }));
+    } catch (error) {
+      console.error(JSON.stringify({
+        level: "error",
+        event: "maintenance_failed",
+        message: error instanceof Error ? error.message : String(error),
+      }));
+      throw error;
+    }
   },
 } satisfies ExportedHandler<Env>;

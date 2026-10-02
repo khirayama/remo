@@ -1,3 +1,8 @@
+import { dateKey, dayRange } from "./day";
+import { clearStoredEvents, clearUploadedPhotoIds, countDirtyEvents, countEvents, loadEventsInRange, loadSyncState, loadUploadedPhotoIds, markPhotoUploaded, migrateLocalStorageValue, putLocalEvents, updateSyncState } from "./timeline-db";
+
+export { dateKey };
+
 export type EventSource = "location" | "photo";
 export type MediaType = "photo" | "video";
 export type PhotoLocationSource = "exif" | "inferred" | "manual" | "removed";
@@ -22,29 +27,28 @@ export type LifeEvent = {
   updatedAt: string;
 };
 
-export type SyncOperation =
-  | { id: string; kind: "upsert"; event: LifeEvent }
-  | { id: string; kind: "delete"; eventId: string };
+/** A name the user gave to a place they stay at. `updatedAt` is in milliseconds. */
+export type Place = {
+  id: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  updatedAt: number;
+  deleted: boolean;
+};
+
+export type SyncCursor = {
+  updatedAt: number;
+  id: string;
+};
 
 const EVENT_SOURCES = new Set<EventSource>(["location", "photo"]);
 const MEDIA_TYPES = new Set<MediaType>(["photo", "video"]);
 const PHOTO_LOCATION_SOURCES = new Set<PhotoLocationSource>(["exif", "inferred", "manual", "removed"]);
 const DEVICE_ID_KEY = "remo:device-id";
-const storageKey = (storageId: string) => `remo:timeline:${storageId}`;
-const queueKey = (userId: string) => `remo:timeline-sync:${userId}`;
-const cursorKey = (userId: string) => `remo:timeline-sync-cursor:${userId}`;
-const pageCursorKey = (userId: string) => `remo:timeline-sync-page:${userId}`;
-const pageStateKey = (userId: string) => `remo:timeline-sync-page-state:${userId}`;
-
-/** Browser storage can be full or unavailable (private browsing, blocked storage, etc.). */
-function writeStorage(key: string, value: string): boolean {
-  try {
-    localStorage.setItem(key, value);
-    return true;
-  } catch {
-    return false;
-  }
-}
+// localStorage keys of earlier versions, read once to migrate or removed.
+const legacyPhotoUploadPrefix = (userId: string) => `remo:photo-uploaded:${userId}:`;
+export const lastBackupKey = (userId: string) => `remo:backup:last-success:${userId}`;
 
 function removeStorage(key: string): void {
   try {
@@ -53,22 +57,6 @@ function removeStorage(key: string): void {
     // Storage cleanup is best-effort.
   }
 }
-
-export type SyncCursor = {
-  updatedAt: number;
-  id: string;
-};
-
-export type SyncPageCursor = SyncCursor & {
-  snapshotAt: number;
-};
-
-export type SyncPageState = SyncPageCursor & {
-  nextPage?: string;
-  complete: boolean;
-  events: LifeEvent[];
-  deletedIds: string[];
-};
 
 /** A browser's local timeline is independent from the account used for backup. */
 export function localDeviceStorageId(): string {
@@ -84,49 +72,53 @@ export function localDeviceStorageId(): string {
   }
 }
 
-function loadEventsFromKey(key: string): LifeEvent[] {
+function parseEvents(raw: string | null): LifeEvent[] {
+  if (!raw) return [];
   try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return [];
     const values = JSON.parse(raw);
     return Array.isArray(values)
       ? values.flatMap((value) => {
           const event = normalizeEvent(value);
           return event ? [event] : [];
-        }).sort(sortNewest)
+        })
       : [];
   } catch {
     return [];
   }
 }
 
-/** Move data written by the old auth-scoped web client into device storage. */
-export function prepareLocalStorage(): string {
-  const storageId = localDeviceStorageId();
-  const currentKey = storageKey(storageId);
-  const legacyKeys: string[] = [];
+function localStorageKeys(): string[] {
   try {
-    for (let index = 0; index < localStorage.length; index += 1) {
-      const key = localStorage.key(index);
-      if (key?.startsWith("remo:timeline:") && !key.startsWith("remo:timeline-sync") && key !== currentKey) legacyKeys.push(key);
-    }
+    return Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index)).filter((key): key is string => key !== null);
   } catch {
-    return storageId;
+    return [];
   }
-  if (!legacyKeys.length) return storageId;
-  const legacyEvents = legacyKeys.flatMap(loadEventsFromKey);
-  if (!legacyEvents.length) {
-    legacyKeys.forEach((key) => localStorage.removeItem(key));
-    return storageId;
+}
+
+/**
+ * Moves records kept in localStorage by the first web client into IndexedDB.
+ * A record already in IndexedDB is kept.
+ */
+export async function migrateLegacyTimeline(storageId: string): Promise<void> {
+  const keys = localStorageKeys().filter((key) => key.startsWith("remo:timeline:") && !key.startsWith("remo:timeline-sync"));
+  for (const key of keys) {
+    await migrateLocalStorageValue(key, async (raw) => {
+      const legacy = parseEvents(raw);
+      if (!legacy.length) return;
+      const times = legacy.map((event) => Date.parse(event.startedAt));
+      const stored = new Set((await loadEventsInRange(storageId, Math.min(...times), Math.max(...times) + 1)).map((event) => event.id));
+      await putLocalEvents(storageId, legacy.filter((event) => !stored.has(event.id)));
+    });
   }
-  const merged = new Map(loadEventsFromKey(currentKey).map((event) => [event.id, event]));
-  legacyEvents.forEach((event) => {
-    const current = merged.get(event.id);
-    if (!current || Date.parse(event.updatedAt) >= Date.parse(current.updatedAt)) merged.set(event.id, event);
+}
+
+/** The records of one local day, oldest first. */
+export async function loadDayEvents(storageId: string, day: string): Promise<LifeEvent[]> {
+  const { from, to } = dayRange(day);
+  return (await loadEventsInRange(storageId, from, to)).flatMap((value) => {
+    const event = normalizeEvent(value);
+    return event ? [event] : [];
   });
-  if (!writeStorage(currentKey, JSON.stringify([...merged.values()].sort(sortNewest)))) return storageId;
-  legacyKeys.forEach(removeStorage);
-  return storageId;
 }
 
 function validDate(value: unknown): value is string {
@@ -141,7 +133,7 @@ function validAccuracy(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1_000_000;
 }
 
-function normalizeEvent(value: unknown): LifeEvent | null {
+export function normalizeEvent(value: unknown): LifeEvent | null {
   if (!value || typeof value !== "object") return null;
   const raw = value as Record<string, unknown>;
   const id = typeof raw.id === "string" ? raw.id.trim().slice(0, 120) : "";
@@ -182,190 +174,153 @@ function normalizeEvent(value: unknown): LifeEvent | null {
   };
 }
 
-function isSyncOperation(value: unknown): value is SyncOperation {
-  if (!value || typeof value !== "object") return false;
-  const operation = value as Record<string, unknown>;
-  if (typeof operation.id !== "string") return false;
-  if (operation.kind === "delete") return typeof operation.eventId === "string";
-  return operation.kind === "upsert" && normalizeEvent(operation.event) !== null;
+// ---- Which account the records belong to ---------------------------------------
+
+/**
+ * The records in this browser are backed up to one account at a time.
+ * "unclaimed" records have never been backed up (or their account was
+ * deleted); "other" means they belong to a different account than the one
+ * signing in, which must not receive them without the user saying so.
+ */
+export type Ownership = "owned" | "unclaimed" | "other";
+
+export async function ownershipFor(storageId: string, userId: string): Promise<Ownership> {
+  const { owner } = await loadSyncState(storageId);
+  if (!owner) return "unclaimed";
+  if (owner === userId) return "owned";
+  // Nothing recorded here: there is nothing that could end up in the wrong account.
+  return await countEvents(storageId) === 0 ? "unclaimed" : "other";
 }
 
-export function loadEvents(storageId: string): LifeEvent[] {
-  return loadEventsFromKey(storageKey(storageId));
-}
-
-export function saveEvents(storageId: string, events: LifeEvent[]): boolean {
-  // setItem is atomic: when quota is exceeded, the previous timeline value
-  // remains intact. Never let that browser exception unmount the whole app.
-  return writeStorage(storageKey(storageId), JSON.stringify(events));
-}
-
-export function clearEvents(storageId: string, syncUserId?: string): void {
-  removeStorage(storageKey(storageId));
-  if (syncUserId) clearSyncState(syncUserId);
-}
-
-// Forgets everything kept for backing up to this account: pending uploads,
-// the download cursor and any partial full sync. Local records are untouched.
-export function clearSyncState(syncUserId: string): void {
-  removeStorage(queueKey(syncUserId));
-  removeStorage(cursorKey(syncUserId));
-  removeStorage(pageCursorKey(syncUserId));
-  removeStorage(pageStateKey(syncUserId));
-  removeStorage(`remo:backup:last-success:${syncUserId}`);
-}
-
-export function loadSyncCursor(userId: string): SyncCursor | undefined {
-  const raw = localStorage.getItem(cursorKey(userId));
-  if (!raw) return undefined;
-  try {
-    const parsed = JSON.parse(raw) as Partial<SyncCursor>;
-    const updatedAt = parsed.updatedAt;
-    const id = parsed.id;
-    if (typeof updatedAt === "number" && Number.isSafeInteger(updatedAt) && updatedAt >= 0 && typeof id === "string" && id) {
-      return { updatedAt, id };
-    }
-  } catch {
-    // A malformed cursor is replaced by the next successful v2 full sync.
-  }
-  // Older clients stored only a server timestamp. It cannot safely resume the
-  // composite cursor, so discard it and let the bounded v2 snapshot rebuild it.
-  removeStorage(cursorKey(userId));
-  return undefined;
-}
-
-export function saveSyncCursor(userId: string, cursor: SyncCursor): void {
-  if (Number.isSafeInteger(cursor.updatedAt) && cursor.updatedAt >= 0 && cursor.id) {
-    writeStorage(cursorKey(userId), JSON.stringify(cursor));
-  }
-}
-
-export function loadSyncPageCursor(userId: string): SyncPageCursor | undefined {
-  try {
-    const raw = localStorage.getItem(pageCursorKey(userId));
-    if (!raw) return undefined;
-    const parsed = JSON.parse(raw) as Partial<SyncPageCursor>;
-    const snapshotAt = parsed.snapshotAt;
-    const updatedAt = parsed.updatedAt;
-    const id = parsed.id;
-    if (typeof snapshotAt === "number" && Number.isSafeInteger(snapshotAt) && snapshotAt >= 0
-      && typeof updatedAt === "number" && Number.isSafeInteger(updatedAt) && updatedAt >= 0
-      && typeof id === "string" && id) {
-      return { snapshotAt, updatedAt, id };
-    }
-  } catch {
-    // A malformed progress marker is safe to discard; the next sync restarts it.
-  }
-  removeStorage(pageCursorKey(userId));
-  return undefined;
-}
-
-export function loadSyncPageState(userId: string): SyncPageState | undefined {
-  try {
-    const raw = localStorage.getItem(pageStateKey(userId));
-    if (!raw) return undefined;
-    const parsed = JSON.parse(raw) as Partial<SyncPageState>;
-    const snapshotAt = parsed.snapshotAt;
-    const updatedAt = parsed.updatedAt;
-    const id = parsed.id;
-    const events = Array.isArray(parsed.events)
-      ? parsed.events.flatMap((value) => {
-        const event = normalizeEvent(value);
-        return event ? [event] : [];
-      })
-      : [];
-    const deletedIds = Array.isArray(parsed.deletedIds)
-      ? parsed.deletedIds.filter((value): value is string => typeof value === "string" && value.length > 0)
-      : [];
-    if (typeof snapshotAt !== "number" || !Number.isSafeInteger(snapshotAt) || snapshotAt < 0
-      || typeof updatedAt !== "number" || !Number.isSafeInteger(updatedAt) || updatedAt < 0
-      || typeof id !== "string" || !id || typeof parsed.complete !== "boolean") return undefined;
-    return {
-      snapshotAt,
-      updatedAt,
-      id,
-      nextPage: typeof parsed.nextPage === "string" && parsed.nextPage ? parsed.nextPage : undefined,
-      complete: parsed.complete,
-      events,
-      deletedIds: [...new Set(deletedIds)],
-    };
-  } catch {
-    removeStorage(pageStateKey(userId));
-    return undefined;
-  }
-}
-
-export function saveSyncPageState(userId: string, state: SyncPageState): boolean {
-  if (!Number.isSafeInteger(state.snapshotAt) || state.snapshotAt < 0
-    || !Number.isSafeInteger(state.updatedAt) || state.updatedAt < 0
-    || !state.id || typeof state.complete !== "boolean") return false;
-  return writeStorage(pageStateKey(userId), JSON.stringify(state));
-}
-
-export function saveSyncPageCursor(userId: string, cursor: SyncPageCursor): void {
-  if (Number.isSafeInteger(cursor.snapshotAt) && cursor.snapshotAt >= 0
-    && Number.isSafeInteger(cursor.updatedAt) && cursor.updatedAt >= 0 && cursor.id) {
-    writeStorage(pageCursorKey(userId), JSON.stringify(cursor));
-  }
-}
-
-export function clearSyncPageCursor(userId: string): void {
-  removeStorage(pageCursorKey(userId));
-  removeStorage(pageStateKey(userId));
-}
-
-export function loadSyncQueue(userId: string): SyncOperation[] {
-  try {
-    const raw = localStorage.getItem(queueKey(userId));
-    if (!raw) return [];
-    const values = JSON.parse(raw);
-    return Array.isArray(values) ? values.filter(isSyncOperation) : [];
-  } catch {
-    return [];
-  }
-}
-
-export function enqueueSync(userId: string, operation: SyncOperation): void {
-  const eventId = operation.kind === "upsert" ? operation.event.id : operation.eventId;
-  const next = loadSyncQueue(userId).filter((current) => {
-    const currentEventId = current.kind === "upsert" ? current.event.id : current.eventId;
-    return currentEventId !== eventId;
+/** Backs the records in this browser up to [userId] from now on. */
+export async function claimRecords(storageId: string, userId: string): Promise<void> {
+  await updateSyncState(storageId, (state) => {
+    // Records backed up to another account have to be uploaded to this one.
+    if (state.owner && state.owner !== userId) state.epoch += 1;
+    state.owner = userId;
   });
-  writeStorage(queueKey(userId), JSON.stringify([...next, operation]));
 }
 
-export function saveSyncQueue(userId: string, operations: SyncOperation[]): void {
-  if (operations.length) writeStorage(queueKey(userId), JSON.stringify(operations));
-  else removeStorage(queueKey(userId));
+/** Removes the records of another account before [userId] starts using this browser. */
+export async function replaceRecords(storageId: string, userId: string): Promise<void> {
+  await clearStoredEvents(storageId);
+  await updateSyncState(storageId, (state) => {
+    state.owner = userId;
+    delete state.cursors[userId];
+    delete state.fullSync[userId];
+  });
 }
+
+/** Removes every record in this browser and forgets what was downloaded. */
+export async function clearEvents(storageId: string): Promise<void> {
+  await clearStoredEvents(storageId);
+  await updateSyncState(storageId, (state) => {
+    state.cursors = {};
+    state.fullSync = {};
+  });
+}
+
+// Forgets everything kept for backing up to this account after the account was
+// deleted: the download position and the photo upload markers. The records
+// stay and count as not backed up, so a later account receives all of them.
+export async function forgetAccount(storageId: string, userId: string): Promise<void> {
+  removeStorage(lastBackupKey(userId));
+  await updateSyncState(storageId, (state) => {
+    delete state.cursors[userId];
+    delete state.fullSync[userId];
+    if (state.owner === userId) {
+      state.owner = undefined;
+      state.epoch += 1;
+    }
+  });
+  await clearUploadedPhotoIds(userId).catch(() => undefined);
+}
+
+/** Records in this browser that are not in the backup yet. */
+export async function countUnsavedEvents(storageId: string): Promise<number> {
+  const state = await loadSyncState(storageId);
+  return countDirtyEvents(storageId, state.owner ? state.epoch : Infinity);
+}
+
+export async function loadUploadedPhotos(userId: string): Promise<Set<string>> {
+  const prefix = legacyPhotoUploadPrefix(userId);
+  const legacy = localStorageKeys().filter((key) => key.startsWith(prefix));
+  try {
+    for (const key of legacy) {
+      await migrateLocalStorageValue(key, () => markPhotoUploaded(userId, key.slice(prefix.length)));
+    }
+    return await loadUploadedPhotoIds(userId);
+  } catch {
+    return new Set();
+  }
+}
+
+export async function rememberUploadedPhoto(userId: string, eventId: string): Promise<void> {
+  await markPhotoUploaded(userId, eventId).catch(() => undefined);
+}
+
+// ---- Export and import ----------------------------------------------------------
 
 export type ExportRange = {
   from: string;
   to: string;
 };
 
-export function eventsInRange(events: LifeEvent[], range: ExportRange): LifeEvent[] {
-  return events.filter((event) => {
-    const date = dateKey(event.startedAt);
-    return date >= range.from && date <= range.to;
-  }).sort(sortOldest);
+export type ExportSummary = { eventCount: number; photoRecordCount: number; photoCount: number; locationCount: number };
+
+function daysOf(range: ExportRange): string[] {
+  const days: string[] = [];
+  const cursor = new Date(`${range.from}T12:00:00`);
+  const last = new Date(`${range.to}T12:00:00`);
+  while (cursor <= last && days.length < 36_600) {
+    days.push(dateKey(cursor));
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return days;
 }
 
-export function downloadExport(userId: string, events: LifeEvent[], range: ExportRange): void {
-  const selected = eventsInRange(events, range);
-  const photoEvents = selected.filter((event) => event.source === "photo");
-  const payload = JSON.stringify({
-    schemaVersion: 1,
-    exportedAt: new Date().toISOString(),
-    range,
-    summary: {
-      eventCount: selected.length,
-      photoRecordCount: photoEvents.length,
-      photoCount: photoEvents.reduce((sum, event) => sum + event.photoCount, 0),
-    },
-    events: selected,
-  }, null, 2);
-  const url = URL.createObjectURL(new Blob([payload], { type: "application/json" }));
+/** Counts the records of a range one day at a time, without keeping them. */
+export async function summarizeRange(storageId: string, range: ExportRange, signal?: AbortSignal): Promise<ExportSummary | undefined> {
+  const summary: ExportSummary = { eventCount: 0, photoRecordCount: 0, photoCount: 0, locationCount: 0 };
+  for (const day of daysOf(range)) {
+    if (signal?.aborted) return undefined;
+    for (const event of await loadDayEvents(storageId, day)) {
+      summary.eventCount += 1;
+      if (event.source === "photo") {
+        summary.photoRecordCount += 1;
+        summary.photoCount += event.photoCount;
+      } else {
+        summary.locationCount += 1;
+      }
+    }
+  }
+  return summary;
+}
+
+/**
+ * Writes the records of a range as a Remo JSON document. The file is built a
+ * day at a time, so a year of records is never held as one string.
+ */
+export async function buildExport(storageId: string, range: ExportRange): Promise<Blob> {
+  const parts: string[] = [`{\n  "schemaVersion": 1,\n  "exportedAt": ${JSON.stringify(new Date().toISOString())},\n  "range": ${JSON.stringify(range)},\n  "events": [`];
+  const summary = { eventCount: 0, photoRecordCount: 0, photoCount: 0 };
+  for (const day of daysOf(range)) {
+    const events = await loadDayEvents(storageId, day);
+    if (!events.length) continue;
+    parts.push((summary.eventCount ? ",\n    " : "\n    ") + events.map((event) => JSON.stringify(event)).join(",\n    "));
+    summary.eventCount += events.length;
+    for (const event of events) {
+      if (event.source !== "photo") continue;
+      summary.photoRecordCount += 1;
+      summary.photoCount += event.photoCount;
+    }
+  }
+  parts.push(`\n  ],\n  "summary": ${JSON.stringify(summary)}\n}\n`);
+  return new Blob(parts, { type: "application/json" });
+}
+
+export async function downloadExport(storageId: string, range: ExportRange): Promise<void> {
+  const url = URL.createObjectURL(await buildExport(storageId, range));
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = `remo-timeline-${range.from}-${range.to}-${new Date().toISOString().slice(0, 10)}.json`;
@@ -373,7 +328,7 @@ export function downloadExport(userId: string, events: LifeEvent[], range: Expor
   URL.revokeObjectURL(url);
 }
 
-export async function readImport(file: File): Promise<LifeEvent[]> {
+export async function readImport(file: Blob): Promise<LifeEvent[]> {
   const parsed = JSON.parse(await file.text()) as { schemaVersion?: unknown; events?: unknown[] };
   if (parsed.schemaVersion !== 1) throw new Error("RemoのJSONバージョンが対応していません");
   if (!Array.isArray(parsed.events)) throw new Error("RemoのJSONファイルではありません");
@@ -383,7 +338,17 @@ export async function readImport(file: File): Promise<LifeEvent[]> {
     return event ? [event] : [];
   });
   if (!imported.length && parsed.events.length) throw new Error("読み込めるタイムライン記録がありません");
-  return imported.map((event) => ({ ...event, updatedAt: new Date().toISOString() })).sort(sortNewest);
+  const importedAt = new Date().toISOString();
+  return imported.map((event) => ({ ...event, updatedAt: importedAt }));
+}
+
+const IMPORT_BATCH = 2_000;
+
+/** Stores imported records in batches so a large file does not hold one long transaction. */
+export async function storeImported(storageId: string, events: LifeEvent[]): Promise<void> {
+  for (let index = 0; index < events.length; index += IMPORT_BATCH) {
+    await putLocalEvents(storageId, events.slice(index, index + IMPORT_BATCH));
+  }
 }
 
 export function sortNewest(a: LifeEvent, b: LifeEvent): number {
@@ -392,12 +357,4 @@ export function sortNewest(a: LifeEvent, b: LifeEvent): number {
 
 export function sortOldest(a: LifeEvent, b: LifeEvent): number {
   return Date.parse(a.startedAt) - Date.parse(b.startedAt);
-}
-
-export function dateKey(value: string | Date): string {
-  const date = typeof value === "string" ? new Date(value) : value;
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
 }

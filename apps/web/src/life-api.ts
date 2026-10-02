@@ -1,6 +1,7 @@
-import { clearSyncPageCursor, enqueueSync, LifeEvent, loadSyncCursor, loadSyncPageState, loadSyncQueue, MediaType, PhotoLocationSource, saveSyncCursor, saveSyncPageState, saveSyncQueue, sortNewest, SyncCursor, SyncPageCursor, SyncPageState } from "./life-log";
+import { LifeEvent, MediaType, PhotoLocationSource, Place, SyncCursor } from "./life-log";
+import { applyRemoteChanges, applyRemotePlaces, countDirtyEvents, loadDirtyEvents, loadDirtyPlaces, loadPendingDeletes, loadSyncState, markEventsSynced, markPlacesSynced, PendingDeletion, removePendingDeletes, updateSyncState } from "./timeline-db";
 
-const baseURL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8787").replace(/\/$/, "");
+import { apiBaseURL as baseURL } from "./api-base";
 
 type ApiEvent = {
   id: string;
@@ -18,17 +19,32 @@ type ApiEvent = {
   updatedAt: number;
 };
 
-type EventSnapshot = {
+type EventPage = {
   events: LifeEvent[];
-  deletedIds: string[];
+  deletions: Array<{ id: string; deletedAt: number }>;
   cursor?: SyncCursor;
-  full: boolean;
-};
-
-type EventPage = EventSnapshot & {
   nextPage?: string;
   nextCursorToken?: string;
 };
+
+/** The session is no longer valid: the user has to sign in again. */
+export class UnauthorizedError extends Error {
+  constructor() {
+    super("unauthorized");
+  }
+}
+
+/** Sends a request with the session cookie; any failure other than a rejected session is "unavailable". */
+async function request(path: string, init: RequestInit = {}): Promise<Response> {
+  const response = await fetch(`${baseURL}${path}`, { credentials: "include", ...init });
+  if (response.status === 401) throw new UnauthorizedError();
+  if (!response.ok) throw new Error("sync unavailable");
+  return response;
+}
+
+function jsonBody(method: string, body: unknown): RequestInit {
+  return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+}
 
 function encodeCursor(cursor: SyncCursor): string {
   return `${cursor.updatedAt}|${cursor.id}`;
@@ -48,36 +64,6 @@ function compareCursors(first: SyncCursor, second: SyncCursor): number {
   return first.id < second.id ? -1 : first.id > second.id ? 1 : 0;
 }
 
-function decodePageCursor(value: unknown): SyncPageCursor | undefined {
-  if (typeof value !== "string") return undefined;
-  const firstSeparator = value.indexOf("|");
-  const secondSeparator = value.indexOf("|", firstSeparator + 1);
-  if (firstSeparator <= 0 || secondSeparator <= firstSeparator + 1) return undefined;
-  const snapshotAt = Number(value.slice(0, firstSeparator));
-  const updatedAt = Number(value.slice(firstSeparator + 1, secondSeparator));
-  const id = value.slice(secondSeparator + 1);
-  return Number.isSafeInteger(snapshotAt) && snapshotAt >= 0
-    && Number.isSafeInteger(updatedAt) && updatedAt >= 0 && id
-    ? { snapshotAt, updatedAt, id }
-    : undefined;
-}
-
-function sameEvent(first: LifeEvent, second: LifeEvent): boolean {
-  return first.id === second.id
-    && first.startedAt === second.startedAt
-    && first.latitude === second.latitude
-    && first.longitude === second.longitude
-    && first.originalLatitude === second.originalLatitude
-    && first.originalLongitude === second.originalLongitude
-    && (first.locationSource ?? null) === (second.locationSource ?? null)
-    && (first.photoLocationAutoPlacementDisabled ?? false) === (second.photoLocationAutoPlacementDisabled ?? false)
-    && (first.accuracyMeters ?? null) === (second.accuracyMeters ?? null)
-    && (first.mediaType ?? (first.source === "photo" ? "photo" : null)) === (second.mediaType ?? (second.source === "photo" ? "photo" : null))
-    && first.photoCount === second.photoCount
-    && first.source === second.source
-    && first.updatedAt === second.updatedAt;
-}
-
 function fromApi(event: ApiEvent): LifeEvent {
   return {
     id: event.id,
@@ -89,7 +75,7 @@ function fromApi(event: ApiEvent): LifeEvent {
       ? { originalLatitude: event.originalLatitude, originalLongitude: event.originalLongitude }
       : {}),
     ...(event.locationSource !== null && event.locationSource !== undefined ? { locationSource: event.locationSource } : {}),
-    ...(event.photoLocationAutoPlacementDisabled !== null && event.photoLocationAutoPlacementDisabled !== undefined
+    ...(event.source === "photo" && event.photoLocationAutoPlacementDisabled !== null && event.photoLocationAutoPlacementDisabled !== undefined
       ? { photoLocationAutoPlacementDisabled: event.photoLocationAutoPlacementDisabled }
       : {}),
     ...(event.accuracyMeters !== null && event.accuracyMeters !== undefined ? { accuracyMeters: event.accuracyMeters } : {}),
@@ -100,134 +86,8 @@ function fromApi(event: ApiEvent): LifeEvent {
   };
 }
 
-async function fetchCloudEventPage(options: { cursor?: SyncCursor; page?: string }): Promise<EventPage> {
-  const params = new URLSearchParams();
-  if (options.page !== undefined) {
-    params.set("v", "2");
-    params.set("page", options.page);
-  } else if (options.cursor) {
-    params.set("v", "2");
-    params.set("cursor", encodeCursor(options.cursor));
-  } else {
-    params.set("v", "2");
-  }
-  const query = `?${params.toString()}`;
-  const response = await fetch(`${baseURL}/api/v1/events${query}`, { credentials: "include" });
-  if (!response.ok) throw new Error("sync unavailable");
-  const payload = await response.json() as {
-    data: ApiEvent[];
-    meta?: {
-      deletedIds?: string[];
-      cursor?: string | null;
-      nextPage?: string | null;
-      nextCursorToken?: string | null;
-      full?: boolean;
-    };
-  };
+function toApi(event: LifeEvent) {
   return {
-    events: payload.data.map(fromApi),
-    deletedIds: payload.meta?.deletedIds ?? [],
-    cursor: decodeCursor(payload.meta?.cursor),
-    nextPage: payload.meta?.nextPage ?? undefined,
-    nextCursorToken: payload.meta?.nextCursorToken ?? undefined,
-    full: payload.meta?.full !== false,
-  };
-}
-
-async function fetchCloudEventHead(): Promise<SyncCursor | null> {
-  const response = await fetch(`${baseURL}/api/v1/events/head`, { credentials: "include" });
-  if (!response.ok) throw new Error("sync unavailable");
-  const payload = await response.json() as { data?: { cursor?: string | null } };
-  if (payload.data?.cursor == null) return null;
-  const cursor = decodeCursor(payload.data.cursor);
-  if (!cursor) throw new Error("sync unavailable");
-  return cursor;
-}
-
-async function fetchCloudEvents(userId: string, cursor?: SyncCursor, pageState?: SyncPageState): Promise<EventSnapshot> {
-  let nextPage: string | undefined = pageState?.nextPage;
-  let nextCursor: SyncCursor | undefined = cursor;
-  let resultCursor = pageState ? { updatedAt: pageState.updatedAt, id: pageState.id } : cursor;
-  let full = cursor === undefined || pageState !== undefined;
-  let hasNext = true;
-  const events: LifeEvent[] = pageState?.events.slice() ?? [];
-  const deletedIds = new Set<string>(pageState?.deletedIds ?? []);
-
-  if (pageState?.complete) {
-    return { events, deletedIds: [...deletedIds], cursor: resultCursor, full: true };
-  }
-
-  if (cursor && pageState === undefined) {
-    const head = await fetchCloudEventHead();
-    if (!head || compareCursors(head, cursor) <= 0) {
-      return { events: [], deletedIds: [], cursor, full: false };
-    }
-  }
-
-  do {
-    const page = await fetchCloudEventPage(nextPage
-      ? { page: nextPage }
-      : { cursor: nextCursor });
-    if (events.length === 0 && pageState === undefined) full = page.full;
-    events.push(...page.events);
-    page.deletedIds.forEach((id) => deletedIds.add(id));
-    resultCursor = page.cursor ?? resultCursor;
-    if (page.nextPage) {
-      nextPage = page.nextPage;
-      if (full) {
-        const progress = decodePageCursor(nextPage);
-        if (progress) {
-          const saved = saveSyncPageState(userId, {
-            ...progress,
-            nextPage,
-            complete: false,
-            events,
-            deletedIds: [...deletedIds],
-          });
-          if (!saved) clearSyncPageCursor(userId);
-        }
-      }
-      nextCursor = undefined;
-      hasNext = true;
-    } else if (page.nextCursorToken) {
-      nextPage = undefined;
-      nextCursor = decodeCursor(page.nextCursorToken);
-      hasNext = nextCursor !== undefined;
-    } else {
-      nextPage = undefined;
-      hasNext = false;
-    }
-  } while (hasNext);
-
-  if (full && pageState !== undefined && pageState.nextPage !== undefined) {
-    const progress = pageState;
-    saveSyncPageState(userId, {
-      ...progress,
-      updatedAt: resultCursor?.updatedAt ?? progress.updatedAt,
-      id: resultCursor?.id ?? progress.id,
-      nextPage: undefined,
-      complete: true,
-      events,
-      deletedIds: [...deletedIds],
-    });
-  }
-  return { events, deletedIds: [...deletedIds], cursor: resultCursor, full };
-}
-
-const BATCH_SIZE = 40;
-
-async function postCloudBatch(body: { events?: unknown[]; deletions?: unknown[] }): Promise<void> {
-  const response = await fetch(`${baseURL}/api/v1/events/batch`, {
-    method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) throw new Error("sync unavailable");
-}
-
-async function pushCloudEvents(events: LifeEvent[]): Promise<void> {
-  await postCloudBatch({ events: events.map((event) => ({
     id: event.id,
     startedAt: Date.parse(event.startedAt),
     latitude: event.latitude ?? null,
@@ -241,49 +101,121 @@ async function pushCloudEvents(events: LifeEvent[]): Promise<void> {
     photoCount: event.photoCount,
     source: event.source,
     updatedAt: Date.parse(event.updatedAt),
-  })) });
+  };
 }
 
-// deletedAt uses this device's clock, like updatedAt on upserts, so the
-// server can resolve a deletion against edits from other devices.
-async function deleteCloudEvents(eventIds: string[]): Promise<void> {
-  const deletedAt = Date.now();
-  await postCloudBatch({ deletions: eventIds.map((id) => ({ id, deletedAt })) });
+async function fetchEventPage(options: { cursor?: SyncCursor; page?: string }): Promise<EventPage> {
+  const params = new URLSearchParams({ v: "2" });
+  if (options.page !== undefined) params.set("page", options.page);
+  else if (options.cursor) params.set("cursor", encodeCursor(options.cursor));
+  const response = await request(`/api/v1/events?${params.toString()}`);
+  const payload = await response.json() as {
+    data: ApiEvent[];
+    meta?: {
+      deletions?: Array<{ id: string; deletedAt: number }>;
+      cursor?: string | null;
+      nextPage?: string | null;
+      nextCursorToken?: string | null;
+    };
+  };
+  return {
+    events: payload.data.map(fromApi),
+    deletions: payload.meta?.deletions ?? [],
+    cursor: decodeCursor(payload.meta?.cursor),
+    nextPage: payload.meta?.nextPage ?? undefined,
+    nextCursorToken: payload.meta?.nextCursorToken ?? undefined,
+  };
 }
 
-async function flushSyncQueue(userId: string): Promise<{ pending: number }> {
-  const queue = loadSyncQueue(userId);
-  const upserts = queue.filter((operation) => operation.kind === "upsert").map((operation) => operation.event);
-  const deletes = queue.filter((operation) => operation.kind === "delete");
-  for (let index = 0; index < upserts.length; index += BATCH_SIZE) {
-    try {
-      await pushCloudEvents(upserts.slice(index, index + BATCH_SIZE));
-    } catch {
-      const sentIds = new Set(upserts.slice(0, index).map((event) => event.id));
-      saveSyncQueue(userId, queue.filter((operation) => {
-        const id = operation.kind === "upsert" ? operation.event.id : operation.eventId;
-        return !sentIds.has(id);
-      }));
-      return { pending: loadSyncQueue(userId).length };
+async function fetchEventHead(): Promise<SyncCursor | null> {
+  const response = await request("/api/v1/events/head");
+  const payload = await response.json() as { data?: { cursor?: string | null } };
+  if (payload.data?.cursor == null) return null;
+  const cursor = decodeCursor(payload.data.cursor);
+  if (!cursor) throw new Error("sync unavailable");
+  return cursor;
+}
+
+/** The server takes up to 500 records per request. */
+const BATCH_SIZE = 400;
+
+// A 2xx response means every item was handled: applied, or rejected by the
+// server as invalid (reported in data.rejected). Either way it is done, so one
+// malformed record cannot block the rest forever.
+async function pushDeletions(storageId: string): Promise<void> {
+  for (;;) {
+    const batch: PendingDeletion[] = await loadPendingDeletes(storageId, BATCH_SIZE);
+    if (!batch.length) return;
+    // deletedAt uses this device's clock, like updatedAt on upserts, so the
+    // server can resolve a deletion against edits from other devices.
+    await request("/api/v1/events/batch", jsonBody("POST", {
+      deletions: batch.map(({ id, deletedAt, startedAt, source }) => ({ id, deletedAt, startedAt: startedAt ?? null, source: source ?? null })),
+    }));
+    await removePendingDeletes(storageId, batch);
+  }
+}
+
+async function pushEvents(storageId: string, epoch: number): Promise<void> {
+  for (;;) {
+    const batch = await loadDirtyEvents(storageId, epoch, BATCH_SIZE);
+    if (!batch.length) return;
+    await request("/api/v1/events/batch", jsonBody("POST", { events: batch.map(toApi) }));
+    await markEventsSynced(storageId, batch, epoch);
+  }
+}
+
+/**
+ * Downloads what changed in the backup and applies it page by page, so a
+ * restore of years of records is never held in memory and continues where it
+ * stopped. What was applied is reported through [outcome] even when a later
+ * page fails.
+ */
+async function pull(storageId: string, userId: string, epoch: number, outcome: SyncOutcome): Promise<void> {
+  const state = await loadSyncState(storageId);
+  const stored: SyncCursor | undefined = state.cursors[userId];
+  let page: string | undefined = stored ? undefined : state.fullSync[userId];
+  let cursor: SyncCursor | undefined = stored;
+  if (stored) {
+    const head = await fetchEventHead();
+    if (!head || compareCursors(head, stored) <= 0) return;
+  }
+  let reached: SyncCursor | undefined;
+  for (;;) {
+    const result: EventPage = await fetchEventPage(page !== undefined ? { page } : { cursor });
+    const applied = await applyRemoteChanges(storageId, result.events, result.deletions, epoch);
+    outcome.changed ||= applied.changed;
+    outcome.removedIds.push(...applied.removedIds);
+    reached = result.cursor ?? reached;
+    if (result.nextPage) {
+      const resume = result.nextPage;
+      page = resume;
+      await updateSyncState(storageId, (next) => { next.fullSync[userId] = resume; });
+    } else if (result.nextCursorToken && decodeCursor(result.nextCursorToken)) {
+      page = undefined;
+      cursor = decodeCursor(result.nextCursorToken);
+    } else {
+      break;
     }
   }
-  for (let index = 0; index < deletes.length; index += BATCH_SIZE) {
-    try {
-      await deleteCloudEvents(deletes.slice(index, index + BATCH_SIZE).map((operation) => operation.eventId));
-    } catch {
-      const sentIds = new Set([
-        ...upserts.map((event) => event.id),
-        ...deletes.slice(0, index).map((operation) => operation.eventId),
-      ]);
-      saveSyncQueue(userId, queue.filter((operation) => {
-        const id = operation.kind === "upsert" ? operation.event.id : operation.eventId;
-        return !sentIds.has(id);
-      }));
-      return { pending: loadSyncQueue(userId).length };
-    }
+  const final = reached;
+  await updateSyncState(storageId, (next) => {
+    // Only a cursor returned by a read is safe to keep: a write response says
+    // nothing about what other devices committed in between.
+    if (final) next.cursors[userId] = final;
+    delete next.fullSync[userId];
+  });
+}
+
+async function syncPlaces(storageId: string, epoch: number): Promise<boolean> {
+  const dirty = await loadDirtyPlaces(storageId, epoch);
+  for (let index = 0; index < dirty.length; index += 200) {
+    const batch = dirty.slice(index, index + 200);
+    await request("/api/v1/places", jsonBody("PUT", { places: batch }));
+    await markPlacesSynced(storageId, batch, epoch);
   }
-  saveSyncQueue(userId, []);
-  return { pending: 0 };
+  const response = await request("/api/v1/places");
+  const payload = await response.json() as { data?: Place[] };
+  return applyRemotePlaces(storageId, payload.data ?? [], epoch);
 }
 
 export async function deleteAllCloudData(): Promise<void> {
@@ -300,10 +232,8 @@ export type AccountDeletionResult = "deleted" | "invalid_password" | "rate_limit
 // for the password; records stored on this device are left as they are.
 export async function deleteAccount(password: string): Promise<AccountDeletionResult> {
   const response = await fetch(`${baseURL}/api/v1/account/delete`, {
-    method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password }),
+    ...jsonBody("POST", { password }),
   });
   if (response.ok) return "deleted";
   if (response.status === 429) return "rate_limited";
@@ -311,85 +241,41 @@ export async function deleteAccount(password: string): Promise<AccountDeletionRe
   return payload?.error?.code === "invalid_password" ? "invalid_password" : "failed";
 }
 
-export async function synchronizeEvents(userId: string, localEvents: LifeEvent[], options: { pull?: boolean } = {}): Promise<{
-  events: LifeEvent[];
-  deletedIds: string[];
-  pending: number;
+export type SyncOutcome = {
+  /** False when the API could not be reached; unsent changes stay queued. */
   online: boolean;
-}> {
-  const pull = options.pull ?? true;
-  const storedCursor = loadSyncCursor(userId);
-  const storedPageState = storedCursor ? undefined : loadSyncPageState(userId);
-  const firstFlush = await flushSyncQueue(userId);
-  if (!pull) {
-    return {
-      events: localEvents.slice().sort(sortNewest),
-      deletedIds: [],
-      pending: firstFlush.pending,
-      online: firstFlush.pending === 0,
-    };
-  }
+  /** The session was rejected: the user has to sign in again. */
+  unauthorized: boolean;
+  /** Records and deletions that are still waiting to be uploaded. */
+  pending: number;
+  /** Local records or places changed and the screen should reload them. */
+  changed: boolean;
+  /** Records another device deleted, removed here by this sync. */
+  removedIds: string[];
+};
 
-  let snapshot: EventSnapshot;
+/**
+ * Backs this browser's changes up to [userId] and, when [pull] is set, brings
+ * in what other devices changed. Only records that are not in the backup yet
+ * are uploaded: a record another device deleted from the backup is not sent
+ * back by a device that still has its own copy.
+ */
+export async function synchronizeEvents(storageId: string, userId: string, options: { pull?: boolean } = {}): Promise<SyncOutcome> {
+  const { epoch, owner } = await loadSyncState(storageId);
+  const outcome: SyncOutcome = { online: true, unauthorized: false, pending: 0, changed: false, removedIds: [] };
+  // The records belong to another account until the user decides otherwise.
+  if (owner !== userId) return { ...outcome, online: false };
   try {
-    snapshot = await fetchCloudEvents(userId, storedCursor, storedPageState);
-  } catch {
-    return { events: localEvents, deletedIds: [], pending: loadSyncQueue(userId).length, online: false };
-  }
-
-  const pendingDeletes = new Set(
-    loadSyncQueue(userId)
-      .filter((operation) => operation.kind === "delete")
-      .map((operation) => operation.eventId),
-  );
-  const localIds = new Set(localEvents.map((event) => event.id));
-  const cloudById = new Map(snapshot.events.map((event) => [event.id, event]));
-
-  for (const local of localEvents) {
-    if (!snapshot.full && !cloudById.has(local.id)) continue;
-    if (pendingDeletes.has(local.id)) continue;
-    const cloud = cloudById.get(local.id);
-    if (!cloud || (Date.parse(local.updatedAt) >= Date.parse(cloud.updatedAt) && !sameEvent(local, cloud))) {
-      enqueueSync(userId, { id: crypto.randomUUID(), kind: "upsert", event: local });
+    await pushDeletions(storageId);
+    await pushEvents(storageId, epoch);
+    if (options.pull ?? true) {
+      await pull(storageId, userId, epoch, outcome);
+      if (await syncPlaces(storageId, epoch)) outcome.changed = true;
     }
+  } catch (error) {
+    outcome.online = false;
+    outcome.unauthorized = error instanceof UnauthorizedError;
   }
-
-  const secondFlush = await flushSyncQueue(userId);
-  // Do not advance the download cursor from a write response. A concurrent
-  // device may have written another row with the same server millisecond;
-  // only a cursor returned by the read snapshot is safe to checkpoint.
-  if (snapshot.cursor) saveSyncCursor(userId, snapshot.cursor);
-  if (snapshot.full) clearSyncPageCursor(userId);
-
-  const pendingDeletesAfterPush = new Set(
-    loadSyncQueue(userId)
-      .filter((operation) => operation.kind === "delete")
-      .map((operation) => operation.eventId),
-  );
-  const deletedAfterPush = new Set([
-    ...snapshot.deletedIds.filter((id) => !localIds.has(id)),
-    ...pendingDeletesAfterPush,
-  ]);
-  const merged = new Map(snapshot.full
-    ? snapshot.events.map((event) => [event.id, event])
-    : localEvents.map((event) => [event.id, event]));
-  if (!snapshot.full) {
-    snapshot.events.forEach((event) => {
-      const local = merged.get(event.id);
-      if (!local || Date.parse(event.updatedAt) > Date.parse(local.updatedAt)) merged.set(event.id, event);
-    });
-  }
-  for (const local of localEvents) {
-    if (pendingDeletesAfterPush.has(local.id)) continue;
-    // The device is the source of truth. Cloud records are only used to
-    // restore records that are not present locally.
-    merged.set(local.id, local);
-  }
-
-  return {
-    events: [...merged.values()].sort(sortNewest),
-    deletedIds: [...deletedAfterPush],
-    pending: Math.max(secondFlush.pending, loadSyncQueue(userId).length),
-    online: true,
-  };
+  outcome.pending = await countDirtyEvents(storageId, epoch) + (await loadPendingDeletes(storageId)).length;
+  return outcome;
 }
