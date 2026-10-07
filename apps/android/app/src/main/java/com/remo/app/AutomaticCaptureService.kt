@@ -2,6 +2,7 @@ package com.remo.app
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -31,6 +32,7 @@ import com.google.android.gms.location.ActivityTransition
 import com.google.android.gms.location.ActivityTransitionEvent
 import com.google.android.gms.location.ActivityTransitionRequest
 import com.google.android.gms.location.ActivityTransitionResult
+import com.google.android.gms.location.CurrentLocationRequest
 import com.google.android.gms.location.DetectedActivity
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
@@ -48,9 +50,7 @@ class AutomaticCaptureService : Service(), SensorEventListener {
     private var mode = CaptureMode.NORMAL
     private var activityRecognitionRegistered = false
     private var activityRecognitionRequestPending = false
-    private var activityRecognitionHasState = false
     private var activityState = ActivityState.UNKNOWN
-    private var lastActivityStateAt = 0L
     private var stationarySensor: Sensor? = null
     private var lastStationaryDetectedAt = 0L
     private val registeredMotionSensors = mutableSetOf<Sensor>()
@@ -63,6 +63,8 @@ class AutomaticCaptureService : Service(), SensorEventListener {
     private var lastObservedLocation: ObservedLocation? = null
     private var lastAcceptedFixNanos = 0L
     private var lastAcceptedAccuracy = Float.POSITIVE_INFINITY
+    private var lastAcceptedFixElapsed = 0L
+    private var currentLocationRequestPending = false
     private var lastTransitionNanos = 0L
     private var lastLoggedElapsed: Long? = null
     private var lastLoggedEntry: LogEntry? = null
@@ -127,6 +129,11 @@ class AutomaticCaptureService : Service(), SensorEventListener {
             if (requestedInterval == null) requestUpdates()
             return START_STICKY
         }
+        if (intent?.action == ACTION_STATIONARY_HEARTBEAT) {
+            handleStationaryHeartbeat()
+            if (requestedInterval == null) requestUpdates()
+            return START_STICKY
+        }
 
         preferences(this).edit { putBoolean(KEY_ENABLED, true) }
         requestUpdates()
@@ -178,8 +185,11 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         val now = System.currentTimeMillis()
         val nowElapsed = SystemClock.elapsedRealtime()
         val sameFixWithBetterAccuracy = location.elapsedRealtimeNanos == lastAcceptedFixNanos && location.hasAccuracy() && location.accuracy < lastAcceptedAccuracy
-        if (!CapturePolicy.isFreshFix(location.elapsedRealtimeNanos, SystemClock.elapsedRealtimeNanos(), if (sameFixWithBetterAccuracy) 0L else lastAcceptedFixNanos)) return
+        // The 5-minute mode gets low-power fixes that can already be minutes old on delivery;
+        // rejecting them left the whole stay without a single record.
+        if (!CapturePolicy.isFreshFix(location.elapsedRealtimeNanos, SystemClock.elapsedRealtimeNanos(), if (sameFixWithBetterAccuracy) 0L else lastAcceptedFixNanos, mode.maxFixAgeMs * 1_000_000L)) return
         lastAcceptedFixNanos = location.elapsedRealtimeNanos
+        lastAcceptedFixElapsed = nowElapsed
         lastAcceptedAccuracy = if (location.hasAccuracy()) location.accuracy else Float.POSITIVE_INFINITY
         val movementReason = movementReason(lastObservedLocation?.location, location)
         if (movementReason != null) onMovementDetected(movementReason)
@@ -187,7 +197,7 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         if (mode == CaptureMode.NORMAL && contributesToStationaryEvidence) maybeEnterStationaryMode(nowElapsed)
 
         val state = preferences(this)
-        val withinInterval = lastLoggedElapsed?.let { nowElapsed - it < mode.intervalMs } == true
+        val withinInterval = lastLoggedElapsed?.let { CapturePolicy.isWithinLoggingInterval(nowElapsed - it, mode.intervalMs) } == true
         // A coarse provider must not suppress a better GPS fix in the same interval.
         val previousEntry = lastLoggedEntry
         val improvesAccuracy = previousEntry != null && location.hasAccuracy() &&
@@ -230,7 +240,13 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         }
         if (previous != null) {
             val distance = previous.distanceTo(current)
-            if (distance >= MOVEMENT_DISTANCE_M) return "location_distance_${distance.formatForReason()}m"
+            val moved = CapturePolicy.movedBeyondAccuracy(
+                distance,
+                previous.accuracy.takeIf { previous.hasAccuracy() },
+                current.accuracy.takeIf { current.hasAccuracy() },
+                MOVEMENT_DISTANCE_M,
+            )
+            if (moved) return "location_distance_${distance.formatForReason()}m"
         }
         return null
     }
@@ -246,22 +262,19 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         if (!CapturePolicy.isStationary(policySamples, nowElapsedRealtime)) return
         val origin = recentLocations.first().location
         val maximumDisplacement = recentLocations.maxOf { origin.distanceTo(it.location) }
-        val maximumSpeed = recentLocations.mapNotNull { observed -> observed.location.speed.takeIf { speed -> observed.location.hasSpeed() && speed.isFinite() } }.maxOrNull() ?: return
+        val maximumSpeed = recentLocations.mapNotNull { observed -> observed.location.speed.takeIf { speed -> observed.location.hasSpeed() && speed.isFinite() } }.maxOrNull()
 
         val stationarySignalIsFresh = stationarySensor == null ||
             (lastStationaryDetectedAt > 0L && nowElapsedRealtime - lastStationaryDetectedAt in 0..STATIONARY_SIGNAL_MAX_AGE_MS)
         if (!stationarySignalIsFresh) return
 
-        val activitySignalIsSafe = when {
-            !activityRecognitionHasState -> true
-            activityState != ActivityState.STILL -> false
-            else -> nowElapsedRealtime - lastActivityStateAt <= ACTIVITY_STATE_MAX_AGE_MS
-        }
-        if (!activitySignalIsSafe) return
+        // STILL is reported once, when the stay begins: it must not expire, or a
+        // false wake-up later in the stay could never return to the 5-minute mode.
+        if (activityState == ActivityState.MOVING) return
 
         val reason = buildList {
             add("location_stable_${maximumDisplacement.formatForReason()}m_${recentLocations.size}samples")
-            add("speed_near_zero_${maximumSpeed.formatForReason()}mps")
+            add(maximumSpeed?.let { "speed_near_zero_${it.formatForReason()}mps" } ?: "speed_unavailable")
             if (lastStationaryDetectedAt != 0L) add("stationary_detect")
             if (activityState == ActivityState.STILL) add("activity_still")
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -284,7 +297,9 @@ class AutomaticCaptureService : Service(), SensorEventListener {
             return
         }
         saveModeReason("enter_5m:$reason")
+        lastAcceptedFixElapsed = SystemClock.elapsedRealtime()
         requestUpdates()
+        scheduleStationaryHeartbeat()
         startForegroundWithCurrentMode()
     }
 
@@ -292,6 +307,7 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         if (mode == CaptureMode.NORMAL) return
         mode = CaptureMode.NORMAL
         saveModeReason("return_10s:$reason")
+        cancelStationaryHeartbeat()
         unregisterMotionSensors()
         registerStationarySensor()
         requestUpdates()
@@ -303,6 +319,69 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         lastObservedLocation = null
         lastStationaryDetectedAt = 0L
         if (mode == CaptureMode.STATIONARY) returnToNormalMode(reason)
+    }
+
+    private fun stationaryHeartbeatPendingIntent(): PendingIntent = PendingIntent.getService(
+        this,
+        STATIONARY_HEARTBEAT_REQUEST_CODE,
+        Intent(this, AutomaticCaptureService::class.java).setAction(ACTION_STATIONARY_HEARTBEAT),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
+
+    private fun scheduleStationaryHeartbeat() {
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        alarmManager.setAndAllowWhileIdle(
+            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+            SystemClock.elapsedRealtime() + STATIONARY_HEARTBEAT_MS,
+            stationaryHeartbeatPendingIntent(),
+        )
+    }
+
+    private fun cancelStationaryHeartbeat() {
+        (getSystemService(Context.ALARM_SERVICE) as AlarmManager).cancel(stationaryHeartbeatPendingIntent())
+    }
+
+    /**
+     * The 5-minute mode depends on low-power fixes and motion sensors, and a device may
+     * deliver neither (Doze, no Wi-Fi fix, a sensor that never fires). This alarm still
+     * fires while idle, so a silent stay asks for one fix itself: it keeps the record
+     * going and, when the device has moved, returns to the 10-second mode.
+     */
+    private fun handleStationaryHeartbeat() {
+        if (destroyed || mode != CaptureMode.STATIONARY) return
+        scheduleStationaryHeartbeat()
+        val silentMs = SystemClock.elapsedRealtime() - lastAcceptedFixElapsed
+        if (!CapturePolicy.isStationarySilent(silentMs, mode.intervalMs)) return
+        Log.i(TAG, "no fix for ${silentMs / 1000}s in the 5-minute mode; requesting one")
+        requestCurrentLocation()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestCurrentLocation() {
+        if (currentLocationRequestPending || !hasLocationPermission()) return
+        // Nothing else keeps the CPU awake until the fix arrives.
+        val wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "remo:stationary_fix")
+        wakeLock.acquire(CURRENT_LOCATION_TIMEOUT_MS + 5_000L)
+        val request = CurrentLocationRequest.Builder()
+            .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+            .setDurationMillis(CURRENT_LOCATION_TIMEOUT_MS)
+            .setMaxUpdateAgeMillis(CURRENT_LOCATION_MAX_AGE_MS)
+            .build()
+        currentLocationRequestPending = true
+        runCatching {
+            fusedLocationClient.getCurrentLocation(request, null).addOnCompleteListener { task ->
+                currentLocationRequestPending = false
+                val location = if (task.isSuccessful) task.result else null
+                if (location != null) handleLocation(location, contributesToStationaryEvidence = true)
+                else Log.w(TAG, "no fix available in the 5-minute mode: ${task.exception?.message}")
+                if (wakeLock.isHeld) wakeLock.release()
+            }
+        }.onFailure {
+            currentLocationRequestPending = false
+            if (wakeLock.isHeld) wakeLock.release()
+            Log.w(TAG, "current location request failed: ${it.message}")
+        }
     }
 
     private fun registerStationarySensor() {
@@ -409,26 +488,18 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         when {
             event.activityType in MOVING_ACTIVITY_TYPES && isEnter -> {
                 activityState = ActivityState.MOVING
-                activityRecognitionHasState = true
-                lastActivityStateAt = now
                 onMovementDetected("activity_${activityName}_enter")
             }
             event.activityType == DetectedActivity.STILL && isEnter -> {
                 activityState = ActivityState.STILL
-                activityRecognitionHasState = true
-                lastActivityStateAt = now
                 maybeEnterStationaryMode(now)
             }
             event.activityType == DetectedActivity.STILL && !isEnter -> {
                 activityState = ActivityState.UNKNOWN
-                activityRecognitionHasState = true
-                lastActivityStateAt = now
                 onMovementDetected("activity_still_exit")
             }
             event.activityType in MOVING_ACTIVITY_TYPES -> {
                 activityState = ActivityState.UNKNOWN
-                activityRecognitionHasState = true
-                lastActivityStateAt = now
             }
         }
     }
@@ -527,15 +598,16 @@ class AutomaticCaptureService : Service(), SensorEventListener {
             sensorManager.cancelTriggerSensor(sensorTriggerListener, it)
         }
         unregisterMotionSensors()
+        cancelStationaryHeartbeat()
         if (activityRecognitionRegistered || activityRecognitionRequestPending) {
             runCatching { ActivityRecognition.getClient(this).removeActivityTransitionUpdates(activityRecognitionPendingIntent()) }
         }
         super.onDestroy()
     }
 
-    private enum class CaptureMode(val intervalMs: Long, val priority: Int, val notificationText: String) {
-        NORMAL(NORMAL_INTERVAL_SECONDS * 1000L, Priority.PRIORITY_HIGH_ACCURACY, "通常モード（10秒ごと）で保存中"),
-        STATIONARY(STATIONARY_INTERVAL_SECONDS * 1000L, Priority.PRIORITY_BALANCED_POWER_ACCURACY, "静止モード（5分ごと）で保存中"),
+    private enum class CaptureMode(val intervalMs: Long, val maxFixAgeMs: Long, val priority: Int, val notificationText: String) {
+        NORMAL(NORMAL_INTERVAL_SECONDS * 1000L, 30_000L, Priority.PRIORITY_HIGH_ACCURACY, "通常モード（10秒ごと）で保存中"),
+        STATIONARY(STATIONARY_INTERVAL_SECONDS * 1000L, STATIONARY_INTERVAL_SECONDS * 1000L, Priority.PRIORITY_BALANCED_POWER_ACCURACY, "静止モード（5分ごと）で保存中"),
     }
 
     private enum class ActivityState { UNKNOWN, STILL, MOVING }
@@ -546,7 +618,9 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         const val ACTION_AUTOMATIC_LOG_SAVED = "com.remo.app.ACTION_AUTOMATIC_LOG_SAVED"
         private const val ACTION_ACTIVITY_TRANSITION = "com.remo.app.ACTION_ACTIVITY_TRANSITION"
         private const val NOTIFICATION_ID = 42
+        private const val ACTION_STATIONARY_HEARTBEAT = "com.remo.app.ACTION_STATIONARY_HEARTBEAT"
         private const val ACTIVITY_RECOGNITION_REQUEST_CODE = 314
+        private const val STATIONARY_HEARTBEAT_REQUEST_CODE = 315
         private const val ACTIVITY_RECOGNITION_PERMISSION_PRE_Q = "com.google.android.gms.permission.ACTIVITY_RECOGNITION"
         private const val KEY_ENABLED = "enabled"
         private const val KEY_LAST_LOGGED_AT = "last_logged_at"
@@ -558,7 +632,9 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         private const val MAX_ACCURACY_M = 500f
         private const val STATIONARY_HISTORY_WINDOW_MS = 5 * 60 * 1000L
         private const val STATIONARY_SIGNAL_MAX_AGE_MS = 5 * 60 * 1000L
-        private const val ACTIVITY_STATE_MAX_AGE_MS = 10 * 60 * 1000L
+        private const val STATIONARY_HEARTBEAT_MS = 6 * 60 * 1000L
+        private const val CURRENT_LOCATION_TIMEOUT_MS = 30_000L
+        private const val CURRENT_LOCATION_MAX_AGE_MS = 30_000L
         private const val MOVEMENT_DISTANCE_M = 75f
         private const val MOVEMENT_SPEED_MPS = 1.2f
 
