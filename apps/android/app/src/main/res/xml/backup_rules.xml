@@ -7,4 +7,6 @@
     <exclude domain="file" path="stay-index.json" />
     <exclude domain="file" path="capture-diagnostics.jsonl" />
     <exclude domain="file" path="capture-diagnostics.jsonl.1" />
+    <exclude domain="file" path="capture-fixes.jsonl" />
+    <exclude domain="file" path="capture-fixes.jsonl.1" />
 </full-backup-content>

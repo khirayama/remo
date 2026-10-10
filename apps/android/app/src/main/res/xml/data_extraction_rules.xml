@@ -13,6 +13,8 @@
         <exclude domain="file" path="stay-index.json" />
         <exclude domain="file" path="capture-diagnostics.jsonl" />
         <exclude domain="file" path="capture-diagnostics.jsonl.1" />
+        <exclude domain="file" path="capture-fixes.jsonl" />
+        <exclude domain="file" path="capture-fixes.jsonl.1" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="rem_auth.xml" />
@@ -21,5 +23,7 @@
         <exclude domain="file" path="stay-index.json" />
         <exclude domain="file" path="capture-diagnostics.jsonl" />
         <exclude domain="file" path="capture-diagnostics.jsonl.1" />
+        <exclude domain="file" path="capture-fixes.jsonl" />
+        <exclude domain="file" path="capture-fixes.jsonl.1" />
     </device-transfer>
 </data-extraction-rules>

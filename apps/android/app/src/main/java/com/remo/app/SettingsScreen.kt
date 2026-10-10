@@ -150,7 +150,7 @@ internal fun SettingsScreen(state: SettingsState, actions: SettingsActions) {
             }
             item {
                 SettingsGroup("データ") {
-                    ActionRow(Icons.Outlined.IosShare, "JSONをエクスポート", subtitle = "期間を指定して位置と写真の情報を書き出します", trailing = { Chevron() }, onClick = actions.onExport)
+                    ActionRow(Icons.Outlined.IosShare, "JSONをエクスポート", subtitle = "期間を指定して位置と写真の情報、記録の診断ログを書き出します", trailing = { Chevron() }, onClick = actions.onExport)
                     GroupDivider()
                     ActionRow(Icons.Outlined.FileOpen, "JSONをインポート", subtitle = "書き出したファイルから記録を読み込みます", trailing = { Chevron() }, onClick = actions.onImport)
                 }

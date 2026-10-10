@@ -21,6 +21,7 @@ import android.hardware.SensorManager
 import android.hardware.TriggerEvent
 import android.hardware.TriggerEventListener
 import android.location.Location
+import android.location.LocationManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
@@ -30,6 +31,7 @@ import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import androidx.core.location.LocationManagerCompat
 import com.google.android.gms.location.ActivityRecognition
 import com.google.android.gms.location.ActivityTransition
 import com.google.android.gms.location.ActivityTransitionEvent
@@ -75,6 +77,8 @@ class AutomaticCaptureService : Service(), SensorEventListener {
     private var lastTransitionNanos = 0L
     private var lastLoggedFixElapsed: Long? = null
     private var lastLoggedEntry: LogEntry? = null
+    /** The fix before the current one, kept or not; only the fix journal uses it. */
+    private var lastSeenFix: CapturePolicy.Sample? = null
     private var requestedInterval: Long? = null
     private var requestedPriority: Int? = null
     private var locationAvailable: Boolean? = null
@@ -195,9 +199,17 @@ class AutomaticCaptureService : Service(), SensorEventListener {
     /** [origin] is where the fix came from: `updates`, `heartbeat` or `verify:<signal>`. */
     private fun handleLocation(location: Location, origin: String) {
         if (destroyed || !isEnabled(this)) return
+        // Handling the fix can change the mode; the journal names the one it arrived in.
+        val arrivedIn = mode
+        val outcome = recordLocation(location, origin)
+        logFix(location, origin, arrivedIn, outcome)
+    }
+
+    /** Returns what happened to the fix: `logged`, `merged`, or the reason it was dropped. */
+    private fun recordLocation(location: Location, origin: String): String {
         stats.received += 1
-        if (location.hasAccuracy() && (!location.accuracy.isFinite() || location.accuracy < 0f || location.accuracy > MAX_ACCURACY_M)) return stats.drop("accuracy")
-        if (!hasUsableCoordinates(location.latitude, location.longitude)) return stats.drop("coordinates")
+        if (location.hasAccuracy() && (!location.accuracy.isFinite() || location.accuracy < 0f || location.accuracy > MAX_ACCURACY_M)) return dropped("accuracy")
+        if (!hasUsableCoordinates(location.latitude, location.longitude)) return dropped("coordinates")
 
         val now = System.currentTimeMillis()
         val nowElapsed = SystemClock.elapsedRealtime()
@@ -207,7 +219,7 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         val sameFixWithBetterAccuracy = location.elapsedRealtimeNanos == lastAcceptedFixNanos && accuracy != null && accuracy < lastAcceptedAccuracy
         // The 5-minute mode gets low-power fixes that can already be minutes old on delivery;
         // rejecting them left the whole stay without a single record.
-        if (!CapturePolicy.isFreshFix(location.elapsedRealtimeNanos, SystemClock.elapsedRealtimeNanos(), if (sameFixWithBetterAccuracy) 0L else lastAcceptedFixNanos, mode.maxFixAgeMs * 1_000_000L)) return stats.drop("stale")
+        if (!CapturePolicy.isFreshFix(location.elapsedRealtimeNanos, SystemClock.elapsedRealtimeNanos(), if (sameFixWithBetterAccuracy) 0L else lastAcceptedFixNanos, mode.maxFixAgeMs * 1_000_000L)) return dropped("stale")
         lastAcceptedFixNanos = location.elapsedRealtimeNanos
         lastAcceptedFixElapsed = nowElapsed
         lastAcceptedAccuracy = accuracy ?: Float.POSITIVE_INFINITY
@@ -249,8 +261,8 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         val improvesAccuracy = previousEntry != null && accuracy != null && sinceLastLogged != null &&
             accuracy < (previousEntry.accuracyMeters ?: Double.POSITIVE_INFINITY) * 0.75 &&
             sinceLastLogged in 0..2_000L
-        if (withinInterval && !improvesAccuracy) return stats.drop("interval")
-        if (!withinInterval && sinceLastLogged != null && CapturePolicy.isRedundantCoarseFix(accuracy, previousEntry?.accuracyMeters, sinceLastLogged)) return stats.drop("coarse")
+        if (withinInterval && !improvesAccuracy) return dropped("interval")
+        if (!withinInterval && sinceLastLogged != null && CapturePolicy.isRedundantCoarseFix(accuracy, previousEntry?.accuracyMeters, sinceLastLogged)) return dropped("coarse")
         val entry = LogEntry(
                 id = if (withinInterval) previousEntry!!.id else UUID.randomUUID().toString(),
                 startedAt = location.time.takeIf { it > 0L } ?: now,
@@ -271,6 +283,36 @@ class AutomaticCaptureService : Service(), SensorEventListener {
             state.edit { putLong(KEY_LAST_LOGGED_AT, now) }
             sendBroadcast(Intent(ACTION_AUTOMATIC_LOG_SAVED).setPackage(packageName))
         }
+        return if (withinInterval) "merged" else "logged"
+    }
+
+    private fun dropped(reason: String): String {
+        stats.drop(reason)
+        return reason
+    }
+
+    /**
+     * One journal line per fix, without its coordinates. Which of speed, bearing and
+     * altitude a fix carries, and how far it lies from the fix before it, is what tells
+     * a satellite fix from a network one that still reports the place the device left.
+     */
+    private fun logFix(location: Location, origin: String, arrivedIn: CaptureMode, outcome: String) {
+        val fixElapsed = location.elapsedRealtimeNanos / 1_000_000L
+        val previous = lastSeenFix
+        lastSeenFix = CapturePolicy.Sample(fixElapsed, location.latitude, location.longitude, null)
+        CaptureDiagnostics.logFix(this, location.time.takeIf { it > 0L } ?: System.currentTimeMillis(), mapOf(
+            "r" to outcome,
+            "o" to origin,
+            "m" to arrivedIn.wireName,
+            "acc" to location.accuracy.takeIf { location.hasAccuracy() },
+            "spd" to location.speed.takeIf { location.hasSpeed() },
+            "spdAcc" to if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && location.hasSpeedAccuracy()) location.speedAccuracyMetersPerSecond else null,
+            "brg" to location.hasBearing(),
+            "alt" to location.hasAltitude(),
+            "delayMs" to SystemClock.elapsedRealtime() - fixElapsed,
+            "sincePrevMs" to previous?.let { fixElapsed - it.elapsedRealtimeMs },
+            "fromPrevM" to previous?.let { CapturePolicy.distanceMeters(it.latitude, it.longitude, location.latitude, location.longitude) },
+        ))
     }
 
     private fun observeLocation(sample: CapturePolicy.Sample) {
@@ -295,17 +337,14 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         }
         stats.evidence(evidence.reason)
 
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         enterStationaryMode(evidence, mapOf(
             "evidence" to evidence.reason,
             "samples" to evidence.sampleCount,
             "spanMs" to evidence.spanMs,
             "anchorRadiusM" to evidence.anchor?.radiusMeters,
             "activity" to activityState.name.lowercase(),
-            "screenOn" to powerManager.isInteractive,
-            "deviceIdle" to powerManager.isDeviceIdleMode,
             "sinceNormalMs" to nowElapsedRealtime - modeChangedElapsed,
-        ))
+        ) + deviceState())
     }
 
     private fun enterStationaryMode(evidence: CapturePolicy.StationaryEvidence, details: Map<String, Any?>) {
@@ -423,16 +462,14 @@ class AutomaticCaptureService : Service(), SensorEventListener {
             stats.signal("heartbeat_fix")
         } else {
             if (silentMs < NORMAL_SILENCE_MS) return maybeLogSummary(nowElapsed)
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
             stats.signal("watchdog_fix")
             diagnose("silent", mapOf(
                 "mode" to mode.wireName,
                 "silentMs" to silentMs,
                 "requestActive" to (requestedInterval != null),
                 "locationAvailable" to locationAvailable,
-                "screenOn" to powerManager.isInteractive,
-                "deviceIdle" to powerManager.isDeviceIdleMode,
-            ))
+                "locationEnabled" to isLocationEnabled(),
+            ) + deviceState())
             maybeLogSummary(nowElapsed)
             requestedInterval = null
             requestedPriority = null
@@ -593,7 +630,9 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         when (event.sensor.type) {
             Sensor.TYPE_MOTION_DETECT -> onWeakMovement("motion_detect")
             Sensor.TYPE_STEP_DETECTOR -> {
-                if (stepWindow.add(event.timestamp / 1_000_000L)) {
+                val walking = stepWindow.add(event.timestamp / 1_000_000L)
+                stats.stepRun(stepWindow.count)
+                if (walking) {
                     stepWindow.clear()
                     onStrongMovement("steps")
                 } else {
@@ -647,6 +686,31 @@ class AutomaticCaptureService : Service(), SensorEventListener {
 
     private fun diagnose(event: String, fields: Map<String, Any?> = emptyMap()) = CaptureDiagnostics.log(this, event, fields)
 
+    /**
+     * What the system may be holding back. Battery saver can switch location off while
+     * the screen is off, which looks exactly like a request that went silent.
+     */
+    private fun deviceState(): Map<String, Any?> {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val locationPowerSave = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) null else when (powerManager.locationPowerSaveMode) {
+            PowerManager.LOCATION_MODE_NO_CHANGE -> null
+            PowerManager.LOCATION_MODE_GPS_DISABLED_WHEN_SCREEN_OFF -> "gps_off_when_screen_off"
+            PowerManager.LOCATION_MODE_ALL_DISABLED_WHEN_SCREEN_OFF -> "all_off_when_screen_off"
+            PowerManager.LOCATION_MODE_FOREGROUND_ONLY -> "foreground_only"
+            PowerManager.LOCATION_MODE_THROTTLE_REQUESTS_WHEN_SCREEN_OFF -> "throttled_when_screen_off"
+            else -> "mode_${powerManager.locationPowerSaveMode}"
+        }
+        return mapOf(
+            "screenOn" to powerManager.isInteractive,
+            "deviceIdle" to powerManager.isDeviceIdleMode,
+            "powerSave" to powerManager.isPowerSaveMode,
+            "locationPowerSave" to locationPowerSave,
+        )
+    }
+
+    private fun isLocationEnabled(): Boolean =
+        LocationManagerCompat.isLocationEnabled(getSystemService(Context.LOCATION_SERVICE) as LocationManager)
+
     /** Why the previous process ended, and what this device offers for waking up from a stay. */
     private fun logServiceStart() {
         val state = preferences(this)
@@ -664,6 +728,8 @@ class AutomaticCaptureService : Service(), SensorEventListener {
             "backgroundLocation" to (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED),
             "activityRecognition" to hasActivityRecognitionPermission(),
             "batteryOptimized" to !powerManager.isIgnoringBatteryOptimizations(packageName),
+            "powerSave" to powerManager.isPowerSaveMode,
+            "locationEnabled" to isLocationEnabled(),
             "motionDetect" to sensor(Sensor.TYPE_MOTION_DETECT),
             "stepDetector" to sensor(Sensor.TYPE_STEP_DETECTOR),
             "significantMotion" to sensor(Sensor.TYPE_SIGNIFICANT_MOTION),
@@ -706,15 +772,12 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = battery?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
         val scale = battery?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         diagnose("summary", stats.fields(nowElapsed) + mapOf(
             "mode" to summarizedMode.wireName,
             "activity" to activityState.name.lowercase(),
             "batteryPct" to if (level >= 0 && scale > 0) level * 100.0 / scale else null,
             "charging" to ((battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0),
-            "screenOn" to powerManager.isInteractive,
-            "deviceIdle" to powerManager.isDeviceIdleMode,
-        ))
+        ) + deviceState())
         stats.reset(nowElapsed)
     }
 

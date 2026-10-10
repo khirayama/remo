@@ -14,11 +14,19 @@ import java.util.concurrent.Executors
  * analysed afterwards, and holds no coordinates.
  *
  * Each line is one JSON object: `{"t": <epoch ms>, "e": "<event>", ...fields}`.
+ *
+ * A second journal holds one line per fix the service received, kept or not:
+ * what the fix looked like (accuracy, speed, which of speed, bearing and
+ * altitude it carried, how late it was delivered, how far it was from the fix
+ * before it) and what happened to it. It is kept apart so that a day of fixes
+ * cannot push the decisions out of the first journal.
  */
 internal object CaptureDiagnostics {
     private const val TAG = "CaptureDiagnostics"
     private const val FILE_NAME = "capture-diagnostics.jsonl"
+    private const val FIX_FILE_NAME = "capture-fixes.jsonl"
     private const val MAX_FILE_BYTES = 1_000_000L
+    private const val MAX_FIX_FILE_BYTES = 4_000_000L
     private val writer = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "remo-capture-diagnostics").apply { isDaemon = true } }
 
     fun log(context: Context, event: String, fields: Map<String, Any?> = emptyMap()) {
@@ -28,10 +36,18 @@ internal object CaptureDiagnostics {
         writer.execute { runCatching { append(directory, line) }.onFailure { Log.w(TAG, "Unable to write diagnostics: ${it.message}") } }
     }
 
-    internal fun encode(timeMs: Long, event: String, fields: Map<String, Any?>): String {
+    /** [fixTimeMs] is the time of the fix itself, which is the `startedAt` of the record it became. */
+    fun logFix(context: Context, fixTimeMs: Long, fields: Map<String, Any?>) {
+        val line = encode(fixTimeMs, null, fields)
+        Log.d(TAG, line)
+        val directory = context.applicationContext.filesDir
+        writer.execute { runCatching { append(directory, line, FIX_FILE_NAME, MAX_FIX_FILE_BYTES) }.onFailure { Log.w(TAG, "Unable to write diagnostics: ${it.message}") } }
+    }
+
+    internal fun encode(timeMs: Long, event: String?, fields: Map<String, Any?>): String {
         val json = JSONObject()
         json.put("t", timeMs)
-        json.put("e", event)
+        event?.let { json.put("e", it) }
         fields.forEach { (name, value) ->
             when (value) {
                 null -> Unit
@@ -44,11 +60,11 @@ internal object CaptureDiagnostics {
         return json.toString()
     }
 
-    /** Keeps the newest ~2 MB: the current file and the one before it. */
-    internal fun append(directory: File, line: String) {
-        val file = File(directory, FILE_NAME)
-        if (file.length() > MAX_FILE_BYTES) {
-            val previous = File(directory, "$FILE_NAME.1")
+    /** Keeps the newest two files' worth: the current file and the one before it. */
+    internal fun append(directory: File, line: String, fileName: String = FILE_NAME, maxFileBytes: Long = MAX_FILE_BYTES) {
+        val file = File(directory, fileName)
+        if (file.length() > maxFileBytes) {
+            val previous = File(directory, "$fileName.1")
             previous.delete()
             file.renameTo(previous)
         }
@@ -56,20 +72,24 @@ internal object CaptureDiagnostics {
     }
 
     /** The journal lines recorded in [fromMs]..[toMs], oldest first. */
-    internal fun read(directory: File, fromMs: Long, toMs: Long): List<JSONObject> =
-        listOf(File(directory, "$FILE_NAME.1"), File(directory, FILE_NAME))
+    internal fun read(directory: File, fromMs: Long, toMs: Long, fileName: String = FILE_NAME): List<JSONObject> =
+        listOf(File(directory, "$fileName.1"), File(directory, fileName))
             .filter(File::isFile)
             .flatMap { file -> runCatching { file.readLines(Charsets.UTF_8) }.getOrDefault(emptyList()) }
             .mapNotNull { line -> runCatching { JSONObject(line) }.getOrNull() }
             .filter { it.optLong("t") in fromMs..toMs }
 
-    /** Writes the `captureLog` array of an export. Waits for queued lines first. */
+    /** Writes the `diagnostics` object of an export. Waits for queued lines first. */
     fun writeExport(context: Context, output: JsonWriter, fromMs: Long, toMs: Long) {
         val directory = context.applicationContext.filesDir
-        val entries = runCatching { writer.submit<List<JSONObject>> { read(directory, fromMs, toMs) }.get() }.getOrDefault(emptyList())
-        output.beginArray()
-        entries.forEach { entry -> writeValue(output, entry) }
-        output.endArray()
+        output.beginObject()
+        mapOf("captureLog" to FILE_NAME, "fixLog" to FIX_FILE_NAME).forEach { (name, fileName) ->
+            val entries = runCatching { writer.submit<List<JSONObject>> { read(directory, fromMs, toMs, fileName) }.get() }.getOrDefault(emptyList())
+            output.name(name).beginArray()
+            entries.forEach { entry -> writeValue(output, entry) }
+            output.endArray()
+        }
+        output.endObject()
     }
 
     private fun writeValue(output: JsonWriter, value: Any?) {
@@ -89,8 +109,10 @@ internal object CaptureDiagnostics {
     fun clear(context: Context) {
         val directory = context.applicationContext.filesDir
         writer.execute {
-            File(directory, FILE_NAME).delete()
-            File(directory, "$FILE_NAME.1").delete()
+            listOf(FILE_NAME, FIX_FILE_NAME).forEach { fileName ->
+                File(directory, fileName).delete()
+                File(directory, "$fileName.1").delete()
+            }
         }
     }
 

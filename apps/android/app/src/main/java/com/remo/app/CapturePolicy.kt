@@ -119,6 +119,9 @@ internal object CapturePolicy {
             return steps.size >= requiredSteps
         }
 
+        /** Steps currently inside the window: how close the run is to counting as walking. */
+        val count: Int get() = steps.size
+
         fun clear() = steps.clear()
     }
 

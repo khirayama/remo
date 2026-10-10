@@ -15,6 +15,7 @@ internal class CaptureStats {
     private val accuracies = mutableListOf<Float>()
     private val speeds = mutableListOf<Float>()
     private var maxDeliveryDelayMs = 0L
+    private var longestStepRun = 0
 
     val isEmpty: Boolean get() = received == 0 && signals.isEmpty()
 
@@ -24,6 +25,11 @@ internal class CaptureStats {
 
     /** The outcome of one stationary check; `ok` and `resumed` mean it passed. */
     fun evidence(reason: String) = count(evidence, reason)
+
+    /** [stepsInWindow] is the run the step window holds after one more step. */
+    fun stepRun(stepsInWindow: Int) {
+        longestStepRun = maxOf(longestStepRun, stepsInWindow)
+    }
 
     fun accepted(accuracyM: Float?, speedMps: Float?, deliveryDelayMs: Long) {
         accuracyM?.let(accuracies::add)
@@ -43,6 +49,7 @@ internal class CaptureStats {
         "speedMedianMps" to percentile(speeds, 0.5),
         "speedMaxMps" to speeds.maxOrNull(),
         "deliveryDelayMaxMs" to maxDeliveryDelayMs.takeIf { received > 0 },
+        "stepRunMax" to longestStepRun.takeIf { it > 0 },
     )
 
     fun reset(nowElapsed: Long) {
@@ -55,6 +62,7 @@ internal class CaptureStats {
         accuracies.clear()
         speeds.clear()
         maxDeliveryDelayMs = 0L
+        longestStepRun = 0
     }
 
     private fun count(counts: MutableMap<String, Int>, key: String) {

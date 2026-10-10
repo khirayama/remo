@@ -112,6 +112,10 @@ class CapturePolicyTest {
         assertFalse((0 until 15).map { crossingRoom.add(it * 600L) }.any { it })
         val walking = CapturePolicy.StepWindow()
         assertTrue((0 until 30).map { walking.add(it * 600L) }.last())
+        // The run the diagnostics report: steps that left the window no longer count.
+        assertEquals(15, crossingRoom.count)
+        crossingRoom.add(60_000L)
+        assertEquals(1, crossingRoom.count)
     }
 
     @Test fun freshnessUsesMonotonicMeasurementTimeAndRejectsDuplicates() {
@@ -144,15 +148,18 @@ class CapturePolicyTest {
         stats.drop("coarse")
         stats.evidence("scattered"); stats.evidence("scattered"); stats.evidence("ok")
         stats.signal("motion_detect")
+        listOf(1, 2, 12, 3).forEach(stats::stepRun)
         val fields = stats.fields(301_000L)
         assertEquals(300_000L, fields["periodMs"])
         assertEquals(mapOf("coarse" to 1), fields["dropped"])
         assertEquals(mapOf("ok" to 1, "scattered" to 2), fields["evidence"])
         assertEquals(40f, fields["accuracyMedianM"])
         assertEquals(200L, fields["deliveryDelayMaxMs"])
+        assertEquals(12, fields["stepRunMax"])
         stats.reset(301_000L)
         assertTrue(stats.isEmpty)
         assertEquals(null, stats.fields(301_000L)["dropped"])
+        assertEquals(null, stats.fields(301_000L)["stepRunMax"])
     }
 
     @Test fun diagnosticsJournalKeepsTheRequestedRangeAndRotates() {
@@ -173,6 +180,14 @@ class CapturePolicyTest {
             assertTrue(java.io.File(directory, "capture-diagnostics.jsonl.1").isFile)
             assertTrue(java.io.File(directory, "capture-diagnostics.jsonl").length() < 1_100_000L)
             assertEquals("mode", CaptureDiagnostics.read(directory, 0L, 10_000L).first().getString("e"))
+
+            // Fixes go to their own file, so they never push the decisions above out.
+            CaptureDiagnostics.append(directory, CaptureDiagnostics.encode(5_000L, null, mapOf("r" to "logged", "acc" to 18.24f, "brg" to false)), "capture-fixes.jsonl")
+            val fix = CaptureDiagnostics.read(directory, 0L, 10_000L, "capture-fixes.jsonl").single()
+            assertFalse(fix.has("e"))
+            assertEquals(18.2, fix.getDouble("acc"), 1e-9)
+            assertFalse(fix.getBoolean("brg"))
+            assertTrue(CaptureDiagnostics.read(directory, 0L, 10_000L).none { it.has("r") })
         } finally {
             directory.deleteRecursively()
         }

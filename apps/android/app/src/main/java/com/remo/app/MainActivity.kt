@@ -765,7 +765,7 @@ internal suspend fun writeTimelineExport(
     store: LogStore,
     from: String,
     to: String,
-    writeCaptureLog: ((android.util.JsonWriter, fromMs: Long, toMs: Long) -> Unit)? = null,
+    writeDiagnostics: ((android.util.JsonWriter, fromMs: Long, toMs: Long) -> Unit)? = null,
 ) {
     val writer = android.util.JsonWriter(output.bufferedWriter(Charsets.UTF_8))
     writer.setIndent("  ")
@@ -806,11 +806,10 @@ internal suspend fun writeTimelineExport(
         .name("photoRecordCount").value(photoRecordCount.toLong())
         .name("photoCount").value(photoCount.toLong())
         .endObject()
-    if (writeCaptureLog != null) {
+    if (writeDiagnostics != null) {
         // What the recording service decided and why; importers ignore it.
-        writer.name("diagnostics").beginObject().name("captureLog")
-        writeCaptureLog(writer, parseDate(from).timeInMillis, parseDate(shiftDay(to, 1)).timeInMillis - 1)
-        writer.endObject()
+        writer.name("diagnostics")
+        writeDiagnostics(writer, parseDate(from).timeInMillis, parseDate(shiftDay(to, 1)).timeInMillis - 1)
     }
     writer.endObject()
     writer.flush()
