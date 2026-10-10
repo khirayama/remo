@@ -1,0 +1,87 @@
+{
+  "activities": [
+    {
+      "kind": "stay",
+      "startedAt": 1790897411120,
+      "endedAt": 1790897932033,
+      "latitude": 33.58085,
+      "longitude": 130.38806,
+      "photoCount": 0
+    },
+    {
+      "kind": "movement",
+      "startedAt": 1790897932033,
+      "endedAt": 1790898163219,
+      "untrackedMs": 0,
+      "photoCount": 0
+    },
+    {
+      "kind": "stay",
+      "startedAt": 1790898163219,
+      "endedAt": 1790898996237,
+      "latitude": 33.58342,
+      "longitude": 130.38987,
+      "photoCount": 0
+    },
+    {
+      "kind": "movement",
+      "startedAt": 1790898996237,
+      "endedAt": 1790899216237,
+      "untrackedMs": 0,
+      "photoCount": 0
+    },
+    {
+      "kind": "stay",
+      "startedAt": 1790899216237,
+      "endedAt": 1790900074252,
+      "latitude": 33.58087,
+      "longitude": 130.38809,
+      "photoCount": 0
+    },
+    {
+      "kind": "movement",
+      "startedAt": 1790900074252,
+      "endedAt": 1790900819269,
+      "untrackedMs": 0,
+      "photoCount": 0
+    },
+    {
+      "kind": "stay",
+      "startedAt": 1790900819269,
+      "endedAt": 1790901166277,
+      "latitude": 33.58171,
+      "longitude": 130.38965,
+      "photoCount": 0
+    },
+    {
+      "kind": "movement",
+      "startedAt": 1790901166277,
+      "endedAt": 1790901582285,
+      "untrackedMs": 0,
+      "photoCount": 1
+    },
+    {
+      "kind": "stay",
+      "startedAt": 1790901582285,
+      "endedAt": 1790905746045,
+      "latitude": 33.58378,
+      "longitude": 130.39253,
+      "photoCount": 0
+    },
+    {
+      "kind": "movement",
+      "startedAt": 1790905746045,
+      "endedAt": 1790906316471,
+      "untrackedMs": 0,
+      "photoCount": 1
+    },
+    {
+      "kind": "stay",
+      "startedAt": 1790906316471,
+      "endedAt": 1790906938393,
+      "latitude": 33.58084,
+      "longitude": 130.38812,
+      "photoCount": 0
+    }
+  ]
+}

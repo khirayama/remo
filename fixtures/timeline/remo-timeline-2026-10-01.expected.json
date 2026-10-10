@@ -1,0 +1,42 @@
+{
+  "activities": [
+    {
+      "kind": "stay",
+      "startedAt": 1790800239322,
+      "endedAt": 1790812350930,
+      "latitude": 33.5807,
+      "longitude": 130.38844,
+      "photoCount": 5
+    },
+    {
+      "kind": "movement",
+      "startedAt": 1790812350930,
+      "endedAt": 1790831142827,
+      "untrackedMs": 18758978,
+      "photoCount": 0
+    },
+    {
+      "kind": "stay",
+      "startedAt": 1790831142827,
+      "endedAt": 1790831939496,
+      "latitude": 33.59049,
+      "longitude": 130.3998,
+      "photoCount": 0
+    },
+    {
+      "kind": "movement",
+      "startedAt": 1790831939496,
+      "endedAt": 1790832480535,
+      "untrackedMs": 0,
+      "photoCount": 0
+    },
+    {
+      "kind": "stay",
+      "startedAt": 1790832480535,
+      "endedAt": 1790833198425,
+      "latitude": 33.603,
+      "longitude": 130.40158,
+      "photoCount": 0
+    }
+  ]
+}
