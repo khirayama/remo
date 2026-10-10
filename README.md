@@ -39,6 +39,6 @@ just web       # http://localhost:5173
 
 ローカル確認用のタイムラインデータは [`fixtures/timeline/`](fixtures/timeline/) にあります。Web の「設定 → JSONをインポート」から `*.sample.json` をインポートして使用できます。エクスポートは開始日・終了日を指定でき、写真は画像本体ではなく撮影日時・位置・枚数のメタデータとして含まれます。
 
-エクスポートしたJSONは `python3 tools/analyze-export.py <export.json>` で、日ごとの測位数・精度・間隔・記録の欠落を確認できます。Androidのエクスポートには記録の診断ログが含まれ、モード別の時間と電池消費、滞在を終えた合図なども集計します。
+エクスポートしたJSONは `python3 tools/analyze-export.py <export.json>` で、日ごとの測位数・精度・間隔・記録の欠落を確認できます。Androidのエクスポートには記録の診断ログが含まれ、モード別の時間と電池消費、滞在を終えた合図、測位1件ごとの種類と飛びなども集計します。`just timeline-report <export.json>` は、同じJSONからTimelineが作る滞在と移動を日ごとに一覧し、日付・時間帯・出力先を付けると、記録した測位と地図に描く線をSVGに重ねて出力します。
 
 AndroidはAndroid Studioで`apps/android`を開き、iOSは`apps/ios/Remo.xcodeproj`を開いて起動します。

@@ -66,6 +66,17 @@ deploy-all:
 api-backup file='remo-db-backup.sql':
     cd apps/api && npx wrangler d1 export remo-db --remote --env production --output "{{ file }}"
 
+# Summarizes how a JSON export was recorded (fixes, holes, capture diagnostics).
+export-report file:
+    python3 tools/analyze-export.py "{{ file }}"
+
+# Lists the stays and movements the timeline builds from a JSON export. With a
+# day, a time window and an output file, also draws that window as an SVG:
+# `just timeline-report export.json 2026-10-10 11:20 11:40 out.svg`
+timeline-report file *window:
+    apps/web/node_modules/.bin/esbuild tools/timeline-report.ts --bundle --platform=node --format=esm --log-level=warning --outfile=apps/web/node_modules/.cache/timeline-report.mjs
+    node apps/web/node_modules/.cache/timeline-report.mjs "{{ file }}" {{ window }}
+
 ios-check:
     cd apps/ios && just test
 
