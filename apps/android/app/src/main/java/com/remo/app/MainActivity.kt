@@ -175,7 +175,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                 // Written a day at a time, so a year of records is never held in memory.
                 runCatching {
                     withContext(Dispatchers.IO) {
-                        context.contentResolver.openOutputStream(uri)?.use { output -> writeTimelineExport(output, store, range.first, range.second) }
+                        context.contentResolver.openOutputStream(uri)?.use { output -> writeTimelineExport(output, store, range.first, range.second) { writer, fromMs, toMs -> CaptureDiagnostics.writeExport(context, writer, fromMs, toMs) } }
                             ?: error("ファイルを開けませんでした")
                     }
                 }.onSuccess { status = "JSONを書き出しました" }
@@ -760,7 +760,13 @@ private fun refreshPhotoState(context: Context, scope: kotlinx.coroutines.Corout
 }
 
 /** Writes a Remo JSON document for the local days [from]..[to], reading one day at a time. */
-internal suspend fun writeTimelineExport(output: java.io.OutputStream, store: LogStore, from: String, to: String) {
+internal suspend fun writeTimelineExport(
+    output: java.io.OutputStream,
+    store: LogStore,
+    from: String,
+    to: String,
+    writeCaptureLog: ((android.util.JsonWriter, fromMs: Long, toMs: Long) -> Unit)? = null,
+) {
     val writer = android.util.JsonWriter(output.bufferedWriter(Charsets.UTF_8))
     writer.setIndent("  ")
     var eventCount = 0
@@ -800,6 +806,12 @@ internal suspend fun writeTimelineExport(output: java.io.OutputStream, store: Lo
         .name("photoRecordCount").value(photoRecordCount.toLong())
         .name("photoCount").value(photoCount.toLong())
         .endObject()
+    if (writeCaptureLog != null) {
+        // What the recording service decided and why; importers ignore it.
+        writer.name("diagnostics").beginObject().name("captureLog")
+        writeCaptureLog(writer, parseDate(from).timeInMillis, parseDate(shiftDay(to, 1)).timeInMillis - 1)
+        writer.endObject()
+    }
     writer.endObject()
     writer.flush()
 }

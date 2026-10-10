@@ -5,4 +5,6 @@
     <exclude domain="sharedpref" path="rem_sync.xml" />
     <exclude domain="database" path="rem_photo_index.db" />
     <exclude domain="file" path="stay-index.json" />
+    <exclude domain="file" path="capture-diagnostics.jsonl" />
+    <exclude domain="file" path="capture-diagnostics.jsonl.1" />
 </full-backup-content>

@@ -11,11 +11,15 @@
         <exclude domain="sharedpref" path="rem_sync.xml" />
         <exclude domain="database" path="rem_photo_index.db" />
         <exclude domain="file" path="stay-index.json" />
+        <exclude domain="file" path="capture-diagnostics.jsonl" />
+        <exclude domain="file" path="capture-diagnostics.jsonl.1" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="rem_auth.xml" />
         <exclude domain="sharedpref" path="rem_sync.xml" />
         <exclude domain="database" path="rem_photo_index.db" />
         <exclude domain="file" path="stay-index.json" />
+        <exclude domain="file" path="capture-diagnostics.jsonl" />
+        <exclude domain="file" path="capture-diagnostics.jsonl.1" />
     </device-transfer>
 </data-extraction-rules>

@@ -236,6 +236,7 @@ object BackupCoordinator {
     private suspend fun clearDevice(context: Context) {
         LogStore.get(context).clearAll()
         StayIndexStorage.delete(context)
+        CaptureDiagnostics.clear(context)
         PhotoLibrary.clearCache(context)
     }
 
