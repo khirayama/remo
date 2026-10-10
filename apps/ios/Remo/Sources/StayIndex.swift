@@ -21,7 +21,7 @@ extension StayCluster {
 
 // Bump whenever stay detection or the cache layout changes so every cached
 // day is recomputed.
-let stayIndexVersion = 2
+let stayIndexVersion = 3
 
 /// Derived, device-local cache of each past day's stays. It is never synced or
 /// exported and can be dropped at any time: the database records which days

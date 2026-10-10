@@ -33,6 +33,16 @@ const MAX_SPIKE_RUN_SAMPLES = 2;
 // ago. Such a fix lies far off the line between its neighbors.
 const MOVING_SPIKE_MAX_SPAN_MS = 2 * 60 * 1000;
 const MIN_MOVING_SPIKE_DISTANCE_METERS = 200;
+// A coarse fix (cell tower / Wi-Fi) between two clearly better fixes adds
+// nothing but error: its position is taken from the better fixes around it.
+const COARSE_FIX_MIN_ACCURACY_METERS = 50;
+const COARSE_FIX_NEIGHBOR_WINDOW_MS = 45 * 1000;
+// Positioning can flip to a second source that reports a place the device
+// left a moment ago, with a confident accuracy. The jump there is far faster
+// than the device was actually travelling.
+const MIN_SPEED_SPIKE_DISTANCE_METERS = 60;
+const SPEED_SPIKE_RATIO = 3;
+const SPEED_SPIKE_MARGIN_MPS = 3;
 
 export function locationEvents(events: LifeEvent[]): LocatedEvent[] {
   return positionEvents(events).filter((event) => event.source === "location");
@@ -185,6 +195,45 @@ export function correctedPositionEvents(events: LifeEvent[]): CorrectedLocation[
     });
   });
 
+  const times = locations.map((event) => timestamp(event.startedAt));
+  const position = (index: number) => corrections.get(index) ?? locations[index];
+  const interpolate = (index: number, before: number, after: number) => {
+    const from = position(before);
+    const to = position(after);
+    const ratio = (times[index] - times[before]) / (times[after] - times[before]);
+    return {
+      latitude: from.latitude + (to.latitude - from.latitude) * ratio,
+      longitude: from.longitude + (to.longitude - from.longitude) * ratio,
+    };
+  };
+
+  // Speed spikes: one or two fixes reached at a speed the surrounding path
+  // rules out. Runs in order, so each fix is judged from an already cleaned
+  // predecessor and a real fix is not blamed for the bad one before it. A
+  // single fix is tried first: taking two at once would trust the fix after
+  // them, which is the bad one when a real fix sits between two spikes.
+  for (let start = 1; start < locations.length - 1; start += 1) {
+    if (corrections.has(start)) continue;
+    for (let length = 1; length <= MAX_SPIKE_RUN_SAMPLES; length += 1) {
+      const end = start + length - 1;
+      const next = end + 1;
+      if (next >= locations.length || (length > 1 && corrections.has(end))) continue;
+      const previous = start - 1;
+      const totalGap = times[next] - times[previous];
+      const entryGap = times[start] - times[previous];
+      if (entryGap <= 0 || totalGap <= 0 || totalGap > MOVING_SPIKE_MAX_SPAN_MS) continue;
+      const bypassSpeed = distanceMeters(position(previous), position(next)) / (totalGap / 1000);
+      const entrySpeed = distanceMeters(position(previous), locations[start]) / (entryGap / 1000);
+      if (entrySpeed < Math.max(bypassSpeed * SPEED_SPIKE_RATIO, bypassSpeed + SPEED_SPIKE_MARGIN_MPS)) continue;
+      const run = Array.from({ length }, (_, offset) => start + offset);
+      const interpolated = run.map((index) => interpolate(index, previous, next));
+      if (!run.every((index, offset) => distanceMeters(locations[index], interpolated[offset])
+        >= Math.max(MIN_SPEED_SPIKE_DISTANCE_METERS, (locations[index].accuracyMeters ?? 0) * 2))) continue;
+      run.forEach((index, offset) => corrections.set(index, interpolated[offset]));
+      break;
+    }
+  }
+
   // A bad fix can be repeated for two samples. Treat a short excursion as a
   // spike only when both sides independently return to one stable cluster.
   for (let start = LOCAL_OUTLIER_WINDOW; start < locations.length - LOCAL_OUTLIER_WINDOW; start += 1) {
@@ -192,7 +241,7 @@ export function correctedPositionEvents(events: LifeEvent[]): CorrectedLocation[
     for (let length = MAX_SPIKE_RUN_SAMPLES; length >= 1; length -= 1) {
       const end = start + length - 1;
       if (end + LOCAL_OUTLIER_WINDOW >= locations.length) continue;
-      const anchor = stableLocalAnchor(locations, start, end);
+      const anchor = stableLocalAnchor(locations, start, end, position);
       if (!anchor) continue;
       const run = locations.slice(start, end + 1);
       if (!run.every((event) => distanceMeters(event, anchor) >= spikeThreshold(event))) continue;
@@ -235,6 +284,21 @@ export function correctedPositionEvents(events: LifeEvent[]): CorrectedLocation[
       run.forEach((index, offset) => corrections.set(index, interpolated[offset]));
       break;
     }
+  }
+
+  // Coarse fixes: replaced by the clearly better fixes right before and after.
+  for (let index = 1; index < locations.length - 1; index += 1) {
+    const accuracy = locations[index].accuracyMeters;
+    if (accuracy === undefined || accuracy < COARSE_FIX_MIN_ACCURACY_METERS || corrections.has(index)) continue;
+    const isBetter = (other: number) => (locations[other].accuracyMeters ?? 30) <= accuracy / 2;
+    let before = index - 1;
+    while (before >= 0 && times[index] - times[before] <= COARSE_FIX_NEIGHBOR_WINDOW_MS && !isBetter(before)) before -= 1;
+    let after = index + 1;
+    while (after < locations.length && times[after] - times[index] <= COARSE_FIX_NEIGHBOR_WINDOW_MS && !isBetter(after)) after += 1;
+    if (before < 0 || after >= locations.length) continue;
+    if (times[index] - times[before] > COARSE_FIX_NEIGHBOR_WINDOW_MS || times[after] - times[index] > COARSE_FIX_NEIGHBOR_WINDOW_MS) continue;
+    if (times[after] <= times[before]) continue;
+    corrections.set(index, interpolate(index, before, after));
   }
 
   return locations.map((event, index) => {
@@ -329,6 +393,8 @@ export type TimelineActivity =
     to: [number, number];
     path: [number, number][];
     distanceMeters: number;
+    /** Time inside this movement during which nothing was recorded. */
+    untrackedMs: number;
   };
 
 export const STAY_CLUSTER_RADIUS_METERS = 80;
@@ -361,6 +427,18 @@ const STAY_CENTER_CANDIDATES = 64;
 // really left it: the device was flipping between fixes.
 const STAY_FLIP_RADIUS_METERS = 500;
 const STAY_FLIP_SHARE = 0.2;
+// The noise rules above exist for indoor fixes. A run of confident fixes
+// that stays away from the place is the device actually leaving it.
+const DEPARTURE_MAX_ACCURACY_METERS = 30;
+const DEPARTURE_MIN_SAMPLES = 6;
+const DEPARTURE_MIN_DURATION_MS = 2 * 60 * 1000;
+// The detector takes in samples as far as its radius, so a stay would begin
+// while the device is still walking up to the place and end after it left.
+// Samples at either edge that are away from the final coordinate are movement.
+const STAY_EDGE_RADIUS_METERS = 50;
+const MAX_STAY_EDGE_TRIM_MS = 3 * 60 * 1000;
+// A movement with no sample for this long was not recorded during that time.
+export const UNTRACKED_GAP_MS = 10 * 60 * 1000;
 // Revisit history only analyzes days that came near the place.
 const STAY_HISTORY_SEARCH_RADIUS_METERS = 1000;
 
@@ -384,14 +462,20 @@ function median(values: number[]) {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
-function stableLocalAnchor(locations: LocatedEvent[], start: number, end: number): { latitude: number; longitude: number } | undefined {
+function stableLocalAnchor(
+  locations: LocatedEvent[],
+  start: number,
+  end: number,
+  position: (index: number) => { latitude: number; longitude: number },
+): { latitude: number; longitude: number } | undefined {
   if (start < LOCAL_OUTLIER_WINDOW || end + LOCAL_OUTLIER_WINDOW >= locations.length) return undefined;
   const window = locations.slice(start - LOCAL_OUTLIER_WINDOW, end + LOCAL_OUTLIER_WINDOW + 1);
   if (!window.slice(1).every((event, offset) => timestamp(event.startedAt) - timestamp(window[offset].startedAt) > 0
     && timestamp(event.startedAt) - timestamp(window[offset].startedAt) <= MAX_CORRECTION_GAP_MS)) return undefined;
+  // Neighbors that are spikes themselves count where they were corrected to.
   const anchors = [
-    ...locations.slice(start - LOCAL_OUTLIER_WINDOW, start),
-    ...locations.slice(end + 1, end + LOCAL_OUTLIER_WINDOW + 1),
+    ...Array.from({ length: LOCAL_OUTLIER_WINDOW }, (_, offset) => position(start - LOCAL_OUTLIER_WINDOW + offset)),
+    ...Array.from({ length: LOCAL_OUTLIER_WINDOW }, (_, offset) => position(end + 1 + offset)),
   ];
   const anchor = { latitude: median(anchors.map((event) => event.latitude)), longitude: median(anchors.map((event) => event.longitude)) };
   return anchors.every((event) => distanceMeters(event, anchor) <= LOCAL_NEIGHBOR_RADIUS_METERS) ? anchor : undefined;
@@ -540,7 +624,31 @@ function nearbyRuns(locations: CorrectedLocation[]): CorrectedLocation[][] {
 function isStayInterruption(before: CorrectedLocation, after: CorrectedLocation, between: CorrectedLocation[], center: { latitude: number; longitude: number }) {
   const gapMs = timestamp(after.event.startedAt) - timestamp(before.event.startedAt);
   if (gapMs > MAX_STAY_BRIDGE_GAP_MS) return false;
-  return gapMs <= MAX_STAY_EXCURSION_MS || between.every((location) => distanceMeters(center, location) <= STAY_DRIFT_RADIUS_METERS);
+  if (gapMs <= MAX_STAY_EXCURSION_MS) return true;
+  return between.every((location) => distanceMeters(center, location) <= STAY_DRIFT_RADIUS_METERS) && !isConfidentDeparture(between, center);
+}
+
+/**
+ * Whether `samples` hold a sustained run of accurate fixes away from
+ * `center`. Indoor flips come back between fixes or report a coarse accuracy.
+ */
+function isConfidentDeparture(samples: CorrectedLocation[], center: { latitude: number; longitude: number }) {
+  let count = 0;
+  let startedAt = 0;
+  for (const location of samples) {
+    const distance = distanceMeters(center, location);
+    if (distance <= STAY_CLUSTER_RADIUS_METERS) {
+      count = 0;
+      continue;
+    }
+    const accuracy = location.event.accuracyMeters;
+    if (accuracy === undefined || accuracy > DEPARTURE_MAX_ACCURACY_METERS || distance <= STAY_CLUSTER_RADIUS_METERS + accuracy) continue;
+    const time = timestamp(location.event.startedAt);
+    if (count === 0) startedAt = time;
+    count += 1;
+    if (count >= DEPARTURE_MIN_SAMPLES && time - startedAt >= DEPARTURE_MIN_DURATION_MS) return true;
+  }
+  return false;
 }
 
 /**
@@ -550,6 +658,7 @@ function isStayInterruption(before: CorrectedLocation, after: CorrectedLocation,
 function isNoiseBetweenStays(before: CorrectedLocation, after: CorrectedLocation, between: CorrectedLocation[], center: { latitude: number; longitude: number }) {
   if (isStayInterruption(before, after, between, center)) return true;
   if (timestamp(after.event.startedAt) - timestamp(before.event.startedAt) > MAX_STAY_BRIDGE_GAP_MS) return false;
+  if (isConfidentDeparture(between, center)) return false;
   const far = between.filter((location) => distanceMeters(center, location) > STAY_MERGE_DRIFT_RADIUS_METERS).length;
   return far <= Math.floor(between.length * STAY_MERGE_MAX_FAR_SHARE) || returningShare(between, center) >= STAY_FLIP_SHARE;
 }
@@ -612,6 +721,20 @@ function mergeNearbyStays(stays: StaySpan[], locations: CorrectedLocation[]): St
   return merged;
 }
 
+/** Drop the approach and the departure from the ends of a stay. */
+function trimStayEdges(stay: StaySpan, center: { latitude: number; longitude: number }, locations: CorrectedLocation[]) {
+  const isAway = (index: number) => distanceMeters(center, locations[index])
+    > Math.max(STAY_EDGE_RADIUS_METERS, Math.min(locations[index].event.accuracyMeters ?? 0, MAX_DISPLAY_ACCURACY_METERS));
+  const time = (index: number) => timestamp(locations[index].event.startedAt);
+  // The first and last sample of the day have no movement to hand samples to.
+  let start = stay.start;
+  while (start > 0 && start < stay.end && isAway(start) && time(start + 1) - time(stay.start) <= MAX_STAY_EDGE_TRIM_MS) start += 1;
+  let end = stay.end;
+  while (end < locations.length - 1 && end > start && isAway(end) && time(stay.end) - time(end - 1) <= MAX_STAY_EDGE_TRIM_MS) end -= 1;
+  // A stay too short to survive the trim keeps its detected span.
+  return isStayRun(locations.slice(start, end + 1)) ? { start, end } : { start: stay.start, end: stay.end };
+}
+
 function correctedStayClusters(locations: CorrectedLocation[]): StayCluster[] {
   const runs = nearbyRuns(locations);
   const runCenters = runs.map(locationCenter);
@@ -651,13 +774,15 @@ function correctedStayClusters(locations: CorrectedLocation[]): StayCluster[] {
     if (isStayRun(core)) stays.push({ core, start, end });
   }
 
-  return mergeNearbyStays(stays, locations).map(({ core, start, end }, index) => {
+  return mergeNearbyStays(stays, locations).map((stay, index) => {
+    const center = stayCenter(stay.core);
+    const { start, end } = trimStayEdges(stay, center, locations);
     const events = locations.slice(start, end + 1);
     const startedAt = events[0].event.startedAt;
     const endedAt = events[events.length - 1].event.startedAt;
     return {
       id: `stay:${startedAt}:${index}`,
-      ...stayCenter(core),
+      ...center,
       startedAt,
       endedAt,
       durationMs: Math.max(0, timestamp(endedAt) - timestamp(startedAt)),
@@ -819,6 +944,7 @@ export function buildTimelineActivities(events: LifeEvent[], analysis?: Timeline
             { latitude: previousLatitude, longitude: previousLongitude },
             { latitude: currentLatitude, longitude: currentLongitude },
           ),
+          untrackedMs: endedAtMs - startedAtMs >= UNTRACKED_GAP_MS ? endedAtMs - startedAtMs : 0,
         };
         const previousActivity = activities.at(-1);
         if (previousActivity?.kind === "movement" && previousActivity.endedAt === movement.startedAt) {
@@ -829,6 +955,7 @@ export function buildTimelineActivities(events: LifeEvent[], analysis?: Timeline
             to: movement.to,
             path: [...previousActivity.path, ...movement.path.slice(1)],
             distanceMeters: previousActivity.distanceMeters + movement.distanceMeters,
+            untrackedMs: previousActivity.untrackedMs + movement.untrackedMs,
           };
         } else {
           activities.push(movement);
@@ -863,6 +990,11 @@ export function buildTimelineActivities(events: LifeEvent[], analysis?: Timeline
   return merged;
 }
 
+/** Whether a movement is a hole in the record rather than a recorded trip. */
+export function isMostlyUntracked(activity: Extract<TimelineActivity, { kind: "movement" }>) {
+  return activity.untrackedMs > 0 && activity.untrackedMs * 2 >= activity.durationMs;
+}
+
 /** Joins movements that are adjacent in time order into one movement. */
 export function mergeAdjacentMovements(activities: TimelineActivity[]): TimelineActivity[] {
   const result: TimelineActivity[] = [];
@@ -877,6 +1009,7 @@ export function mergeAdjacentMovements(activities: TimelineActivity[]): Timeline
         to: activity.endedAt > previous.endedAt ? activity.to : previous.to,
         path: [...previous.path, ...activity.path.slice(1)],
         distanceMeters: previous.distanceMeters + activity.distanceMeters,
+        untrackedMs: previous.untrackedMs + activity.untrackedMs,
         photos: [...previous.photos, ...activity.photos],
       };
     } else {

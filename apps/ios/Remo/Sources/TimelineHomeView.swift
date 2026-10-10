@@ -599,8 +599,12 @@ private struct ActivityRow: View {
                     RowTitle(title: label?.primary ?? "滞在", trailing: activityDurationLabel(activity.duration))
                     if let address = label?.address, address != label?.primary { RowSubtitle(text: address) }
                 } else {
-                    RowTitle(title: "移動", trailing: activityDurationLabel(activity.duration))
-                    RowSubtitle(text: formatDistance(activity.distance))
+                    RowTitle(title: activity.isMostlyUntracked ? "記録なし" : "移動", trailing: activityDurationLabel(activity.duration))
+                    RowSubtitle(text: activity.isMostlyUntracked
+                        ? "直線距離 \(formatDistance(activity.distance))"
+                        : activity.untracked > 0
+                            ? "\(formatDistance(activity.distance))・うち記録なし \(activityDurationLabel(activity.untracked))"
+                            : formatDistance(activity.distance))
                 }
                 if !activity.photos.isEmpty {
                     PhotoStrip(entries: activity.photos, assets: assets) { onSelectPhotos(activity.photos) }

@@ -21,19 +21,22 @@ class SharedTimelineFixtureTest {
         error("fixtures/timeline/$name not found")
     }
 
-    @Test fun matchesTheActivitiesEveryPlatformExpects() {
-        val logs = decodeTimelineImport(fixture("remo-timeline-2026-09-01.sample.json").readText(), importedAt = 0L)
-        val expected = JSONObject(fixture("remo-timeline-2026-09-01.expected.json").readText()).getJSONArray("activities")
+    @Test fun matchesTheActivitiesEveryPlatformExpects() = listOf("2026-09-01", "2026-10-01", "2026-10-02").forEach(::assertMatches)
+
+    private fun assertMatches(day: String) {
+        val logs = decodeTimelineImport(fixture("remo-timeline-$day.sample.json").readText(), importedAt = 0L)
+        val expected = JSONObject(fixture("remo-timeline-$day.expected.json").readText()).getJSONArray("activities")
         val actual = buildTimelineActivities(logs)
 
-        assertEquals(expected.length(), actual.size)
+        assertEquals(day, expected.length(), actual.size)
         actual.forEachIndexed { index, activity ->
             val item = expected.getJSONObject(index)
-            val label = "activity $index"
+            val label = "$day activity $index"
             assertEquals(label, item.getString("kind"), activity.kind.name.lowercase())
             assertEquals(label, item.getLong("startedAt"), activity.startedAt)
             assertEquals(label, item.getLong("endedAt"), activity.endedAt)
             assertEquals(label, item.getInt("photoCount"), activity.photos.size)
+            if (activity.kind == TimelineActivityKind.MOVEMENT) assertEquals(label, item.getLong("untrackedMs"), activity.untrackedMs)
             if (activity.kind == TimelineActivityKind.STAY) {
                 assertEquals(label, item.getDouble("latitude"), activity.coordinate!!.latitude, 1e-5)
                 assertEquals(label, item.getDouble("longitude"), activity.coordinate!!.longitude, 1e-5)

@@ -21,7 +21,7 @@ internal fun StayCluster.summary() = StaySummary(id, coordinate.latitude, coordi
 
 // Bump whenever stay detection or the cache layout changes so every cached
 // day is recomputed.
-const val STAY_INDEX_VERSION = 2
+const val STAY_INDEX_VERSION = 3
 
 /**
  * Derived, device-local cache of each past day's stays. It is never synced or

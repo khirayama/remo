@@ -61,6 +61,9 @@ import com.google.android.gms.maps.model.LatLngBounds
 import com.google.android.gms.maps.model.MapStyleOptions
 import com.google.android.gms.maps.model.Marker
 import com.google.android.gms.maps.model.MarkerOptions
+import com.google.android.gms.maps.model.Dot
+import com.google.android.gms.maps.model.Gap
+import com.google.android.gms.maps.model.PatternItem
 import com.google.android.gms.maps.model.Polyline
 import com.google.android.gms.maps.model.PolylineOptions
 import com.google.android.gms.maps.model.RoundCap
@@ -189,12 +192,17 @@ internal fun TimelineMap(
                         val previous = routeLines.getOrNull(index)
                         if (previous == null) {
                             routeLines += path to map.addPolyline(
-                                PolylineOptions().addAll(path.points).color(path.color).width(4 * px)
+                                PolylineOptions().addAll(path.points).color(path.color).width(routeWidth(path) * px)
+                                    .pattern(routePattern(path, px))
                                     .jointType(JointType.ROUND).startCap(RoundCap()).endCap(RoundCap())
                             )
                         } else if (previous.first != path) {
                             if (previous.first.points != path.points) previous.second.points = path.points
                             if (previous.first.color != path.color) previous.second.color = path.color
+                            if (previous.first.untracked != path.untracked) {
+                                previous.second.width = routeWidth(path) * px
+                                previous.second.pattern = routePattern(path, px)
+                            }
                             routeLines[index] = path to previous.second
                         }
                     }
@@ -492,3 +500,9 @@ private fun photoMarkerIcon(context: Context, thumbnail: Bitmap?, photoCount: In
     }
     bitmap
 })
+
+private fun routeWidth(path: RouteRenderPath): Float = if (path.untracked) 3f else 4f
+
+/** Dotted where nothing was recorded, so a straight connection is not read as the route taken. */
+private fun routePattern(path: RouteRenderPath, px: Float): List<PatternItem>? =
+    if (path.untracked) listOf(Dot(), Gap(6 * px)) else null

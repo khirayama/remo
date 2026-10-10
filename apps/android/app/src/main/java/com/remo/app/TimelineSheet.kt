@@ -368,8 +368,12 @@ private fun ActivityRow(
                 RowTitle(label?.primary ?: "滞在", activityDurationLabel(activity.durationMs))
                 label?.address?.takeIf { it != label.primary }?.let { RowSubtitle(it) }
             } else {
-                RowTitle("移動", activityDurationLabel(activity.durationMs))
-                RowSubtitle(formatDistance(activity.distanceMeters))
+                RowTitle(if (activity.isMostlyUntracked) "記録なし" else "移動", activityDurationLabel(activity.durationMs))
+                RowSubtitle(when {
+                    activity.isMostlyUntracked -> "直線距離 ${formatDistance(activity.distanceMeters)}"
+                    activity.untrackedMs > 0L -> "${formatDistance(activity.distanceMeters)}・うち記録なし ${activityDurationLabel(activity.untrackedMs)}"
+                    else -> formatDistance(activity.distanceMeters)
+                })
             }
             if (activity.photos.isNotEmpty()) PhotoStrip(activity.photos, photos) { onSelectPhotos(activity.photos) }
             if (isStay && selected) {

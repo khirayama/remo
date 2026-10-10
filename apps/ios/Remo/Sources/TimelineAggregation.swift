@@ -64,6 +64,11 @@ struct TimelineActivity: Identifiable {
     let path: [CLLocationCoordinate2D]
     let distance: Double?
     let entries: [CorrectedLocation]
+    /// Time inside a movement during which nothing was recorded.
+    var untracked: TimeInterval = 0
+
+    /// Whether a movement is a hole in the record rather than a recorded trip.
+    var isMostlyUntracked: Bool { untracked > 0 && untracked * 2 >= duration }
 }
 
 struct CorrectedLocation {
@@ -127,6 +132,16 @@ private let maxSpikeRunSamples = 2
 // ago. Such a fix lies far off the line between its neighbors.
 private let movingSpikeMaxSpan: TimeInterval = 2 * 60
 private let minMovingSpikeDistanceMeters = 200.0
+// A coarse fix (cell tower / Wi-Fi) between two clearly better fixes adds
+// nothing but error: its position is taken from the better fixes around it.
+private let coarseFixMinAccuracyMeters = 50.0
+private let coarseFixNeighborWindow: TimeInterval = 45
+// Positioning can flip to a second source that reports a place the device
+// left a moment ago, with a confident accuracy. The jump there is far faster
+// than the device was actually travelling.
+private let minSpeedSpikeDistanceMeters = 60.0
+private let speedSpikeRatio = 3.0
+private let speedSpikeMarginMps = 3.0
 let stayClusterRadiusMeters = 80.0
 // Keep detection strict, but tolerate building/station-sized GPS drift when
 // grouping separate visits into a recurring place.
@@ -158,6 +173,18 @@ private let stayCenterCandidates = 64
 private let stayFlipRadiusMeters = 500.0
 private let stayFlipShare = 0.2
 // Revisit history only analyzes days that came near the place.
+// The noise rules above exist for indoor fixes. A run of confident fixes
+// that stays away from the place is the device actually leaving it.
+private let departureMaxAccuracyMeters = 30.0
+private let departureMinSamples = 6
+private let departureMinDuration: TimeInterval = 2 * 60
+// The detector takes in samples as far as its radius, so a stay would begin
+// while the device is still walking up to the place and end after it left.
+// Samples at either edge that are away from the final coordinate are movement.
+private let stayEdgeRadiusMeters = 50.0
+private let maxStayEdgeTrim: TimeInterval = 3 * 60
+// A movement with no sample for this long was not recorded during that time.
+let untrackedGap: TimeInterval = 10 * 60
 private let stayHistorySearchRadiusMeters = 1000.0
 
 private func distanceMeters(_ from: LogEntry, _ to: LogEntry) -> Double {
@@ -186,22 +213,20 @@ private func median(_ values: [Double]) -> Double {
     values.sorted()[values.count / 2]
 }
 
-private func stableLocalAnchor(_ logs: [LogEntry], start: Int, end: Int) -> CLLocationCoordinate2D? {
+private func stableLocalAnchor(_ logs: [LogEntry], start: Int, end: Int, position: (Int) -> CLLocationCoordinate2D) -> CLLocationCoordinate2D? {
     guard start >= localOutlierWindow, end + localOutlierWindow < logs.count else { return nil }
     let window = Array(logs[(start - localOutlierWindow)...(end + localOutlierWindow)])
     guard zip(window, window.dropFirst()).allSatisfy({ pair in
         let gap = pair.1.startedAt.timeIntervalSince(pair.0.startedAt)
         return gap > 0 && gap <= maxCorrectionGap
     }) else { return nil }
-    let anchors = Array(logs[(start - localOutlierWindow)..<start]) + Array(logs[(end + 1)...(end + localOutlierWindow)])
+    // Neighbors that are spikes themselves count where they were corrected to.
+    let anchors = (Array((start - localOutlierWindow)..<start) + Array((end + 1)...(end + localOutlierWindow))).map(position)
     let coordinate = CLLocationCoordinate2D(
-        latitude: median(anchors.compactMap(\.latitude)),
-        longitude: median(anchors.compactMap(\.longitude)),
+        latitude: median(anchors.map(\.latitude)),
+        longitude: median(anchors.map(\.longitude)),
     )
-    guard anchors.allSatisfy({ entry in
-        guard let latitude = entry.latitude, let longitude = entry.longitude else { return false }
-        return distanceMeters(CLLocationCoordinate2D(latitude: latitude, longitude: longitude), coordinate) <= localNeighborRadiusMeters
-    }) else { return nil }
+    guard anchors.allSatisfy({ distanceMeters($0, coordinate) <= localNeighborRadiusMeters }) else { return nil }
     return coordinate
 }
 
@@ -309,6 +334,60 @@ func correctedPositionLogs(_ logs: [LogEntry]) -> [CorrectedLocation] {
         }
     }
 
+    func position(_ index: Int) -> CLLocationCoordinate2D {
+        if let correction = corrections[index] { return CLLocationCoordinate2D(latitude: correction.latitude, longitude: correction.longitude) }
+        return CLLocationCoordinate2D(latitude: locations[index].latitude!, longitude: locations[index].longitude!)
+    }
+    func interpolate(_ index: Int, _ before: Int, _ after: Int) -> (latitude: Double, longitude: Double) {
+        let from = position(before)
+        let to = position(after)
+        let ratio = locations[index].startedAt.timeIntervalSince(locations[before].startedAt)
+            / locations[after].startedAt.timeIntervalSince(locations[before].startedAt)
+        return (
+            latitude: from.latitude + (to.latitude - from.latitude) * ratio,
+            longitude: from.longitude + (to.longitude - from.longitude) * ratio
+        )
+    }
+
+    // Speed spikes: one or two fixes reached at a speed the surrounding path
+    // rules out. Runs in order, so each fix is judged from an already cleaned
+    // predecessor and a real fix is not blamed for the bad one before it. A
+    // single fix is tried first: taking two at once would trust the fix after
+    // them, which is the bad one when a real fix sits between two spikes.
+    if locations.count >= 3 {
+        for start in 1..<(locations.count - 1) {
+            if corrections[start] != nil { continue }
+            for length in 1...maxSpikeRunSamples {
+                let end = start + length - 1
+                let next = end + 1
+                if next >= locations.count || (length > 1 && corrections[end] != nil) { continue }
+                let previous = start - 1
+                let totalGap = locations[next].startedAt.timeIntervalSince(locations[previous].startedAt)
+                let entryGap = locations[start].startedAt.timeIntervalSince(locations[previous].startedAt)
+                guard entryGap > 0, totalGap > 0, totalGap <= movingSpikeMaxSpan else { continue }
+                let bypassSpeed = distanceMeters(position(previous), position(next)) / totalGap
+                let entrySpeed = distanceMeters(
+                    position(previous),
+                    CLLocationCoordinate2D(latitude: locations[start].latitude!, longitude: locations[start].longitude!),
+                ) / entryGap
+                if entrySpeed < max(bypassSpeed * speedSpikeRatio, bypassSpeed + speedSpikeMarginMps) { continue }
+                let run = Array(start...end)
+                let interpolated = run.map { interpolate($0, previous, next) }
+                let offPath = zip(run, interpolated).allSatisfy { index, point in
+                    let entry = locations[index]
+                    let deviation = distanceMeters(
+                        CLLocationCoordinate2D(latitude: entry.latitude!, longitude: entry.longitude!),
+                        CLLocationCoordinate2D(latitude: point.latitude, longitude: point.longitude),
+                    )
+                    return deviation >= max(minSpeedSpikeDistanceMeters, (entry.accuracyMeters ?? 0) * 2)
+                }
+                guard offPath else { continue }
+                for (index, point) in zip(run, interpolated) { corrections[index] = point }
+                break
+            }
+        }
+    }
+
     // A bad fix can be repeated for two samples. Treat a short excursion as a
     // spike only when both sides independently return to one stable cluster.
     if locations.count > localOutlierWindow * 2 {
@@ -317,7 +396,7 @@ func correctedPositionLogs(_ logs: [LogEntry]) -> [CorrectedLocation] {
             for length in stride(from: maxSpikeRunSamples, through: 1, by: -1) {
                 let end = start + length - 1
                 if end + localOutlierWindow >= locations.count { continue }
-                guard let anchor = stableLocalAnchor(locations, start: start, end: end) else { continue }
+                guard let anchor = stableLocalAnchor(locations, start: start, end: end, position: position) else { continue }
                 let run = locations[start...end]
                 guard run.allSatisfy({ entry in
                     guard let latitude = entry.latitude, let longitude = entry.longitude else { return false }
@@ -371,6 +450,24 @@ func correctedPositionLogs(_ logs: [LogEntry]) -> [CorrectedLocation] {
                 for (index, point) in zip(run, interpolated) { corrections[index] = point }
                 break
             }
+        }
+    }
+
+    // Coarse fixes: replaced by the clearly better fixes right before and after.
+    if locations.count >= 3 {
+        for index in 1..<(locations.count - 1) {
+            guard let accuracy = locations[index].accuracyMeters, accuracy >= coarseFixMinAccuracyMeters, corrections[index] == nil else { continue }
+            let time = locations[index].startedAt
+            func isBetter(_ other: Int) -> Bool { (locations[other].accuracyMeters ?? 30) <= accuracy / 2 }
+            var before = index - 1
+            while before >= 0, time.timeIntervalSince(locations[before].startedAt) <= coarseFixNeighborWindow, !isBetter(before) { before -= 1 }
+            var after = index + 1
+            while after < locations.count, locations[after].startedAt.timeIntervalSince(time) <= coarseFixNeighborWindow, !isBetter(after) { after += 1 }
+            guard before >= 0, after < locations.count else { continue }
+            guard time.timeIntervalSince(locations[before].startedAt) <= coarseFixNeighborWindow,
+                  locations[after].startedAt.timeIntervalSince(time) <= coarseFixNeighborWindow,
+                  locations[after].startedAt > locations[before].startedAt else { continue }
+            corrections[index] = interpolate(index, before, after)
         }
     }
 
@@ -550,7 +647,28 @@ private func nearbyRuns(_ locations: [CorrectedLocation]) -> [[CorrectedLocation
 private func isStayInterruption(before: CorrectedLocation, after: CorrectedLocation, between: [CorrectedLocation], center: CLLocationCoordinate2D) -> Bool {
     let gap = after.entry.startedAt.timeIntervalSince(before.entry.startedAt)
     if gap > maxStayBridgeGap { return false }
-    return gap <= maxStayExcursion || between.allSatisfy { distanceMeters(center, $0.coordinate) <= stayDriftRadiusMeters }
+    if gap <= maxStayExcursion { return true }
+    return between.allSatisfy { distanceMeters(center, $0.coordinate) <= stayDriftRadiusMeters } && !isConfidentDeparture(between, center: center)
+}
+
+/// Whether `samples` hold a sustained run of accurate fixes away from
+/// `center`. Indoor flips come back between fixes or report a coarse accuracy.
+private func isConfidentDeparture(_ samples: [CorrectedLocation], center: CLLocationCoordinate2D) -> Bool {
+    var count = 0
+    var startedAt = Date.distantPast
+    for location in samples {
+        let distance = distanceMeters(center, location.coordinate)
+        if distance <= stayClusterRadiusMeters {
+            count = 0
+            continue
+        }
+        guard let accuracy = location.entry.accuracyMeters, accuracy <= departureMaxAccuracyMeters,
+              distance > stayClusterRadiusMeters + accuracy else { continue }
+        if count == 0 { startedAt = location.entry.startedAt }
+        count += 1
+        if count >= departureMinSamples && location.entry.startedAt.timeIntervalSince(startedAt) >= departureMinDuration { return true }
+    }
+    return false
 }
 
 /// The looser test between two detected stays: mostly nearby fixes, or fixes
@@ -558,6 +676,7 @@ private func isStayInterruption(before: CorrectedLocation, after: CorrectedLocat
 private func isNoiseBetweenStays(before: CorrectedLocation, after: CorrectedLocation, between: [CorrectedLocation], center: CLLocationCoordinate2D) -> Bool {
     if isStayInterruption(before: before, after: after, between: between, center: center) { return true }
     if after.entry.startedAt.timeIntervalSince(before.entry.startedAt) > maxStayBridgeGap { return false }
+    if isConfidentDeparture(between, center: center) { return false }
     let far = between.filter { distanceMeters(center, $0.coordinate) > stayMergeDriftRadiusMeters }.count
     return far <= Int(Double(between.count) * stayMergeMaxFarShare) || returningShare(between, center: center) >= stayFlipShare
 }
@@ -625,6 +744,22 @@ private func mergeNearbyStays(_ stays: [StaySpan], locations: [CorrectedLocation
     return merged
 }
 
+/// Drop the approach and the departure from the ends of a stay.
+private func trimStayEdges(_ stay: StaySpan, center: CLLocationCoordinate2D, locations: [CorrectedLocation]) -> ClosedRange<Int> {
+    func isAway(_ index: Int) -> Bool {
+        distanceMeters(center, locations[index].coordinate)
+            > max(stayEdgeRadiusMeters, min(locations[index].entry.accuracyMeters ?? 0, maxDisplayAccuracyMeters))
+    }
+    func time(_ index: Int) -> Date { locations[index].entry.startedAt }
+    // The first and last sample of the day have no movement to hand samples to.
+    var start = stay.start
+    while start > 0, start < stay.end, isAway(start), time(start + 1).timeIntervalSince(time(stay.start)) <= maxStayEdgeTrim { start += 1 }
+    var end = stay.end
+    while end < locations.count - 1, end > start, isAway(end), time(stay.end).timeIntervalSince(time(end - 1)) <= maxStayEdgeTrim { end -= 1 }
+    // A stay too short to survive the trim keeps its detected span.
+    return isStayRun(Array(locations[start...end])) ? start...end : stay.start...stay.end
+}
+
 private func correctedStayClusters(_ locations: [CorrectedLocation]) -> [StayCluster] {
     let runs = nearbyRuns(locations)
     let runCenters = runs.map(locationCenter)
@@ -671,12 +806,13 @@ private func correctedStayClusters(_ locations: [CorrectedLocation]) -> [StayClu
     }
 
     return mergeNearbyStays(stays, locations: locations).enumerated().map { index, stay in
-        let entries = Array(locations[stay.start...stay.end])
+        let center = stayCenter(stay.core)
+        let entries = Array(locations[trimStayEdges(stay, center: center, locations: locations)])
         let startedAt = entries[0].entry.startedAt
         let endedAt = entries[entries.count - 1].entry.startedAt
         return StayCluster(
             id: "stay:\(startedAt.timeIntervalSince1970):\(index)",
-            coordinate: stayCenter(stay.core),
+            coordinate: center,
             startedAt: startedAt,
             endedAt: endedAt,
             duration: max(0, endedAt.timeIntervalSince(startedAt)),
@@ -793,6 +929,7 @@ func buildTimelineActivities(_ logs: [LogEntry], analysis: TimelineAnalysis? = n
                     path: [previous.coordinate, node.coordinate],
                     distance: distanceMeters(previous.coordinate, node.coordinate),
                     entries: [],
+                    untracked: duration >= untrackedGap ? duration : 0,
                 )
                 if let previousMovement = activities.last, previousMovement.kind == .movement,
                    previousMovement.endedAt == movement.startedAt {
@@ -809,6 +946,7 @@ func buildTimelineActivities(_ logs: [LogEntry], analysis: TimelineAnalysis? = n
                         path: previousMovement.path + Array(movement.path.dropFirst()),
                         distance: (previousMovement.distance ?? 0) + (movement.distance ?? 0),
                         entries: [],
+                        untracked: previousMovement.untracked + movement.untracked,
                     )
                 } else {
                     activities.append(movement)
@@ -879,6 +1017,7 @@ func mergeAdjacentMovements(_ activities: [TimelineActivity]) -> [TimelineActivi
                 path: previous.path + Array(activity.path.dropFirst()),
                 distance: (previous.distance ?? 0) + (activity.distance ?? 0),
                 entries: [],
+                untracked: previous.untracked + activity.untracked,
             )
         } else {
             result.append(activity)

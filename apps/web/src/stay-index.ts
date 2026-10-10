@@ -6,7 +6,7 @@ export type StaySummary = StayVisit;
 
 // Bump whenever stay detection or the cache layout changes so every cached
 // day is recomputed.
-export const STAY_INDEX_VERSION = 2;
+export const STAY_INDEX_VERSION = 3;
 
 /**
  * Derived, device-local cache of each past day's stays. It is never synced or

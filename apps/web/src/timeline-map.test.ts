@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import timelineFixture from "../../../fixtures/timeline/remo-timeline-2026-09-01.sample.json";
 import { LifeEvent } from "./life-log";
-import { buildMovementSegments, buildRawRouteSegments, buildStayClusters, buildStayPlaces, buildStayVisitHistory, buildTimelineActivities, clusterPhotoEvents, mergeAdjacentMovements, correctedLocationEvents, displayPhotoEvents, distanceMeters, PHOTO_CLUSTER_RADIUS_METERS, routeOpacity, STAY_CLUSTER_RADIUS_METERS, stayCircleRadiusMeters, suggestPhotoLocation } from "./timeline-map";
+import { buildMovementSegments, buildRawRouteSegments, buildStayClusters, buildStayPlaces, buildStayVisitHistory, buildTimelineActivities, clusterPhotoEvents, isMostlyUntracked, mergeAdjacentMovements, correctedLocationEvents, displayPhotoEvents, distanceMeters, PHOTO_CLUSTER_RADIUS_METERS, routeOpacity, STAY_CLUSTER_RADIUS_METERS, stayCircleRadiusMeters, suggestPhotoLocation, UNTRACKED_GAP_MS } from "./timeline-map";
 
 function event(overrides: Partial<LifeEvent> = {}): LifeEvent {
   return {
@@ -29,7 +29,7 @@ describe("map timeline", () => {
   it("joins movements that end up next to each other", () => {
     const movement = (id: string, startedAt: string, endedAt: string, to: [number, number]) => ({
       kind: "movement" as const, id, startedAt, endedAt, durationMs: Date.parse(endedAt) - Date.parse(startedAt),
-      photos: [], from: [35, 139] as [number, number], to, path: [[35, 139], to] as [number, number][], distanceMeters: 100,
+      photos: [], from: [35, 139] as [number, number], to, path: [[35, 139], to] as [number, number][], distanceMeters: 100, untrackedMs: 0,
     });
     const merged = mergeAdjacentMovements([
       movement("m1", "2026-08-31T01:00:00.000Z", "2026-08-31T01:10:00.000Z", [35.1, 139]),
@@ -565,5 +565,91 @@ describe("map timeline", () => {
     ]);
     expect(history.dayCount).toBe(2);
     expect(history.totalDurationMs).toBe(3 * 20 * 60 * 1000);
+  });
+
+  /** A walk north at about 1.4 m/s: one accurate fix every 10 seconds. */
+  function walk(prefix: string, start: string, count: number, fromLatitude = 35.6812, overrides: Partial<LifeEvent> = {}): LifeEvent[] {
+    return samples(prefix, start, count, 10, { accuracyMeters: 10, ...overrides })
+      .map((sample, index) => ({ ...sample, latitude: fromLatitude + index * 0.000126 }));
+  }
+
+  it("removes stale fixes that jump back along a walk and keeps the real fix between them", () => {
+    const events = walk("walk", "2026-08-31T01:00:00.000Z", 12);
+    // Two confident fixes report where the walker was a minute ago.
+    events[5] = { ...events[5], latitude: events[0].latitude };
+    events[7] = { ...events[7], latitude: events[1].latitude };
+    const corrected = correctedLocationEvents(events);
+
+    expect(corrected.filter((location) => location.corrected).map((location) => location.event.id)).toEqual(["walk-5", "walk-7"]);
+    expect(corrected[6]).toMatchObject({ corrected: false, latitude: events[6].latitude });
+    // The cleaned path only moves forward.
+    corrected.slice(1).forEach((location, index) => expect(location.latitude).toBeGreaterThan(corrected[index].latitude));
+  });
+
+  it("keeps a real acceleration and a turn at speed", () => {
+    const stopped = samples("stop", "2026-08-31T01:00:00.000Z", 4, 10, { accuracyMeters: 10 });
+    // 15 m/s north, then east: fast, but each fix continues from the last one.
+    const driving = samples("drive", "2026-08-31T01:00:40.000Z", 8, 10, { accuracyMeters: 10 })
+      .map((sample, index) => index < 4
+        ? { ...sample, latitude: 35.6812 + (index + 1) * 0.00135 }
+        : { ...sample, latitude: 35.6812 + 4 * 0.00135, longitude: 139.7671 + (index - 3) * 0.00166 });
+    expect(correctedLocationEvents([...stopped, ...driving]).some((location) => location.corrected)).toBe(false);
+  });
+
+  it("places a coarse fix between the clearly better fixes around it", () => {
+    const events = walk("walk", "2026-08-31T01:00:00.000Z", 7);
+    events[3] = { ...events[3], latitude: 35.6812 + 3 * 0.000126 - 0.0004, accuracyMeters: 90 };
+    const corrected = correctedLocationEvents(events);
+
+    expect(corrected[3].corrected).toBe(true);
+    expect(corrected[3].latitude).toBeCloseTo(35.6812 + 3 * 0.000126, 6);
+    // Without a better fix nearby in time the coarse fix is all there is.
+    const alone = [events[0], { ...events[3], startedAt: "2026-08-31T01:05:00.000Z" }, { ...events[6], startedAt: "2026-08-31T01:10:00.000Z" }];
+    expect(correctedLocationEvents(alone)[1].corrected).toBe(false);
+  });
+
+  it("ends a stay when accurate fixes walk away, even if they come back nearby", () => {
+    const home = samples("home", "2026-08-31T01:00:00.000Z", 40, 15, { accuracyMeters: 30 });
+    // Ten minutes around the block (a 250 m wide loop) with GPS-quality fixes.
+    const out = samples("out", "2026-08-31T01:10:00.000Z", 60, 10, { accuracyMeters: 10 })
+      .map((sample, index) => {
+        const angle = 2 * Math.PI * index / 60;
+        return { ...sample, latitude: 35.6812 + 125 * (1 - Math.cos(angle)) / 111_000, longitude: 139.7671 + 125 * Math.sin(angle) / 90_000 };
+      });
+    const back = samples("back", "2026-08-31T01:20:00.000Z", 40, 15, { accuracyMeters: 30 });
+
+    const activities = buildTimelineActivities([...home, ...out, ...back]);
+    expect(activities.map((activity) => activity.kind)).toEqual(["stay", "movement", "stay"]);
+
+    // The same wandering reported by coarse indoor fixes is positioning noise.
+    const noisy = out.map((sample) => ({ ...sample, accuracyMeters: 60 }));
+    expect(buildTimelineActivities([...home, ...noisy, ...back]).map((activity) => activity.kind)).toEqual(["stay"]);
+  });
+
+  it("starts a stay on arrival instead of during the approach", () => {
+    // Walking up to the place: the last fixes of the walk are within the stay radius.
+    const approach = walk("approach", "2026-08-31T01:00:00.000Z", 20, 35.6812 - 20 * 0.000126);
+    const stay = samples("stay", "2026-08-31T01:03:20.000Z", 40, 15, { accuracyMeters: 10 });
+    const [first] = buildStayClusters([...approach, ...stay]);
+
+    expect(first.events[0].event.id.startsWith("approach")).toBe(true);
+    // Only the fixes within 50 m of the place belong to the stay.
+    expect(distanceMeters(first, first.events[0])).toBeLessThanOrEqual(50);
+    expect(first.events.length).toBeLessThan(approach.length + stay.length);
+    expect(Date.parse(first.startedAt)).toBeGreaterThanOrEqual(Date.parse("2026-08-31T01:02:30.000Z"));
+  });
+
+  it("marks a movement across a recording hole as untracked", () => {
+    const morning = samples("morning", "2026-08-31T01:00:00.000Z", 40, 15, { accuracyMeters: 10 });
+    const afternoon = samples("afternoon", "2026-08-31T07:00:00.000Z", 40, 15, { accuracyMeters: 10, latitude: 35.70 });
+    const activities = buildTimelineActivities([...morning, ...afternoon]);
+    const movement = activities.find((activity) => activity.kind === "movement");
+
+    expect(movement).toMatchObject({ untrackedMs: movement!.durationMs });
+    expect(movement?.kind === "movement" && isMostlyUntracked(movement)).toBe(true);
+    expect(buildMovementSegments([...morning, ...afternoon]).filter((segment) => segment.gapMs >= UNTRACKED_GAP_MS)).toHaveLength(1);
+
+    const walked = buildTimelineActivities(walk("walk", "2026-08-31T01:00:00.000Z", 30)).find((activity) => activity.kind === "movement");
+    expect(walked).toMatchObject({ untrackedMs: 0 });
   });
 });

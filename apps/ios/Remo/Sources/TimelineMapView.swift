@@ -116,6 +116,7 @@ struct TimelineMapView: UIViewRepresentable {
             let dimmed = focus != nil
             for path in routeRenderPaths(snapshot.routeSegments, dimmed: dimmed) {
                 let line = RoutePolyline(coordinates: path.points, count: path.points.count)
+                line.untracked = path.untracked
                 line.alpha = path.alpha
                 map.addOverlay(line, level: .aboveRoads)
             }
@@ -242,7 +243,9 @@ struct TimelineMapView: UIViewRepresentable {
             if let line = overlay as? RoutePolyline {
                 let renderer = MKPolylineRenderer(polyline: line)
                 renderer.strokeColor = line.isFocus ? RemoMapColor.focusRoute : RemoMapColor.route.withAlphaComponent(line.alpha)
-                renderer.lineWidth = line.isFocus ? 6 : 4
+                renderer.lineWidth = line.isFocus ? 6 : line.untracked ? 3 : 4
+                // Dotted where nothing was recorded, so a straight connection is not read as the route taken.
+                if line.untracked { renderer.lineDashPattern = [0, 8] }
                 renderer.lineCap = .round
                 renderer.lineJoin = .round
                 return renderer
@@ -390,6 +393,8 @@ func fitMap(_ map: MKMapView, to coordinates: [CLLocationCoordinate2D], insets: 
 struct RouteRenderPath {
     let points: [CLLocationCoordinate2D]
     let alpha: CGFloat
+    /// Only connects two known points: nothing was recorded along it.
+    var untracked = false
 }
 
 /// Join only adjacent segments with the exact same rendered alpha. No points are simplified.
@@ -397,17 +402,20 @@ func routeRenderPaths(_ segments: [RouteSegment], dimmed: Bool) -> [RouteRenderP
     var result: [RouteRenderPath] = []
     var points: [CLLocationCoordinate2D] = []
     var previousAlpha: CGFloat?
+    var previousUntracked = false
     for segment in segments {
+        let untracked = segment.gap >= untrackedGap
         let alpha = (CGFloat(dimmed ? segment.opacity * 0.2 : segment.opacity) * 255).rounded(.down) / 255
         let continues = points.last.map { $0.latitude == segment.from.latitude && $0.longitude == segment.from.longitude } ?? false
-        if alpha != previousAlpha || !continues {
-            if let previousAlpha, !points.isEmpty { result.append(RouteRenderPath(points: points, alpha: previousAlpha)) }
+        if alpha != previousAlpha || untracked != previousUntracked || !continues {
+            if let previousAlpha, !points.isEmpty { result.append(RouteRenderPath(points: points, alpha: previousAlpha, untracked: previousUntracked)) }
             points = [segment.from]
         }
         points.append(segment.to)
         previousAlpha = alpha
+        previousUntracked = untracked
     }
-    if let previousAlpha, !points.isEmpty { result.append(RouteRenderPath(points: points, alpha: previousAlpha)) }
+    if let previousAlpha, !points.isEmpty { result.append(RouteRenderPath(points: points, alpha: previousAlpha, untracked: previousUntracked)) }
     return result
 }
 
@@ -416,6 +424,7 @@ func routeRenderPaths(_ segments: [RouteSegment], dimmed: Bool) -> [RouteRenderP
 private final class RoutePolyline: MKPolyline {
     var alpha: CGFloat = 1
     var isFocus = false
+    var untracked = false
 }
 
 private final class StayCircle: MKCircle {

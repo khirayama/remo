@@ -8,7 +8,7 @@ import { clearDirtyDays, countEvents, deleteLocalEvents, listRecordedDays, loadD
 import { readPhotoMetadata } from "./photo-metadata";
 import { deleteAllPhotoPreviews, deletePhotoPreview, listLocalPhotoPreviewIds, loadPhotoPreview, makePhotoThumbnail, migratePhotoPreviews, savePhotoPreview } from "./photo-storage";
 import { loadRemotePhotoPreview, loadRemotePhotoPreviews, uploadPhotoPreview } from "./photo-api";
-import { buildTimelineSnapshot, distanceMeters, PHOTO_LOCATION_SUGGESTION_WINDOW_MS, PhotoCluster, StayCluster, StayPlace, StayVisit, StayVisitHistory, STAY_PLACE_RADIUS_METERS, TimelineActivity, TimelineRenderSnapshot, stayCircleRadiusMeters, suggestPhotoLocation } from "./timeline-map";
+import { buildTimelineSnapshot, distanceMeters, PHOTO_LOCATION_SUGGESTION_WINDOW_MS, PhotoCluster, StayCluster, StayPlace, StayVisit, StayVisitHistory, STAY_PLACE_RADIUS_METERS, TimelineActivity, TimelineRenderSnapshot, UNTRACKED_GAP_MS, isMostlyUntracked, stayCircleRadiusMeters, suggestPhotoLocation } from "./timeline-map";
 import { allStays, AllTimeStayPlace, buildAllTimeStayPlaces, detectDayStays, historyOf, parseStayIndexCache, refreshStayIndex, StayIndexCache, StaySummary, stayVisitHistoryFromStays } from "./stay-index";
 import { deleteStayIndexCache, loadStayIndexCache, saveStayIndexCache } from "./stay-index-storage";
 import { isFreshFix, isStationary } from "./capture-policy";
@@ -319,7 +319,11 @@ function LeafletMap({ timeline, previews, viewKey, focus, currentLocation, place
     layer.clearLayers();
     let popupToRestore: L.Layer | undefined;
     const dimmed = Boolean(focus);
-    movementSegments.forEach((segment) => L.polyline([segment.from, segment.to], { color: ROUTE_COLOR, weight: 4, opacity: dimmed ? segment.opacity * 0.2 : segment.opacity, lineCap: "round", lineJoin: "round", interactive: false }).addTo(layer));
+    movementSegments.forEach((segment) => {
+      // Nothing was recorded along this segment: it only connects two known points.
+      const untracked = segment.gapMs >= UNTRACKED_GAP_MS;
+      L.polyline([segment.from, segment.to], { color: ROUTE_COLOR, weight: untracked ? 2 : 4, dashArray: untracked ? "2 8" : undefined, opacity: dimmed ? segment.opacity * 0.2 : segment.opacity, lineCap: "round", lineJoin: "round", interactive: false }).addTo(layer);
+    });
     stayClusters.forEach((stay) => {
       const selected = focus?.kind === "stay" && focus.activityId === stay.id;
       const circle = L.circle([stay.latitude, stay.longitude], {
@@ -521,8 +525,10 @@ function ActivityRow({ activity, placeName, isFirst, isLast, selected, previews,
   const stay = activity.kind === "stay";
   return <TimelineRow startedAt={activity.startedAt} endedAt={activity.endedAt} isFirst={isFirst} isLast={isLast} badge={stay ? <IconBadge name="place" tone="green"/> : <IconBadge name="route" tone="teal"/>}>
     <div className={`row-card ${activity.kind}${selected ? " selected" : ""}`} role="button" tabIndex={0} aria-pressed={selected} onClick={onFocus} onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); onFocus(); } }}>
-      <RowTitle title={stay ? placeName ?? "滞在" : "移動"} trailing={activityDurationLabel(activity.durationMs)}/>
-      {!stay && <span className="row-subtitle">{formatDistance(activity.distanceMeters)}</span>}
+      <RowTitle title={stay ? placeName ?? "滞在" : isMostlyUntracked(activity) ? "記録なし" : "移動"} trailing={activityDurationLabel(activity.durationMs)}/>
+      {!stay && <span className="row-subtitle">{isMostlyUntracked(activity)
+        ? `直線距離 ${formatDistance(activity.distanceMeters)}`
+        : activity.untrackedMs > 0 ? `${formatDistance(activity.distanceMeters)}・うち記録なし ${activityDurationLabel(activity.untrackedMs)}` : formatDistance(activity.distanceMeters)}</span>}
       {activity.photos.length > 0 && <PhotoStrip entries={activity.photos} previews={previews} onOpen={() => onSelectPhotos(activity.photos)}/>}
       {stay && selected && <button type="button" className="text-button row-card-action" onClick={(event) => { event.stopPropagation(); onOpenHistory(); }}><Icon name="restore" size={18}/>この場所の訪問履歴</button>}
     </div>

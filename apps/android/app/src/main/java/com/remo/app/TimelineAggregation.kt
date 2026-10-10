@@ -69,7 +69,12 @@ data class TimelineActivity(
     val path: List<LatLng> = emptyList(),
     val distanceMeters: Double? = null,
     val entries: List<CorrectedLocation> = emptyList(),
-)
+    /** Time inside a movement during which nothing was recorded. */
+    val untrackedMs: Long = 0L,
+) {
+    /** Whether a movement is a hole in the record rather than a recorded trip. */
+    val isMostlyUntracked: Boolean get() = untrackedMs > 0L && untrackedMs * 2 >= durationMs
+}
 
 data class CorrectedLocation(
     val entry: LogEntry,
@@ -98,6 +103,16 @@ private const val MAX_SPIKE_RUN_SAMPLES = 2
 // ago. Such a fix lies far off the line between its neighbors.
 private const val MOVING_SPIKE_MAX_SPAN_MS = 2 * 60 * 1000L
 private const val MIN_MOVING_SPIKE_DISTANCE_METERS = 200.0
+// A coarse fix (cell tower / Wi-Fi) between two clearly better fixes adds
+// nothing but error: its position is taken from the better fixes around it.
+private const val COARSE_FIX_MIN_ACCURACY_METERS = 50.0
+private const val COARSE_FIX_NEIGHBOR_WINDOW_MS = 45 * 1000L
+// Positioning can flip to a second source that reports a place the device
+// left a moment ago, with a confident accuracy. The jump there is far faster
+// than the device was actually travelling.
+private const val MIN_SPEED_SPIKE_DISTANCE_METERS = 60.0
+private const val SPEED_SPIKE_RATIO = 3.0
+private const val SPEED_SPIKE_MARGIN_MPS = 3.0
 const val STAY_CLUSTER_RADIUS_METERS = 80.0
 // Keep detection strict, but tolerate building/station-sized GPS drift when
 // grouping separate visits into a recurring place.
@@ -128,6 +143,18 @@ private const val STAY_CENTER_CANDIDATES = 64
 // really left it: the device was flipping between fixes.
 private const val STAY_FLIP_RADIUS_METERS = 500.0
 private const val STAY_FLIP_SHARE = 0.2
+// The noise rules above exist for indoor fixes. A run of confident fixes
+// that stays away from the place is the device actually leaving it.
+private const val DEPARTURE_MAX_ACCURACY_METERS = 30.0
+private const val DEPARTURE_MIN_SAMPLES = 6
+private const val DEPARTURE_MIN_DURATION_MS = 2 * 60 * 1000L
+// The detector takes in samples as far as its radius, so a stay would begin
+// while the device is still walking up to the place and end after it left.
+// Samples at either edge that are away from the final coordinate are movement.
+private const val STAY_EDGE_RADIUS_METERS = 50.0
+private const val MAX_STAY_EDGE_TRIM_MS = 3 * 60 * 1000L
+// A movement with no sample for this long was not recorded during that time.
+const val UNTRACKED_GAP_MS = 10 * 60 * 1000L
 // Revisit history only analyzes days that came near the place.
 private const val STAY_HISTORY_SEARCH_RADIUS_METERS = 1000.0
 
@@ -163,18 +190,14 @@ internal class UpperMedianAccumulator {
 
 private fun median(values: List<Double>): Double = values.sorted()[values.size / 2]
 
-private fun stableLocalAnchor(logs: List<LogEntry>, start: Int, end: Int): LatLng? {
+private fun stableLocalAnchor(logs: List<LogEntry>, start: Int, end: Int, position: (Int) -> LatLng): LatLng? {
     if (start < LOCAL_OUTLIER_WINDOW || end + LOCAL_OUTLIER_WINDOW >= logs.size) return null
     val window = logs.subList(start - LOCAL_OUTLIER_WINDOW, end + LOCAL_OUTLIER_WINDOW + 1)
     if (!window.zipWithNext().all { (previous, next) -> next.startedAt - previous.startedAt > 0L && next.startedAt - previous.startedAt <= MAX_CORRECTION_GAP_MS }) return null
-    val anchors = logs.subList(start - LOCAL_OUTLIER_WINDOW, start) + logs.subList(end + 1, end + LOCAL_OUTLIER_WINDOW + 1)
-    val anchor = LatLng(median(anchors.mapNotNull { it.latitude }), median(anchors.mapNotNull { it.longitude }))
-    return anchor.takeIf { candidate ->
-        anchors.all { entry ->
-            val coordinate = coordinatePair(entry.latitude, entry.longitude) ?: return@all false
-            distanceMeters(LatLng(coordinate.first, coordinate.second), candidate) <= LOCAL_NEIGHBOR_RADIUS_METERS
-        }
-    }
+    // Neighbors that are spikes themselves count where they were corrected to.
+    val anchors = ((start - LOCAL_OUTLIER_WINDOW until start) + (end + 1..end + LOCAL_OUTLIER_WINDOW)).map(position)
+    val anchor = LatLng(median(anchors.map { it.latitude }), median(anchors.map { it.longitude }))
+    return anchor.takeIf { candidate -> anchors.all { distanceMeters(it, candidate) <= LOCAL_NEIGHBOR_RADIUS_METERS } }
 }
 
 private fun spikeThreshold(entry: LogEntry): Double = max(MIN_LOCAL_SPIKE_DISTANCE_METERS, (entry.accuracyMeters ?: 0.0) * 2)
@@ -281,6 +304,47 @@ fun correctedPositionLogs(logs: List<LogEntry>): List<CorrectedLocation> {
                 (previous.longitude!! + (next.longitude!! - previous.longitude) * ratio)
     }
 
+    fun position(index: Int): LatLng = corrections[index]?.let { LatLng(it.first, it.second) }
+        ?: LatLng(locations[index].latitude!!, locations[index].longitude!!)
+    fun interpolate(index: Int, before: Int, after: Int): Pair<Double, Double> {
+        val from = position(before)
+        val to = position(after)
+        val ratio = (locations[index].startedAt - locations[before].startedAt).toDouble() / (locations[after].startedAt - locations[before].startedAt).toDouble()
+        return (from.latitude + (to.latitude - from.latitude) * ratio) to (from.longitude + (to.longitude - from.longitude) * ratio)
+    }
+
+    // Speed spikes: one or two fixes reached at a speed the surrounding path
+    // rules out. Runs in order, so each fix is judged from an already cleaned
+    // predecessor and a real fix is not blamed for the bad one before it. A
+    // single fix is tried first: taking two at once would trust the fix after
+    // them, which is the bad one when a real fix sits between two spikes.
+    for (start in 1 until locations.size - 1) {
+        if (corrections.containsKey(start)) continue
+        for (length in 1..MAX_SPIKE_RUN_SAMPLES) {
+            val end = start + length - 1
+            val next = end + 1
+            if (next >= locations.size || (length > 1 && corrections.containsKey(end))) continue
+            val previous = start - 1
+            val totalGap = locations[next].startedAt - locations[previous].startedAt
+            val entryGap = locations[start].startedAt - locations[previous].startedAt
+            if (entryGap <= 0L || totalGap <= 0L || totalGap > MOVING_SPIKE_MAX_SPAN_MS) continue
+            val bypassSpeed = distanceMeters(position(previous), position(next)) / (totalGap / 1000.0)
+            val entrySpeed = distanceMeters(position(previous), LatLng(locations[start].latitude!!, locations[start].longitude!!)) / (entryGap / 1000.0)
+            if (entrySpeed < max(bypassSpeed * SPEED_SPIKE_RATIO, bypassSpeed + SPEED_SPIKE_MARGIN_MPS)) continue
+            val run = (start..end).toList()
+            val interpolated = run.map { interpolate(it, previous, next) }
+            val offPath = run.indices.all { offset ->
+                val entry = locations[run[offset]]
+                val point = interpolated[offset]
+                distanceMeters(LatLng(entry.latitude!!, entry.longitude!!), LatLng(point.first, point.second)) >=
+                    max(MIN_SPEED_SPIKE_DISTANCE_METERS, (entry.accuracyMeters ?: 0.0) * 2)
+            }
+            if (!offPath) continue
+            run.forEachIndexed { offset, index -> corrections[index] = interpolated[offset] }
+            break
+        }
+    }
+
     // A bad fix can be repeated for two samples. Treat a short excursion as a
     // spike only when both sides independently return to one stable cluster.
     for (start in LOCAL_OUTLIER_WINDOW until locations.size - LOCAL_OUTLIER_WINDOW) {
@@ -288,7 +352,7 @@ fun correctedPositionLogs(logs: List<LogEntry>): List<CorrectedLocation> {
         for (length in MAX_SPIKE_RUN_SAMPLES downTo 1) {
             val end = start + length - 1
             if (end + LOCAL_OUTLIER_WINDOW >= locations.size) continue
-            val anchor = stableLocalAnchor(locations, start, end) ?: continue
+            val anchor = stableLocalAnchor(locations, start, end, ::position) ?: continue
             val run = locations.subList(start, end + 1)
             if (!run.all { event ->
                     val coordinate = coordinatePair(event.latitude, event.longitude) ?: return@all false
@@ -335,6 +399,22 @@ fun correctedPositionLogs(logs: List<LogEntry>): List<CorrectedLocation> {
             run.forEachIndexed { offset, index -> corrections[index] = interpolated[offset] }
             break
         }
+    }
+
+    // Coarse fixes: replaced by the clearly better fixes right before and after.
+    for (index in 1 until locations.size - 1) {
+        val accuracy = locations[index].accuracyMeters
+        if (accuracy == null || accuracy < COARSE_FIX_MIN_ACCURACY_METERS || corrections.containsKey(index)) continue
+        val time = locations[index].startedAt
+        fun isBetter(other: Int) = (locations[other].accuracyMeters ?: 30.0) <= accuracy / 2
+        var before = index - 1
+        while (before >= 0 && time - locations[before].startedAt <= COARSE_FIX_NEIGHBOR_WINDOW_MS && !isBetter(before)) before -= 1
+        var after = index + 1
+        while (after < locations.size && locations[after].startedAt - time <= COARSE_FIX_NEIGHBOR_WINDOW_MS && !isBetter(after)) after += 1
+        if (before < 0 || after >= locations.size) continue
+        if (time - locations[before].startedAt > COARSE_FIX_NEIGHBOR_WINDOW_MS || locations[after].startedAt - time > COARSE_FIX_NEIGHBOR_WINDOW_MS) continue
+        if (locations[after].startedAt <= locations[before].startedAt) continue
+        corrections[index] = interpolate(index, before, after)
     }
 
     return locations.mapIndexed { index, entry ->
@@ -480,7 +560,30 @@ private fun nearbyRuns(locations: List<CorrectedLocation>): List<List<CorrectedL
 private fun isStayInterruption(before: CorrectedLocation, after: CorrectedLocation, between: List<CorrectedLocation>, center: LatLng): Boolean {
     val gapMs = after.entry.startedAt - before.entry.startedAt
     if (gapMs > MAX_STAY_BRIDGE_GAP_MS) return false
-    return gapMs <= MAX_STAY_EXCURSION_MS || between.all { distanceMeters(center, it.coordinate) <= STAY_DRIFT_RADIUS_METERS }
+    if (gapMs <= MAX_STAY_EXCURSION_MS) return true
+    return between.all { distanceMeters(center, it.coordinate) <= STAY_DRIFT_RADIUS_METERS } && !isConfidentDeparture(between, center)
+}
+
+/**
+ * Whether [samples] hold a sustained run of accurate fixes away from
+ * [center]. Indoor flips come back between fixes or report a coarse accuracy.
+ */
+private fun isConfidentDeparture(samples: List<CorrectedLocation>, center: LatLng): Boolean {
+    var count = 0
+    var startedAt = 0L
+    for (location in samples) {
+        val distance = distanceMeters(center, location.coordinate)
+        if (distance <= STAY_CLUSTER_RADIUS_METERS) {
+            count = 0
+            continue
+        }
+        val accuracy = location.entry.accuracyMeters
+        if (accuracy == null || accuracy > DEPARTURE_MAX_ACCURACY_METERS || distance <= STAY_CLUSTER_RADIUS_METERS + accuracy) continue
+        if (count == 0) startedAt = location.entry.startedAt
+        count += 1
+        if (count >= DEPARTURE_MIN_SAMPLES && location.entry.startedAt - startedAt >= DEPARTURE_MIN_DURATION_MS) return true
+    }
+    return false
 }
 
 /**
@@ -490,6 +593,7 @@ private fun isStayInterruption(before: CorrectedLocation, after: CorrectedLocati
 private fun isNoiseBetweenStays(before: CorrectedLocation, after: CorrectedLocation, between: List<CorrectedLocation>, center: LatLng): Boolean {
     if (isStayInterruption(before, after, between, center)) return true
     if (after.entry.startedAt - before.entry.startedAt > MAX_STAY_BRIDGE_GAP_MS) return false
+    if (isConfidentDeparture(between, center)) return false
     val far = between.count { distanceMeters(center, it.coordinate) > STAY_MERGE_DRIFT_RADIUS_METERS }
     return far <= (between.size * STAY_MERGE_MAX_FAR_SHARE).toInt() || returningShare(between, center) >= STAY_FLIP_SHARE
 }
@@ -552,6 +656,20 @@ private fun mergeNearbyStays(stays: List<StaySpan>, locations: List<CorrectedLoc
     return merged
 }
 
+/** Drop the approach and the departure from the ends of a stay. */
+private fun trimStayEdges(stay: StaySpan, center: LatLng, locations: List<CorrectedLocation>): IntRange {
+    fun isAway(index: Int) = distanceMeters(center, locations[index].coordinate) >
+        max(STAY_EDGE_RADIUS_METERS, min(locations[index].entry.accuracyMeters ?: 0.0, MAX_DISPLAY_ACCURACY_METERS))
+    fun time(index: Int) = locations[index].entry.startedAt
+    // The first and last sample of the day have no movement to hand samples to.
+    var start = stay.start
+    while (start > 0 && start < stay.end && isAway(start) && time(start + 1) - time(stay.start) <= MAX_STAY_EDGE_TRIM_MS) start += 1
+    var end = stay.end
+    while (end < locations.lastIndex && end > start && isAway(end) && time(stay.end) - time(end - 1) <= MAX_STAY_EDGE_TRIM_MS) end -= 1
+    // A stay too short to survive the trim keeps its detected span.
+    return if (isStayRun(locations.subList(start, end + 1))) start..end else stay.start..stay.end
+}
+
 private fun correctedStayClusters(locations: List<CorrectedLocation>): List<StayCluster> {
     val runs = nearbyRuns(locations)
     val runCenters = runs.map(::locationCenter)
@@ -593,12 +711,14 @@ private fun correctedStayClusters(locations: List<CorrectedLocation>): List<Stay
     }
 
     return mergeNearbyStays(stays, locations).mapIndexed { stayIndex, stay ->
-        val entries = locations.subList(stay.start, stay.end + 1).toList()
+        val center = stayCenter(stay.core)
+        val span = trimStayEdges(stay, center, locations)
+        val entries = locations.subList(span.first, span.last + 1).toList()
         val startedAt = entries.first().entry.startedAt
         val endedAt = entries.last().entry.startedAt
         StayCluster(
             id = "stay:$startedAt:$stayIndex",
-            coordinate = stayCenter(stay.core),
+            coordinate = center,
             startedAt = startedAt,
             endedAt = endedAt,
             durationMs = (endedAt - startedAt).coerceAtLeast(0L),
@@ -722,6 +842,7 @@ fun buildTimelineActivities(logs: List<LogEntry>, analysis: TimelineAnalysis): L
                 to = node.coordinate,
                 path = listOf(previous.coordinate, node.coordinate),
                 distanceMeters = distanceMeters(previous.coordinate, node.coordinate),
+                untrackedMs = (node.startedAt - previous.endedAt).takeIf { it >= UNTRACKED_GAP_MS } ?: 0L,
             )
             val previousActivity = activities.lastOrNull()
             if (previousActivity?.kind == TimelineActivityKind.MOVEMENT && previousActivity.endedAt == movement.startedAt) {
@@ -733,6 +854,7 @@ fun buildTimelineActivities(logs: List<LogEntry>, analysis: TimelineAnalysis): L
                     to = movement.to,
                     path = path,
                     distanceMeters = (previousActivity.distanceMeters ?: 0.0) + (movement.distanceMeters ?: 0.0),
+                    untrackedMs = previousActivity.untrackedMs + movement.untrackedMs,
                 )
             } else {
                 activities += movement
@@ -785,6 +907,7 @@ internal fun mergeAdjacentMovements(activities: List<TimelineActivity>): List<Ti
                 to = if (activity.endedAt > previous.endedAt) activity.to else previous.to,
                 path = previous.path + activity.path.drop(1),
                 distanceMeters = (previous.distanceMeters ?: 0.0) + (activity.distanceMeters ?: 0.0),
+                untrackedMs = previous.untrackedMs + activity.untrackedMs,
                 photos = previous.photos + activity.photos,
             )
         } else {

@@ -18,22 +18,28 @@ final class SharedTimelineFixtureTests: XCTestCase {
             let latitude: Double?
             let longitude: Double?
             let photoCount: Int
+            let untrackedMs: Int64?
         }
         let activities: [Activity]
     }
 
     func testMatchesTheActivitiesEveryPlatformExpects() throws {
-        let logs = try TimelineImport.decode(data: fixture("remo-timeline-2026-09-01.sample.json"), importedAt: Date(timeIntervalSince1970: 0))
-        let expected = try JSONDecoder().decode(Expected.self, from: fixture("remo-timeline-2026-09-01.expected.json")).activities
+        for day in ["2026-09-01", "2026-10-01", "2026-10-02"] { try assertMatches(day) }
+    }
+
+    private func assertMatches(_ day: String) throws {
+        let logs = try TimelineImport.decode(data: fixture("remo-timeline-\(day).sample.json"), importedAt: Date(timeIntervalSince1970: 0))
+        let expected = try JSONDecoder().decode(Expected.self, from: fixture("remo-timeline-\(day).expected.json")).activities
         let actual = buildTimelineActivities(logs)
 
-        XCTAssertEqual(actual.count, expected.count)
+        XCTAssertEqual(actual.count, expected.count, day)
         for (index, (activity, item)) in zip(actual, expected).enumerated() {
-            let label = "activity \(index)"
+            let label = "\(day) activity \(index)"
             XCTAssertEqual(activity.kind == .stay ? "stay" : "movement", item.kind, label)
             XCTAssertEqual(Int64((activity.startedAt.timeIntervalSince1970 * 1000).rounded()), item.startedAt, label)
             XCTAssertEqual(Int64((activity.endedAt.timeIntervalSince1970 * 1000).rounded()), item.endedAt, label)
             XCTAssertEqual(activity.photos.count, item.photoCount, label)
+            if activity.kind == .movement { XCTAssertEqual(Int64((activity.untracked * 1000).rounded()), item.untrackedMs ?? -1, label) }
             if activity.kind == .stay, let latitude = item.latitude, let longitude = item.longitude {
                 XCTAssertEqual(activity.coordinate?.latitude ?? .nan, latitude, accuracy: 1e-5, label)
                 XCTAssertEqual(activity.coordinate?.longitude ?? .nan, longitude, accuracy: 1e-5, label)
