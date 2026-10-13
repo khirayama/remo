@@ -26,13 +26,17 @@ internal object CapturePolicy {
      * newest ones all have to, which is what a departure breaks first.
      *
      * A stay that was just interrupted by a false alarm is confirmed again sooner when the
-     * fixes are still at its [resumeAnchor].
+     * fixes are still at its [resumeAnchor], and sooner still when every fix since lies
+     * there and the device has hardly taken a step: 39 of 44 wake-ups by significant
+     * motion in one day ended back in the same stay. [recentSteps] is null when steps
+     * are not being counted.
      */
     internal fun stationaryEvidence(
         samples: List<Sample>,
         nowElapsedRealtimeMs: Long,
         resumeAnchor: Anchor? = null,
         historyWindowMs: Long = STATIONARY_HISTORY_WINDOW_MS,
+        recentSteps: Int? = null,
     ): StationaryEvidence {
         val recent = samples.filter { it.elapsedRealtimeMs in (nowElapsedRealtimeMs - historyWindowMs)..nowElapsedRealtimeMs }
         if (recent.isEmpty()) return StationaryEvidence(false, "no_samples")
@@ -51,16 +55,18 @@ internal object CapturePolicy {
         val spanMs = usable.last().elapsedRealtimeMs - usable.first().elapsedRealtimeMs
         val resuming = resumeAnchor != null &&
             distanceMeters(resumeAnchor.latitude, resumeAnchor.longitude, center.latitude, center.longitude) <= STATIONARY_RADIUS_M
+        val neverLeft = resuming && recentSteps != null && recentSteps <= QUICK_RESUME_MAX_STEPS &&
+            usable.all { distanceMeters(resumeAnchor!!.latitude, resumeAnchor.longitude, it.latitude, it.longitude) <= STATIONARY_RADIUS_M }
         fun rejected(reason: String) = StationaryEvidence(false, reason, sampleCount = usable.size, spanMs = spanMs)
-        if (usable.size < if (resuming) RESUME_MIN_SAMPLES else MIN_SAMPLES) return rejected("few_usable")
-        if (spanMs < if (resuming) RESUME_CONFIRMATION_MS else CONFIRMATION_MS) return rejected("short_span")
+        if (usable.size < if (neverLeft) QUICK_RESUME_MIN_SAMPLES else if (resuming) RESUME_MIN_SAMPLES else MIN_SAMPLES) return rejected("few_usable")
+        if (spanMs < if (neverLeft) QUICK_RESUME_CONFIRMATION_MS else if (resuming) RESUME_CONFIRMATION_MS else CONFIRMATION_MS) return rejected("short_span")
         val inside = usable.map { distanceMeters(center.latitude, center.longitude, it.latitude, it.longitude) <= max(STATIONARY_RADIUS_M, it.accuracyMeters!!.toDouble()) }
         if (inside.count { it } < ceil(usable.size * MIN_INSIDE_SHARE)) return rejected("scattered")
         if (inside.takeLast(TRAILING_SAMPLES).any { !it }) return rejected("recent_outside")
         val speeds = usable.mapNotNull { sample -> sample.speedMps?.takeIf { it.isFinite() } }
         val fast = speeds.count { it > MAX_STATIONARY_SPEED_MPS }
         if (fast >= 2 && fast * 4 > speeds.size) return rejected("speed")
-        return StationaryEvidence(true, if (resuming) "resumed" else "ok", center, usable.size, spanMs)
+        return StationaryEvidence(true, if (neverLeft) "resumed_quick" else if (resuming) "resumed" else "ok", center, usable.size, spanMs)
     }
 
     internal fun isStationary(samples: List<Sample>, nowElapsedRealtimeMs: Long): Boolean =
@@ -122,6 +128,9 @@ internal object CapturePolicy {
         /** Steps currently inside the window: how close the run is to counting as walking. */
         val count: Int get() = steps.size
 
+        /** Steps in the window that ends at [elapsedRealtimeMs], when no step may have come since. */
+        fun countAt(elapsedRealtimeMs: Long): Int = steps.count { it >= elapsedRealtimeMs - windowMs }
+
         fun clear() = steps.clear()
     }
 
@@ -142,6 +151,9 @@ internal object CapturePolicy {
     private const val CONFIRMATION_MS = 3 * 60 * 1000L
     private const val RESUME_MIN_SAMPLES = 4
     private const val RESUME_CONFIRMATION_MS = 75_000L
+    private const val QUICK_RESUME_MIN_SAMPLES = 3
+    private const val QUICK_RESUME_CONFIRMATION_MS = 30_000L
+    private const val QUICK_RESUME_MAX_STEPS = 8
     private const val STATIONARY_RADIUS_M = 40.0
     private const val MIN_INSIDE_SHARE = 0.85
     private const val TRAILING_SAMPLES = 3

@@ -217,6 +217,8 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         val accuracy = location.accuracy.takeIf { location.hasAccuracy() && it.isFinite() }
         val speed = location.speed.takeIf { location.hasSpeed() && it.isFinite() }
         val sameFixWithBetterAccuracy = location.elapsedRealtimeNanos == lastAcceptedFixNanos && accuracy != null && accuracy < lastAcceptedAccuracy
+        // A fix asked for directly also arrives through the running request.
+        if (location.elapsedRealtimeNanos == lastAcceptedFixNanos && !sameFixWithBetterAccuracy) return dropped("duplicate")
         // The 5-minute mode gets low-power fixes that can already be minutes old on delivery;
         // rejecting them left the whole stay without a single record.
         if (!CapturePolicy.isFreshFix(location.elapsedRealtimeNanos, SystemClock.elapsedRealtimeNanos(), if (sameFixWithBetterAccuracy) 0L else lastAcceptedFixNanos, mode.maxFixAgeMs * 1_000_000L)) return dropped("stale")
@@ -327,7 +329,10 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         if (mode != CaptureMode.NORMAL) return
         // The stay that was just interrupted is confirmed again faster while it is recent.
         val resumeAnchor = anchor?.takeIf { nowElapsedRealtime - anchorLeftElapsed <= RESUME_ANCHOR_MAX_AGE_MS }
-        val evidence = CapturePolicy.stationaryEvidence(locationHistory.toList(), nowElapsedRealtime, resumeAnchor)
+        val countingSteps = registeredMotionSensors.any { it.type == Sensor.TYPE_STEP_DETECTOR }
+        if (resumeAnchor == null && countingSteps) unregisterMotionSensors()
+        val recentSteps = if (resumeAnchor != null && countingSteps) stepWindow.countAt(nowElapsedRealtime) else null
+        val evidence = CapturePolicy.stationaryEvidence(locationHistory.toList(), nowElapsedRealtime, resumeAnchor, recentSteps = recentSteps)
         if (!evidence.stationary) return stats.evidence(evidence.reason)
 
         // An activity transition is reported once. A vehicle waiting at a light is
@@ -392,6 +397,9 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         locationHistory.clear()
         scheduleHeartbeat()
         unregisterMotionSensors()
+        // Steps keep being counted while the stay may resume: walking away must not look like a false alarm.
+        stepWindow.clear()
+        registerMotionSensors(listOf(Sensor.TYPE_STEP_DETECTOR))
         requestUpdates()
         startForegroundWithCurrentMode()
     }
@@ -507,9 +515,9 @@ class AutomaticCaptureService : Service(), SensorEventListener {
     }
 
     /** Arms every motion sensor that is not armed yet; safe to call repeatedly. */
-    private fun registerMotionSensors() {
+    private fun registerMotionSensors(types: List<Int> = listOf(Sensor.TYPE_MOTION_DETECT, Sensor.TYPE_STEP_DETECTOR)) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
-        listOf(Sensor.TYPE_MOTION_DETECT, Sensor.TYPE_STEP_DETECTOR).forEach { type ->
+        types.forEach { type ->
             if (registeredMotionSensors.any { it.type == type }) return@forEach
             val sensor = runCatching { sensorManager.getDefaultSensor(type, true) ?: sensorManager.getDefaultSensor(type) }.getOrNull() ?: return@forEach
             if (runCatching {
@@ -630,6 +638,11 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         when (event.sensor.type) {
             Sensor.TYPE_MOTION_DETECT -> onWeakMovement("motion_detect")
             Sensor.TYPE_STEP_DETECTOR -> {
+                if (mode != CaptureMode.STATIONARY) {
+                    // Counted on arrival, the clock the stationary check reads.
+                    stepWindow.add(SystemClock.elapsedRealtime())
+                    return
+                }
                 val walking = stepWindow.add(event.timestamp / 1_000_000L)
                 stats.stepRun(stepWindow.count)
                 if (walking) {

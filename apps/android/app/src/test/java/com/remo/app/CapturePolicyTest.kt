@@ -85,6 +85,20 @@ class CapturePolicyTest {
         assertEquals("short_span", CapturePolicy.stationaryEvidence(fixes, now, CapturePolicy.Anchor(35.6839, 139.7671, 30f)).reason)
     }
 
+    @Test fun aStayThatWasNeverLeftIsConfirmedAgainWithinHalfAMinute() {
+        val fixes = indoor(4)
+        val now = fixes.last().elapsedRealtimeMs
+        val anchor = CapturePolicy.Anchor(35.68125, 139.7671, 30f)
+        assertEquals("short_span", CapturePolicy.stationaryEvidence(fixes, now, anchor).reason)
+        val still = CapturePolicy.stationaryEvidence(fixes, now, anchor, recentSteps = 3)
+        assertTrue(still.stationary)
+        assertEquals("resumed_quick", still.reason)
+        // Walking, or one fix away from the anchor, takes the longer confirmation.
+        assertEquals("short_span", CapturePolicy.stationaryEvidence(fixes, now, anchor, recentSteps = 20).reason)
+        val away = fixes.dropLast(2) + fixes[2].copy(latitude = 35.68185) + fixes.last()
+        assertEquals("short_span", CapturePolicy.stationaryEvidence(away, now, anchor, recentSteps = 0).reason)
+    }
+
     @Test fun leavingTheAnchorDiscountsBothUncertainties() {
         val anchor = CapturePolicy.Anchor(35.6812, 139.7671, 30f)
         // About 133 m north of the anchor.
@@ -116,6 +130,7 @@ class CapturePolicyTest {
         assertEquals(15, crossingRoom.count)
         crossingRoom.add(60_000L)
         assertEquals(1, crossingRoom.count)
+        assertEquals(0, crossingRoom.countAt(120_000L))
     }
 
     @Test fun freshnessUsesMonotonicMeasurementTimeAndRejectsDuplicates() {

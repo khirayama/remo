@@ -23,7 +23,7 @@ internal class CaptureStats {
 
     fun signal(name: String) = count(signals, name)
 
-    /** The outcome of one stationary check; `ok` and `resumed` mean it passed. */
+    /** The outcome of one stationary check; `ok`, `resumed` and `resumed_quick` mean it passed. */
     fun evidence(reason: String) = count(evidence, reason)
 
     /** [stepsInWindow] is the run the step window holds after one more step. */
