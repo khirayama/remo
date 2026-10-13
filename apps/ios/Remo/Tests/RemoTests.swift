@@ -530,6 +530,18 @@ final class RemoTests: XCTestCase {
         XCTAssertEqual(stale.latitude, 35.6812 + 4 * 0.002, accuracy: 0.000001)
     }
 
+    func testFixThatLandsBehindAWalkIsCorrected() {
+        // A walk north at about 1.4 m/s; one fix reports a place 50m back.
+        let logs = (0..<12).map { index -> LogEntry in
+            let latitude: Double = 35.6812 + Double(index) * 0.000126
+            let stale = index == 5
+            return LogEntry(id: "walk-\(index)", startedAt: origin.addingTimeInterval(Double(index) * 10), latitude: stale ? latitude - 0.00045 : latitude, longitude: 139.7671, accuracyMeters: stale ? 20 : 10, source: .location, updatedAt: origin)
+        }
+        let corrected = correctedPositionLogs(logs)
+        XCTAssertEqual(corrected.filter { $0.corrected }.map { $0.entry.id }, ["walk-5"])
+        XCTAssertEqual(corrected[5].latitude, 35.6812 + 5 * 0.000126, accuracy: 0.000001)
+    }
+
     func testLongSamplingGapThatEndsWhereItStartedIsBridged() {
         let stays = buildStayClusters(
             samples("evening", origin, 3, 120)

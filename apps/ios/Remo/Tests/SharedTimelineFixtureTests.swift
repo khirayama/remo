@@ -24,7 +24,7 @@ final class SharedTimelineFixtureTests: XCTestCase {
     }
 
     func testMatchesTheActivitiesEveryPlatformExpects() throws {
-        for day in ["2026-09-01", "2026-10-01", "2026-10-02"] { try assertMatches(day) }
+        for day in ["2026-09-01", "2026-10-01", "2026-10-02", "2026-10-11"] { try assertMatches(day) }
     }
 
     private func assertMatches(_ day: String) throws {

@@ -113,6 +113,14 @@ private const val COARSE_FIX_NEIGHBOR_WINDOW_MS = 45 * 1000L
 private const val MIN_SPEED_SPIKE_DISTANCE_METERS = 60.0
 private const val SPEED_SPIKE_RATIO = 3.0
 private const val SPEED_SPIKE_MARGIN_MPS = 3.0
+// On foot the same flip lands only a few dozen meters away, every half minute
+// or so: one fix behind the fix before it or beyond the fix after it, where
+// walking on would not have taken the device. Coarse fixes are left to the
+// rules above; indoors they are often the correct ones.
+private const val WALKING_SPIKE_MAX_SPEED_MPS = 3.0
+private const val MIN_WALKING_SPIKE_DISTANCE_METERS = 30.0
+private const val WALKING_SPIKE_RATIO = 2.0
+private const val WALKING_SPIKE_MARGIN_MPS = 1.5
 const val STAY_CLUSTER_RADIUS_METERS = 80.0
 // Keep detection strict, but tolerate building/station-sized GPS drift when
 // grouping separate visits into a recurring place.
@@ -417,6 +425,26 @@ fun correctedPositionLogs(logs: List<LogEntry>): List<CorrectedLocation> {
         corrections[index] = interpolate(index, before, after)
     }
 
+    // Walking spikes: runs last, so the fixes the rules above settled stay as they are.
+    for (index in 1 until locations.size - 1) {
+        val accuracy = locations[index].accuracyMeters ?: 0.0
+        if (corrections.containsKey(index) || accuracy >= COARSE_FIX_MIN_ACCURACY_METERS) continue
+        val totalGap = locations[index + 1].startedAt - locations[index - 1].startedAt
+        val entryGap = locations[index].startedAt - locations[index - 1].startedAt
+        if (entryGap <= 0L || totalGap <= entryGap || totalGap > MOVING_SPIKE_MAX_SPAN_MS) continue
+        val recorded = LatLng(locations[index].latitude!!, locations[index].longitude!!)
+        val bypass = distanceMeters(position(index - 1), position(index + 1))
+        val bypassSpeed = bypass / (totalGap / 1000.0)
+        if (bypassSpeed > WALKING_SPIKE_MAX_SPEED_MPS) continue
+        val out = distanceMeters(position(index - 1), recorded)
+        val back = distanceMeters(recorded, position(index + 1))
+        if (out * out + bypass * bypass >= back * back && back * back + bypass * bypass >= out * out) continue
+        if (out / (entryGap / 1000.0) < max(bypassSpeed * WALKING_SPIKE_RATIO, bypassSpeed + WALKING_SPIKE_MARGIN_MPS)) continue
+        val interpolated = interpolate(index, index - 1, index + 1)
+        if (distanceMeters(recorded, LatLng(interpolated.first, interpolated.second)) < max(MIN_WALKING_SPIKE_DISTANCE_METERS, accuracy)) continue
+        corrections[index] = interpolated
+    }
+
     return locations.mapIndexed { index, entry ->
         val correction = corrections[index]
         if (correction == null) {
@@ -643,7 +671,9 @@ private fun mergeNearbyStays(stays: List<StaySpan>, locations: List<CorrectedLoc
             val sameStay = distance <= STAY_MERGE_RADIUS_METERS
                 || (distance <= STAY_FLIP_RADIUS_METERS
                     && (isFlippedStay(stay, previousCenter, locations) || isFlippedStay(previous, stayCenterValue, locations)))
-            if (sameStay && isNoiseBetweenStays(locations[previous.end], locations[stay.start], between, previousCenter)) {
+            // Accurate fixes that stay away are a second place nearby, not a flip.
+            val separatePlace = isConfidentDeparture(locations.subList(stay.start, stay.end + 1), previousCenter)
+            if (sameStay && !separatePlace && isNoiseBetweenStays(locations[previous.end], locations[stay.start], between, previousCenter)) {
                 previous.core += stay.core
                 previous.end = stay.end
                 center = stayCenter(previous.core)
@@ -666,8 +696,9 @@ private fun trimStayEdges(stay: StaySpan, center: LatLng, locations: List<Correc
     while (start > 0 && start < stay.end && isAway(start) && time(start + 1) - time(stay.start) <= MAX_STAY_EDGE_TRIM_MS) start += 1
     var end = stay.end
     while (end < locations.lastIndex && end > start && isAway(end) && time(stay.end) - time(end - 1) <= MAX_STAY_EDGE_TRIM_MS) end -= 1
-    // A stay too short to survive the trim keeps its detected span.
-    return if (isStayRun(locations.subList(start, end + 1))) start..end else stay.start..stay.end
+    // A stop shorter than a stay once the walk up to it is taken off is still
+    // shown, but without that walk: kept, it would be drawn as a straight line.
+    return if (end - start + 1 >= MIN_STAY_SAMPLES) start..end else stay.start..stay.end
 }
 
 private fun correctedStayClusters(locations: List<CorrectedLocation>): List<StayCluster> {

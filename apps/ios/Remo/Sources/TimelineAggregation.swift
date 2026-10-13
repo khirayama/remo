@@ -142,6 +142,14 @@ private let coarseFixNeighborWindow: TimeInterval = 45
 private let minSpeedSpikeDistanceMeters = 60.0
 private let speedSpikeRatio = 3.0
 private let speedSpikeMarginMps = 3.0
+// On foot the same flip lands only a few dozen meters away, every half minute
+// or so: one fix behind the fix before it or beyond the fix after it, where
+// walking on would not have taken the device. Coarse fixes are left to the
+// rules above; indoors they are often the correct ones.
+private let walkingSpikeMaxSpeedMps = 3.0
+private let minWalkingSpikeDistanceMeters = 30.0
+private let walkingSpikeRatio = 2.0
+private let walkingSpikeMarginMps = 1.5
 let stayClusterRadiusMeters = 80.0
 // Keep detection strict, but tolerate building/station-sized GPS drift when
 // grouping separate visits into a recurring place.
@@ -471,6 +479,29 @@ func correctedPositionLogs(_ logs: [LogEntry]) -> [CorrectedLocation] {
         }
     }
 
+    // Walking spikes: runs last, so the fixes the rules above settled stay as they are.
+    if locations.count >= 3 {
+        for index in 1..<(locations.count - 1) {
+            let accuracy = locations[index].accuracyMeters ?? 0
+            if corrections[index] != nil || accuracy >= coarseFixMinAccuracyMeters { continue }
+            let totalGap = locations[index + 1].startedAt.timeIntervalSince(locations[index - 1].startedAt)
+            let entryGap = locations[index].startedAt.timeIntervalSince(locations[index - 1].startedAt)
+            guard entryGap > 0, totalGap > entryGap, totalGap <= movingSpikeMaxSpan else { continue }
+            let recorded = CLLocationCoordinate2D(latitude: locations[index].latitude!, longitude: locations[index].longitude!)
+            let bypass = distanceMeters(position(index - 1), position(index + 1))
+            let bypassSpeed = bypass / totalGap
+            if bypassSpeed > walkingSpikeMaxSpeedMps { continue }
+            let out = distanceMeters(position(index - 1), recorded)
+            let back = distanceMeters(recorded, position(index + 1))
+            if out * out + bypass * bypass >= back * back && back * back + bypass * bypass >= out * out { continue }
+            if out / entryGap < max(bypassSpeed * walkingSpikeRatio, bypassSpeed + walkingSpikeMarginMps) { continue }
+            let interpolated = interpolate(index, index - 1, index + 1)
+            let deviation = distanceMeters(recorded, CLLocationCoordinate2D(latitude: interpolated.latitude, longitude: interpolated.longitude))
+            if deviation < max(minWalkingSpikeDistanceMeters, accuracy) { continue }
+            corrections[index] = interpolated
+        }
+    }
+
     return locations.enumerated().map { index, entry in
         guard let correction = corrections[index] else {
             return CorrectedLocation(entry: entry, latitude: entry.latitude!, longitude: entry.longitude!, corrected: false)
@@ -731,7 +762,9 @@ private func mergeNearbyStays(_ stays: [StaySpan], locations: [CorrectedLocation
             let sameStay = distance <= stayMergeRadiusMeters
                 || (distance <= stayFlipRadiusMeters
                     && (isFlippedStay(stay, center: previousCenter, locations: locations) || isFlippedStay(previous, center: stayCenterValue, locations: locations)))
-            if sameStay, isNoiseBetweenStays(before: locations[previous.end], after: locations[stay.start], between: between, center: previousCenter) {
+            // Accurate fixes that stay away are a second place nearby, not a flip.
+            let separatePlace = isConfidentDeparture(Array(locations[stay.start...stay.end]), center: previousCenter)
+            if sameStay, !separatePlace, isNoiseBetweenStays(before: locations[previous.end], after: locations[stay.start], between: between, center: previousCenter) {
                 merged[merged.count - 1].core += stay.core
                 merged[merged.count - 1].end = stay.end
                 center = stayCenter(merged[merged.count - 1].core)
@@ -756,8 +789,9 @@ private func trimStayEdges(_ stay: StaySpan, center: CLLocationCoordinate2D, loc
     while start > 0, start < stay.end, isAway(start), time(start + 1).timeIntervalSince(time(stay.start)) <= maxStayEdgeTrim { start += 1 }
     var end = stay.end
     while end < locations.count - 1, end > start, isAway(end), time(stay.end).timeIntervalSince(time(end - 1)) <= maxStayEdgeTrim { end -= 1 }
-    // A stay too short to survive the trim keeps its detected span.
-    return isStayRun(Array(locations[start...end])) ? start...end : stay.start...stay.end
+    // A stop shorter than a stay once the walk up to it is taken off is still
+    // shown, but without that walk: kept, it would be drawn as a straight line.
+    return end - start + 1 >= minStaySamples ? start...end : stay.start...stay.end
 }
 
 private func correctedStayClusters(_ locations: [CorrectedLocation]) -> [StayCluster] {

@@ -43,6 +43,14 @@ const COARSE_FIX_NEIGHBOR_WINDOW_MS = 45 * 1000;
 const MIN_SPEED_SPIKE_DISTANCE_METERS = 60;
 const SPEED_SPIKE_RATIO = 3;
 const SPEED_SPIKE_MARGIN_MPS = 3;
+// On foot the same flip lands only a few dozen meters away, every half minute
+// or so: one fix behind the fix before it or beyond the fix after it, where
+// walking on would not have taken the device. Coarse fixes are left to the
+// rules above; indoors they are often the correct ones.
+const WALKING_SPIKE_MAX_SPEED_MPS = 3;
+const MIN_WALKING_SPIKE_DISTANCE_METERS = 30;
+const WALKING_SPIKE_RATIO = 2;
+const WALKING_SPIKE_MARGIN_MPS = 1.5;
 
 export function locationEvents(events: LifeEvent[]): LocatedEvent[] {
   return positionEvents(events).filter((event) => event.source === "location");
@@ -299,6 +307,25 @@ export function correctedPositionEvents(events: LifeEvent[]): CorrectedLocation[
     if (times[index] - times[before] > COARSE_FIX_NEIGHBOR_WINDOW_MS || times[after] - times[index] > COARSE_FIX_NEIGHBOR_WINDOW_MS) continue;
     if (times[after] <= times[before]) continue;
     corrections.set(index, interpolate(index, before, after));
+  }
+
+  // Walking spikes: runs last, so the fixes the rules above settled stay as they are.
+  for (let index = 1; index < locations.length - 1; index += 1) {
+    const accuracy = locations[index].accuracyMeters ?? 0;
+    if (corrections.has(index) || accuracy >= COARSE_FIX_MIN_ACCURACY_METERS) continue;
+    const totalGap = times[index + 1] - times[index - 1];
+    const entryGap = times[index] - times[index - 1];
+    if (entryGap <= 0 || totalGap <= entryGap || totalGap > MOVING_SPIKE_MAX_SPAN_MS) continue;
+    const bypass = distanceMeters(position(index - 1), position(index + 1));
+    const bypassSpeed = bypass / (totalGap / 1000);
+    if (bypassSpeed > WALKING_SPIKE_MAX_SPEED_MPS) continue;
+    const out = distanceMeters(position(index - 1), locations[index]);
+    const back = distanceMeters(locations[index], position(index + 1));
+    if (out * out + bypass * bypass >= back * back && back * back + bypass * bypass >= out * out) continue;
+    if (out / (entryGap / 1000) < Math.max(bypassSpeed * WALKING_SPIKE_RATIO, bypassSpeed + WALKING_SPIKE_MARGIN_MPS)) continue;
+    const interpolated = interpolate(index, index - 1, index + 1);
+    if (distanceMeters(locations[index], interpolated) < Math.max(MIN_WALKING_SPIKE_DISTANCE_METERS, accuracy)) continue;
+    corrections.set(index, interpolated);
   }
 
   return locations.map((event, index) => {
@@ -708,7 +735,9 @@ function mergeNearbyStays(stays: StaySpan[], locations: CorrectedLocation[]): St
       const sameStay = distance <= STAY_MERGE_RADIUS_METERS
         || (distance <= STAY_FLIP_RADIUS_METERS
           && (isFlippedStay(stay, center, locations) || isFlippedStay(previous, stayCenterValue, locations)));
-      if (sameStay && isNoiseBetweenStays(locations[previous.end], locations[stay.start], between, center)) {
+      // Accurate fixes that stay away are a second place nearby, not a flip.
+      const separatePlace = isConfidentDeparture(locations.slice(stay.start, stay.end + 1), center);
+      if (sameStay && !separatePlace && isNoiseBetweenStays(locations[previous.end], locations[stay.start], between, center)) {
         previous.core.push(...stay.core);
         previous.end = stay.end;
         center = stayCenter(previous.core);
@@ -731,8 +760,9 @@ function trimStayEdges(stay: StaySpan, center: { latitude: number; longitude: nu
   while (start > 0 && start < stay.end && isAway(start) && time(start + 1) - time(stay.start) <= MAX_STAY_EDGE_TRIM_MS) start += 1;
   let end = stay.end;
   while (end < locations.length - 1 && end > start && isAway(end) && time(stay.end) - time(end - 1) <= MAX_STAY_EDGE_TRIM_MS) end -= 1;
-  // A stay too short to survive the trim keeps its detected span.
-  return isStayRun(locations.slice(start, end + 1)) ? { start, end } : { start: stay.start, end: stay.end };
+  // A stop shorter than a stay once the walk up to it is taken off is still
+  // shown, but without that walk: kept, it would be drawn as a straight line.
+  return end - start + 1 >= MIN_STAY_SAMPLES ? { start, end } : { start: stay.start, end: stay.end };
 }
 
 function correctedStayClusters(locations: CorrectedLocation[]): StayCluster[] {

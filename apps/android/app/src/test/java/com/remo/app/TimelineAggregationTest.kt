@@ -347,6 +347,16 @@ class TimelineAggregationTest {
         assertEquals(139.8, display.longitude!!, 0.000001)
     }
 
+    @Test fun fixThatLandsBehindAWalkIsCorrected() {
+        // A walk north at about 1.4 m/s; one fix reports a place 50m back.
+        val logs = (0 until 12).map { index ->
+            entry("walk-$index", index * 10_000L, latitude = 35.6812 + index * 0.000126 - if (index == 5) 0.00045 else 0.0, accuracyMeters = if (index == 5) 20.0 else 10.0)
+        }
+        val corrected = correctedLocationLogs(logs)
+        assertEquals(listOf("walk-5"), corrected.filter { it.corrected }.map { it.entry.id })
+        assertEquals(35.6812 + 5 * 0.000126, corrected[5].latitude, 0.000001)
+    }
+
     @Test fun timelineSnapshotMatchesCompatibilityBuilders() {
         val logs = listOf(
             entry("move-1", 0, latitude = 35.684, longitude = 139.77),

@@ -586,6 +586,16 @@ describe("map timeline", () => {
     corrected.slice(1).forEach((location, index) => expect(location.latitude).toBeGreaterThan(corrected[index].latitude));
   });
 
+  it("removes a fix that lands a few dozen meters behind a walk", () => {
+    const events = walk("walk", "2026-08-31T01:00:00.000Z", 12);
+    // 50m back: too small and too slow for the stale-fix rule above.
+    events[5] = { ...events[5], latitude: 35.6812 + 5 * 0.000126 - 0.00045, accuracyMeters: 20 };
+    const corrected = correctedLocationEvents(events);
+
+    expect(corrected.filter((location) => location.corrected).map((location) => location.event.id)).toEqual(["walk-5"]);
+    expect(corrected[5].latitude).toBeCloseTo(35.6812 + 5 * 0.000126, 6);
+  });
+
   it("keeps a real acceleration and a turn at speed", () => {
     const stopped = samples("stop", "2026-08-31T01:00:00.000Z", 4, 10, { accuracyMeters: 10 });
     // 15 m/s north, then east: fast, but each fix continues from the last one.
