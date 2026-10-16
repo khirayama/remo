@@ -3,6 +3,7 @@ import fixture20260901 from "../../../fixtures/timeline/remo-timeline-2026-09-01
 import fixture20261001 from "../../../fixtures/timeline/remo-timeline-2026-10-01.sample.json";
 import fixture20261002 from "../../../fixtures/timeline/remo-timeline-2026-10-02.sample.json";
 import fixture20261011 from "../../../fixtures/timeline/remo-timeline-2026-10-11.sample.json";
+import fixture20261013 from "../../../fixtures/timeline/remo-timeline-2026-10-13.sample.json";
 import { LifeEvent } from "./life-log";
 import { buildTimelineActivities } from "./timeline-map";
 
@@ -27,11 +28,13 @@ function activitySummary(events: LifeEvent[]) {
 // 2026-09-01: a quiet day at home. 2026-10-01: a recording hole with photos
 // in it. 2026-10-02: walks with stale fixes that jump back along the path.
 // 2026-10-11: a stop near home, a short stop on a walk, small jumps back.
+// 2026-10-13: a walk that turns around nearby, fixes jumping back on arrival.
 const fixtures = {
   "2026-09-01": fixture20260901,
   "2026-10-01": fixture20261001,
   "2026-10-02": fixture20261002,
   "2026-10-11": fixture20261011,
+  "2026-10-13": fixture20261013,
 };
 
 describe("shared timeline fixture", () => {

@@ -1,6 +1,7 @@
 package com.remo.app
 
 import com.google.android.gms.maps.model.LatLng
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.log10
@@ -121,6 +122,14 @@ private const val WALKING_SPIKE_MAX_SPEED_MPS = 3.0
 private const val MIN_WALKING_SPIKE_DISTANCE_METERS = 30.0
 private const val WALKING_SPIKE_RATIO = 2.0
 private const val WALKING_SPIKE_MARGIN_MPS = 1.5
+// Walks are drawn through the weighted average of five fixes. Ten seconds
+// apart, the fixes of seven recorded walks turned by more than 60 degrees at a
+// quarter to half of them and made the line 17 to 43% longer than its average.
+private const val WALK_SMOOTHING_REACH = 2
+private const val WALK_SMOOTHING_MAX_GAP_MS = 30 * 1000L
+private const val WALK_SMOOTHING_MAX_SPEED_MPS = 3.0
+private const val WALK_SMOOTHING_MIN_ACCURACY_METERS = 5.0
+private const val WALK_SMOOTHING_DEFAULT_ACCURACY_METERS = 20.0
 const val STAY_CLUSTER_RADIUS_METERS = 80.0
 // Keep detection strict, but tolerate building/station-sized GPS drift when
 // grouping separate visits into a recurring place.
@@ -147,6 +156,15 @@ private const val STAY_MERGE_MAX_FAR_SHARE = 0.3
 // flipped fixes does not pull it between two places.
 private const val STAY_CENTER_RADIUS_METERS = 50.0
 private const val STAY_CENTER_CANDIDATES = 64
+// A walk that turns around within the cluster radius is not a stay: 30m or
+// more of headway (the fixes' own error at least) over 45 seconds to 2 minutes,
+// in 70% of the fixes. In 85 recorded stays the share reached 65% once and
+// stayed under 55% otherwise; the two walks taken for stays had 78% and 100%.
+private const val STAY_HEADWAY_MIN_WINDOW_MS = 45 * 1000L
+private const val STAY_HEADWAY_MAX_WINDOW_MS = 2 * 60 * 1000L
+private const val STAY_HEADWAY_METERS = 30.0
+private const val STAY_HEADWAY_MAX_SHARE = 0.7
+private const val STAY_HEADWAY_MIN_WINDOWS = 8
 // A "stay" whose own samples keep landing back at the neighboring stay never
 // really left it: the device was flipping between fixes.
 private const val STAY_FLIP_RADIUS_METERS = 500.0
@@ -642,6 +660,28 @@ private fun stayCenter(locations: List<CorrectedLocation>): LatLng {
     return locationCenter(locations.filter { distanceMeters(densest.coordinate, it.coordinate) <= STAY_CENTER_RADIUS_METERS })
 }
 
+/**
+ * Whether the samples stop somewhere. Walking a short way out and back keeps
+ * every fix within the cluster radius too, but the fixes keep making headway:
+ * most of them are a walk away from the fix taken a minute earlier. Someone
+ * who stays moves about now and then, and a jumping fix moves back.
+ */
+private fun isSettled(core: List<CorrectedLocation>): Boolean {
+    var windows = 0
+    var moving = 0
+    var to = 0
+    for (from in core.indices) {
+        val time = core[from].entry.startedAt
+        while (to < core.size && core[to].entry.startedAt - time < STAY_HEADWAY_MIN_WINDOW_MS) to += 1
+        if (to >= core.size) break
+        if (core[to].entry.startedAt - time > STAY_HEADWAY_MAX_WINDOW_MS) continue
+        windows += 1
+        val error = (core[from].entry.accuracyMeters ?: 0.0) + (core[to].entry.accuracyMeters ?: 0.0)
+        if (distanceMeters(core[from].coordinate, core[to].coordinate) >= max(STAY_HEADWAY_METERS, error)) moving += 1
+    }
+    return windows < STAY_HEADWAY_MIN_WINDOWS || moving < windows * STAY_HEADWAY_MAX_SHARE
+}
+
 private class StaySpan(val core: MutableList<CorrectedLocation>, val start: Int, var end: Int)
 
 /** Share of samples recorded at [center]. */
@@ -712,6 +752,7 @@ private fun correctedStayClusters(locations: List<CorrectedLocation>): List<Stay
         // `core` holds the samples at the place; the span also covers the noisy
         // samples in between so they are hidden from the movement line.
         val core = runs[index].toMutableList()
+        val first = index
         val start = runStarts[index]
         var end = start + runs[index].size - 1
         index += 1
@@ -738,7 +779,10 @@ private fun correctedStayClusters(locations: List<CorrectedLocation>): List<Stay
             if (elapsedMs > MAX_STAY_BRIDGE_GAP_MS
                 || (elapsedMs > MAX_STAY_EXCURSION_MS && run.any { distanceMeters(center, it.coordinate) > STAY_DRIFT_RADIUS_METERS })) break
         }
-        if (isStayRun(core)) stays += StaySpan(core, start, end)
+        if (!isStayRun(core)) continue
+        if (isSettled(core)) stays += StaySpan(core, start, end)
+        // The runs it took in may still be stays of their own.
+        else index = first + 1
     }
 
     return mergeNearbyStays(stays, locations).mapIndexed { stayIndex, stay ->
@@ -765,14 +809,55 @@ data class TimelineAnalysis(
     val stayClusters: List<StayCluster>,
 )
 
+/**
+ * The positions with the walked parts of the route evened out. On foot a fix
+ * is as far off as the device gets between two fixes, so the recorded line
+ * zigzags along the street. Each fix outside a stay is drawn at the average of
+ * itself and up to two fixes on either side, the accurate and the near ones
+ * counting most. Both ends of a walk, the fixes next to a hole in the record
+ * and anything faster than walking keep their place.
+ */
+private fun smoothedWalks(positions: List<CorrectedLocation>, stays: List<StayCluster>): List<CorrectedLocation> {
+    val inStay = stays.flatMapTo(HashSet()) { stay -> stay.entries.map { it.entry.id } }
+    // Whether the fixes from `index - reach` to `index + reach` are one stretch of walking.
+    fun isWalk(index: Int, reach: Int): Boolean {
+        val from = index - reach
+        val to = index + reach
+        if (from < 0 || to >= positions.size) return false
+        for (other in from..to) {
+            if (positions[other].entry.id in inStay) return false
+            if (other > from && positions[other].entry.startedAt - positions[other - 1].entry.startedAt !in 1..WALK_SMOOTHING_MAX_GAP_MS) return false
+        }
+        val seconds = (positions[to].entry.startedAt - positions[from].entry.startedAt) / 1000.0
+        return distanceMeters(positions[from].coordinate, positions[to].coordinate) <= WALK_SMOOTHING_MAX_SPEED_MPS * seconds
+    }
+    return positions.mapIndexed { index, location ->
+        val reach = if (isWalk(index, WALK_SMOOTHING_REACH)) WALK_SMOOTHING_REACH else if (isWalk(index, 1)) 1 else 0
+        if (reach == 0) return@mapIndexed location
+        var latitude = 0.0
+        var longitude = 0.0
+        var total = 0.0
+        for (other in index - reach..index + reach) {
+            val error = max(WALK_SMOOTHING_MIN_ACCURACY_METERS, positions[other].entry.accuracyMeters ?: WALK_SMOOTHING_DEFAULT_ACCURACY_METERS)
+            val weight = (WALK_SMOOTHING_REACH + 1 - abs(other - index)) / (error * error)
+            latitude += positions[other].latitude * weight
+            longitude += positions[other].longitude * weight
+            total += weight
+        }
+        location.copy(latitude = latitude / total, longitude = longitude / total)
+    }
+}
+
 fun analyzeTimeline(logs: List<LogEntry>): TimelineAnalysis {
     // Stay detection intentionally uses quality-filtered, corrected locations;
-    // raw coordinate records are never used for stay detection.
+    // raw coordinate records are never used for stay detection. Smoothing only
+    // changes how the walks between the stays are drawn.
     val positions = correctedPositionLogs(logs)
+    val stayClusters = correctedStayClusters(positions)
     return TimelineAnalysis(
-        correctedPositions = positions,
-        correctedLocations = correctedLocationLogs(logs),
-        stayClusters = correctedStayClusters(positions),
+        correctedPositions = smoothedWalks(positions, stayClusters),
+        correctedLocations = smoothedWalks(correctedLocationLogs(logs), stayClusters),
+        stayClusters = stayClusters,
     )
 }
 

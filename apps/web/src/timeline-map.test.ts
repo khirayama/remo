@@ -596,6 +596,45 @@ describe("map timeline", () => {
     expect(corrected[5].latitude).toBeCloseTo(35.6812 + 5 * 0.000126, 6);
   });
 
+  it("draws a walk through the middle of fixes that zigzag along the street", () => {
+    // 12m to either side of the street in turn.
+    const events = walk("walk", "2026-08-31T01:00:00.000Z", 12).map((sample, index) => ({ ...sample, longitude: 139.7671 + (index % 2 ? 0.000133 : -0.000133) }));
+    const segments = buildMovementSegments(events, Date.parse("2026-08-31T02:00:00.000Z"));
+
+    // Both ends are drawn where they were recorded.
+    expect(segments[0].from).toEqual([events[0].latitude, events[0].longitude]);
+    expect(segments.at(-1)?.to).toEqual([events[11].latitude, events[11].longitude]);
+    segments.slice(1, -1).forEach((segment) => expect(Math.abs(segment.to[1] - 139.7671)).toBeLessThan(0.00003));
+    segments.forEach((segment) => expect(segment.to[0]).toBeGreaterThan(segment.from[0]));
+  });
+
+  it("leaves a drive and the fixes around a hole in the record as recorded", () => {
+    const zigzag = (sample: LifeEvent, index: number) => ({ ...sample, longitude: 139.7671 + (index % 2 ? 0.000133 : -0.000133) });
+    const drive = samples("drive", "2026-08-31T01:00:00.000Z", 8, 10, { accuracyMeters: 10 })
+      .map((sample, index) => ({ ...sample, latitude: 35.6812 + index * 0.00135 })).map(zigzag);
+    expect(buildMovementSegments(drive, 0).map((segment) => segment.to)).toEqual(drive.slice(1).map((sample) => [sample.latitude, sample.longitude]));
+
+    const sparse = samples("sparse", "2026-08-31T01:00:00.000Z", 8, 60, { accuracyMeters: 10 })
+      .map((sample, index) => ({ ...sample, latitude: 35.6812 + index * 0.00063 })).map(zigzag);
+    expect(buildMovementSegments(sparse, 0).map((segment) => segment.to)).toEqual(sparse.slice(1).map((sample) => [sample.latitude, sample.longitude]));
+  });
+
+  it("does not take a walk that turns around nearby for a stay", () => {
+    // 110m up the street and back, over and over: never farther than 80m from the middle.
+    const events = samples("lap", "2026-08-31T01:00:00.000Z", 40, 10, { accuracyMeters: 10 })
+      .map((sample, index) => ({ ...sample, latitude: 35.6812 + Math.abs((index % 16) - 8) * 0.000126 }));
+
+    expect(buildStayClusters(events)).toEqual([]);
+  });
+
+  it("keeps a stay whose fixes wander about the place", () => {
+    // A stroll around a square 50m across: always moving, hardly making headway.
+    const events = samples("square", "2026-08-31T01:00:00.000Z", 40, 10, { accuracyMeters: 10 })
+      .map((sample, index) => ({ ...sample, latitude: 35.6812 + Math.sin(index / 8) * 0.000225, longitude: 139.7671 + Math.cos(index / 8) * 0.000277 }));
+
+    expect(buildStayClusters(events)).toHaveLength(1);
+  });
+
   it("keeps a real acceleration and a turn at speed", () => {
     const stopped = samples("stop", "2026-08-31T01:00:00.000Z", 4, 10, { accuracyMeters: 10 });
     // 15 m/s north, then east: fast, but each fix continues from the last one.

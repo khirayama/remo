@@ -150,6 +150,14 @@ private let walkingSpikeMaxSpeedMps = 3.0
 private let minWalkingSpikeDistanceMeters = 30.0
 private let walkingSpikeRatio = 2.0
 private let walkingSpikeMarginMps = 1.5
+// Walks are drawn through the weighted average of five fixes. Ten seconds
+// apart, the fixes of seven recorded walks turned by more than 60 degrees at a
+// quarter to half of them and made the line 17 to 43% longer than its average.
+private let walkSmoothingReach = 2
+private let walkSmoothingMaxGap: TimeInterval = 30
+private let walkSmoothingMaxSpeedMps = 3.0
+private let walkSmoothingMinAccuracyMeters = 5.0
+private let walkSmoothingDefaultAccuracyMeters = 20.0
 let stayClusterRadiusMeters = 80.0
 // Keep detection strict, but tolerate building/station-sized GPS drift when
 // grouping separate visits into a recurring place.
@@ -176,6 +184,15 @@ private let stayMergeMaxFarShare = 0.3
 // flipped fixes does not pull it between two places.
 private let stayCenterRadiusMeters = 50.0
 private let stayCenterCandidates = 64
+// A walk that turns around within the cluster radius is not a stay: 30m or
+// more of headway (the fixes' own error at least) over 45 seconds to 2 minutes,
+// in 70% of the fixes. In 85 recorded stays the share reached 65% once and
+// stayed under 55% otherwise; the two walks taken for stays had 78% and 100%.
+private let stayHeadwayMinWindow: TimeInterval = 45
+private let stayHeadwayMaxWindow: TimeInterval = 2 * 60
+private let stayHeadwayMeters = 30.0
+private let stayHeadwayMaxShare = 0.7
+private let stayHeadwayMinWindows = 8
 // A "stay" whose own samples keep landing back at the neighboring stay never
 // really left it: the device was flipping between fixes.
 private let stayFlipRadiusMeters = 500.0
@@ -728,6 +745,26 @@ private func stayCenter(_ locations: [CorrectedLocation]) -> CLLocationCoordinat
     return locationCenter(locations.filter { distanceMeters(densest.coordinate, $0.coordinate) <= stayCenterRadiusMeters })
 }
 
+/// Whether the samples stop somewhere. Walking a short way out and back keeps
+/// every fix within the cluster radius too, but the fixes keep making headway:
+/// most of them are a walk away from the fix taken a minute earlier. Someone
+/// who stays moves about now and then, and a jumping fix moves back.
+private func isSettled(_ core: [CorrectedLocation]) -> Bool {
+    var windows = 0
+    var moving = 0
+    var to = 0
+    for from in core.indices {
+        let time = core[from].entry.startedAt
+        while to < core.count && core[to].entry.startedAt.timeIntervalSince(time) < stayHeadwayMinWindow { to += 1 }
+        if to >= core.count { break }
+        if core[to].entry.startedAt.timeIntervalSince(time) > stayHeadwayMaxWindow { continue }
+        windows += 1
+        let error = (core[from].entry.accuracyMeters ?? 0) + (core[to].entry.accuracyMeters ?? 0)
+        if distanceMeters(core[from].coordinate, core[to].coordinate) >= max(stayHeadwayMeters, error) { moving += 1 }
+    }
+    return windows < stayHeadwayMinWindows || Double(moving) < Double(windows) * stayHeadwayMaxShare
+}
+
 private struct StaySpan {
     var core: [CorrectedLocation]
     let start: Int
@@ -810,6 +847,7 @@ private func correctedStayClusters(_ locations: [CorrectedLocation]) -> [StayClu
         // `core` holds the samples at the place; the span also covers the noisy
         // samples in between so they are hidden from the movement line.
         var core = runs[index]
+        let first = index
         let start = runStarts[index]
         var end = start + runs[index].count - 1
         index += 1
@@ -836,7 +874,13 @@ private func correctedStayClusters(_ locations: [CorrectedLocation]) -> [StayClu
             if elapsed > maxStayBridgeGap
                 || (elapsed > maxStayExcursion && run.contains { distanceMeters(center, $0.coordinate) > stayDriftRadiusMeters }) { break }
         }
-        if isStayRun(core) { stays.append(StaySpan(core: core, start: start, end: end)) }
+        guard isStayRun(core) else { continue }
+        if isSettled(core) {
+            stays.append(StaySpan(core: core, start: start, end: end))
+        } else {
+            // The runs it took in may still be stays of their own.
+            index = first + 1
+        }
     }
 
     return mergeNearbyStays(stays, locations: locations).enumerated().map { index, stay in
@@ -861,12 +905,55 @@ func buildStayClusters(_ logs: [LogEntry]) -> [StayCluster] {
     correctedStayClusters(correctedPositionLogs(logs))
 }
 
+/// The positions with the walked parts of the route evened out. On foot a fix
+/// is as far off as the device gets between two fixes, so the recorded line
+/// zigzags along the street. Each fix outside a stay is drawn at the average of
+/// itself and up to two fixes on either side, the accurate and the near ones
+/// counting most. Both ends of a walk, the fixes next to a hole in the record
+/// and anything faster than walking keep their place.
+private func smoothedWalks(_ positions: [CorrectedLocation], stays: [StayCluster]) -> [CorrectedLocation] {
+    let inStay = Set(stays.flatMap { $0.entries.map { $0.entry.id } })
+    // Whether the fixes from `index - reach` to `index + reach` are one stretch of walking.
+    func isWalk(_ index: Int, _ reach: Int) -> Bool {
+        let from = index - reach
+        let to = index + reach
+        guard from >= 0, to < positions.count else { return false }
+        for other in from...to {
+            if inStay.contains(positions[other].entry.id) { return false }
+            if other > from {
+                let gap = positions[other].entry.startedAt.timeIntervalSince(positions[other - 1].entry.startedAt)
+                if !(gap > 0 && gap <= walkSmoothingMaxGap) { return false }
+            }
+        }
+        let seconds = positions[to].entry.startedAt.timeIntervalSince(positions[from].entry.startedAt)
+        return distanceMeters(positions[from].coordinate, positions[to].coordinate) <= walkSmoothingMaxSpeedMps * seconds
+    }
+    return positions.enumerated().map { index, location in
+        let reach = isWalk(index, walkSmoothingReach) ? walkSmoothingReach : isWalk(index, 1) ? 1 : 0
+        guard reach > 0 else { return location }
+        var latitude = 0.0
+        var longitude = 0.0
+        var total = 0.0
+        for other in (index - reach)...(index + reach) {
+            let error = max(walkSmoothingMinAccuracyMeters, positions[other].entry.accuracyMeters ?? walkSmoothingDefaultAccuracyMeters)
+            let weight = Double(walkSmoothingReach + 1 - abs(other - index)) / (error * error)
+            latitude += positions[other].latitude * weight
+            longitude += positions[other].longitude * weight
+            total += weight
+        }
+        return CorrectedLocation(entry: location.entry, latitude: latitude / total, longitude: longitude / total, corrected: location.corrected)
+    }
+}
+
 func analyzeTimeline(_ logs: [LogEntry]) -> TimelineAnalysis {
-    let correctedPositions = correctedPositionLogs(logs)
+    let corrected = correctedPositionLogs(logs)
+    // Stays are detected on the corrected positions; smoothing only changes how the walks between them are drawn.
+    let stayClusters = correctedStayClusters(corrected)
+    let correctedPositions = smoothedWalks(corrected, stays: stayClusters)
     return TimelineAnalysis(
         correctedPositions: correctedPositions,
         correctedLocations: correctedPositions.filter { $0.entry.source == .location },
-        stayClusters: correctedStayClusters(correctedPositions),
+        stayClusters: stayClusters,
     )
 }
 

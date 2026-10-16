@@ -1,0 +1,27 @@
+{
+  "activities": [
+    {
+      "kind": "stay",
+      "startedAt": 1791847826650,
+      "endedAt": 1791850023071,
+      "latitude": 33.58089,
+      "longitude": 130.38821,
+      "photoCount": 0
+    },
+    {
+      "kind": "movement",
+      "startedAt": 1791850023071,
+      "endedAt": 1791852681127,
+      "untrackedMs": 0,
+      "photoCount": 0
+    },
+    {
+      "kind": "stay",
+      "startedAt": 1791852681127,
+      "endedAt": 1791854908082,
+      "latitude": 33.58083,
+      "longitude": 130.38811,
+      "photoCount": 0
+    }
+  ]
+}

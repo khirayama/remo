@@ -21,7 +21,7 @@ class SharedTimelineFixtureTest {
         error("fixtures/timeline/$name not found")
     }
 
-    @Test fun matchesTheActivitiesEveryPlatformExpects() = listOf("2026-09-01", "2026-10-01", "2026-10-02", "2026-10-11").forEach(::assertMatches)
+    @Test fun matchesTheActivitiesEveryPlatformExpects() = listOf("2026-09-01", "2026-10-01", "2026-10-02", "2026-10-11", "2026-10-13").forEach(::assertMatches)
 
     private fun assertMatches(day: String) {
         val logs = decodeTimelineImport(fixture("remo-timeline-$day.sample.json").readText(), importedAt = 0L)

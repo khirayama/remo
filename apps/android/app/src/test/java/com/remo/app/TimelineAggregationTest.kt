@@ -5,6 +5,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.sin
 
 class TimelineAggregationTest {
     private val minute = 60 * 1000L
@@ -355,6 +358,45 @@ class TimelineAggregationTest {
         val corrected = correctedLocationLogs(logs)
         assertEquals(listOf("walk-5"), corrected.filter { it.corrected }.map { it.entry.id })
         assertEquals(35.6812 + 5 * 0.000126, corrected[5].latitude, 0.000001)
+    }
+
+    @Test fun walkIsDrawnThroughTheMiddleOfZigzaggingFixes() {
+        // A walk north at about 1.4 m/s, 12m to either side of the street in turn.
+        val logs = (0 until 12).map { index ->
+            entry("walk-$index", index * 10_000L, latitude = 35.6812 + index * 0.000126, longitude = 139.7671 + if (index % 2 == 1) 0.000133 else -0.000133, accuracyMeters = 10.0)
+        }
+        val segments = buildMovementSegments(logs, referenceTimeMs = 3_600_000L)
+
+        // Both ends are drawn where they were recorded.
+        assertEquals(LatLng(logs.first().latitude!!, logs.first().longitude!!), segments.first().from)
+        assertEquals(LatLng(logs.last().latitude!!, logs.last().longitude!!), segments.last().to)
+        segments.drop(1).dropLast(1).forEach { assertTrue(abs(it.to.longitude - 139.7671) < 0.00003) }
+        segments.forEach { assertTrue(it.to.latitude > it.from.latitude) }
+    }
+
+    @Test fun driveAndFixesAroundAHoleAreDrawnAsRecorded() {
+        fun zigzag(prefix: String, step: Long, latitudeStep: Double) = (0 until 8).map { index ->
+            entry("$prefix-$index", index * step, latitude = 35.6812 + index * latitudeStep, longitude = 139.7671 + if (index % 2 == 1) 0.000133 else -0.000133, accuracyMeters = 10.0)
+        }
+        listOf(zigzag("drive", 10_000L, 0.00135), zigzag("sparse", 60_000L, 0.00063)).forEach { logs ->
+            assertEquals(logs.drop(1).map { LatLng(it.latitude!!, it.longitude!!) }, buildMovementSegments(logs, referenceTimeMs = 0L).map { it.to })
+        }
+    }
+
+    @Test fun walkThatTurnsAroundNearbyIsNotAStay() {
+        // 110m up the street and back, over and over: never farther than 80m from the middle.
+        val logs = (0 until 40).map { index ->
+            entry("lap-$index", index * 10_000L, latitude = 35.6812 + abs(index % 16 - 8) * 0.000126, accuracyMeters = 10.0)
+        }
+        assertEquals(emptyList<StayCluster>(), buildStayClusters(logs))
+    }
+
+    @Test fun stayWhoseFixesWanderAboutThePlaceIsKept() {
+        // A stroll around a square 50m across: always moving, hardly making headway.
+        val logs = (0 until 40).map { index ->
+            entry("square-$index", index * 10_000L, latitude = 35.6812 + sin(index / 8.0) * 0.000225, longitude = 139.7671 + cos(index / 8.0) * 0.000277, accuracyMeters = 10.0)
+        }
+        assertEquals(1, buildStayClusters(logs).size)
     }
 
     @Test fun timelineSnapshotMatchesCompatibilityBuilders() {

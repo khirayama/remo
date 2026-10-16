@@ -424,6 +424,14 @@ export type TimelineActivity =
     untrackedMs: number;
   };
 
+// Walks are drawn through the weighted average of five fixes. Ten seconds
+// apart, the fixes of seven recorded walks turned by more than 60 degrees at a
+// quarter to half of them and made the line 17 to 43% longer than its average.
+const WALK_SMOOTHING_REACH = 2;
+const WALK_SMOOTHING_MAX_GAP_MS = 30 * 1000;
+const WALK_SMOOTHING_MAX_SPEED_MPS = 3;
+const WALK_SMOOTHING_MIN_ACCURACY_METERS = 5;
+const WALK_SMOOTHING_DEFAULT_ACCURACY_METERS = 20;
 export const STAY_CLUSTER_RADIUS_METERS = 80;
 // Keep recurring-place grouping close to the stay detector so neighboring
 // buildings do not get presented as the same place.
@@ -450,6 +458,15 @@ const STAY_MERGE_MAX_FAR_SHARE = 0.3;
 // flipped fixes does not pull it between two places.
 const STAY_CENTER_RADIUS_METERS = 50;
 const STAY_CENTER_CANDIDATES = 64;
+// A walk that turns around within the cluster radius is not a stay: 30m or
+// more of headway (the fixes' own error at least) over 45 seconds to 2 minutes,
+// in 70% of the fixes. In 85 recorded stays the share reached 65% once and
+// stayed under 55% otherwise; the two walks taken for stays had 78% and 100%.
+const STAY_HEADWAY_MIN_WINDOW_MS = 45 * 1000;
+const STAY_HEADWAY_MAX_WINDOW_MS = 2 * 60 * 1000;
+const STAY_HEADWAY_METERS = 30;
+const STAY_HEADWAY_MAX_SHARE = 0.7;
+const STAY_HEADWAY_MIN_WINDOWS = 8;
 // A "stay" whose own samples keep landing back at the neighboring stay never
 // really left it: the device was flipping between fixes.
 const STAY_FLIP_RADIUS_METERS = 500;
@@ -706,6 +723,27 @@ function stayCenter(locations: CorrectedLocation[]) {
   return locationCenter(locations.filter((location) => distanceMeters(densest, location) <= STAY_CENTER_RADIUS_METERS));
 }
 
+/**
+ * Whether the samples stop somewhere. Walking a short way out and back keeps
+ * every fix within the cluster radius too, but the fixes keep making headway:
+ * most of them are a walk away from the fix taken a minute earlier. Someone
+ * who stays moves about now and then, and a jumping fix moves back.
+ */
+function isSettled(core: CorrectedLocation[]) {
+  let windows = 0;
+  let moving = 0;
+  for (let from = 0, to = 0; from < core.length; from += 1) {
+    const time = timestamp(core[from].event.startedAt);
+    while (to < core.length && timestamp(core[to].event.startedAt) - time < STAY_HEADWAY_MIN_WINDOW_MS) to += 1;
+    if (to >= core.length) break;
+    if (timestamp(core[to].event.startedAt) - time > STAY_HEADWAY_MAX_WINDOW_MS) continue;
+    windows += 1;
+    const error = (core[from].event.accuracyMeters ?? 0) + (core[to].event.accuracyMeters ?? 0);
+    if (distanceMeters(core[from], core[to]) >= Math.max(STAY_HEADWAY_METERS, error)) moving += 1;
+  }
+  return windows < STAY_HEADWAY_MIN_WINDOWS || moving < windows * STAY_HEADWAY_MAX_SHARE;
+}
+
 type StaySpan = { core: CorrectedLocation[]; start: number; end: number };
 
 /** Whether `stay` keeps returning to `center` while it records fixes elsewhere. */
@@ -776,6 +814,7 @@ function correctedStayClusters(locations: CorrectedLocation[]): StayCluster[] {
     // `core` holds the samples at the place; the span also covers the noisy
     // samples in between so they are hidden from the movement line.
     const core = [...runs[index]];
+    const first = index;
     const start = runStarts[index];
     let end = start + runs[index].length - 1;
     index += 1;
@@ -801,7 +840,10 @@ function correctedStayClusters(locations: CorrectedLocation[]): StayCluster[] {
       if (elapsedMs > MAX_STAY_BRIDGE_GAP_MS
         || (elapsedMs > MAX_STAY_EXCURSION_MS && run.some((location) => distanceMeters(center, location) > STAY_DRIFT_RADIUS_METERS))) break;
     }
-    if (isStayRun(core)) stays.push({ core, start, end });
+    if (!isStayRun(core)) continue;
+    if (isSettled(core)) stays.push({ core, start, end });
+    // The runs it took in may still be stays of their own.
+    else index = first + 1;
   }
 
   return mergeNearbyStays(stays, locations).map((stay, index) => {
@@ -1101,12 +1143,54 @@ function suggestPhotoLocationFromLocations(event: LifeEvent, locations: Correcte
   return { latitude: nearest.latitude, longitude: nearest.longitude, timeDistanceMs: Math.min(previousDistance, nextDistance), previousId: previous?.event.id, nextId: next?.event.id };
 }
 
+/**
+ * The positions with the walked parts of the route evened out. On foot a fix
+ * is as far off as the device gets between two fixes, so the recorded line
+ * zigzags along the street. Each fix outside a stay is drawn at the average of
+ * itself and up to two fixes on either side, the accurate and the near ones
+ * counting most. Both ends of a walk, the fixes next to a hole in the record
+ * and anything faster than walking keep their place.
+ */
+function smoothedWalks(positions: CorrectedLocation[], stays: StayCluster[]): CorrectedLocation[] {
+  const inStay = new Set(stays.flatMap((stay) => stay.events.map((location) => location.event.id)));
+  const times = positions.map((location) => timestamp(location.event.startedAt));
+  // Whether the fixes from `index - reach` to `index + reach` are one stretch of walking.
+  const isWalk = (index: number, reach: number) => {
+    const from = index - reach;
+    const to = index + reach;
+    if (from < 0 || to >= positions.length) return false;
+    for (let other = from; other <= to; other += 1) {
+      if (inStay.has(positions[other].event.id)) return false;
+      if (other > from && !(times[other] - times[other - 1] > 0 && times[other] - times[other - 1] <= WALK_SMOOTHING_MAX_GAP_MS)) return false;
+    }
+    return distanceMeters(positions[from], positions[to]) <= WALK_SMOOTHING_MAX_SPEED_MPS * (times[to] - times[from]) / 1000;
+  };
+  return positions.map((location, index) => {
+    const reach = isWalk(index, WALK_SMOOTHING_REACH) ? WALK_SMOOTHING_REACH : isWalk(index, 1) ? 1 : 0;
+    if (reach === 0) return location;
+    let latitude = 0;
+    let longitude = 0;
+    let total = 0;
+    for (let other = index - reach; other <= index + reach; other += 1) {
+      const error = Math.max(WALK_SMOOTHING_MIN_ACCURACY_METERS, positions[other].event.accuracyMeters ?? WALK_SMOOTHING_DEFAULT_ACCURACY_METERS);
+      const weight = (WALK_SMOOTHING_REACH + 1 - Math.abs(other - index)) / (error * error);
+      latitude += positions[other].latitude * weight;
+      longitude += positions[other].longitude * weight;
+      total += weight;
+    }
+    return { ...location, latitude: latitude / total, longitude: longitude / total };
+  });
+}
+
 function analyzeTimeline(events: LifeEvent[]): TimelineAnalysis {
-  const correctedPositions = correctedPositionEvents(events);
+  const corrected = correctedPositionEvents(events);
+  // Stays are detected on the corrected positions; smoothing only changes how the walks between them are drawn.
+  const stayClusters = correctedStayClusters(corrected);
+  const correctedPositions = smoothedWalks(corrected, stayClusters);
   return {
     correctedPositions,
     correctedLocations: correctedPositions.filter((location) => location.event.source === "location"),
-    stayClusters: correctedStayClusters(correctedPositions),
+    stayClusters,
   };
 }
 

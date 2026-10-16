@@ -530,6 +530,49 @@ final class RemoTests: XCTestCase {
         XCTAssertEqual(stale.latitude, 35.6812 + 4 * 0.002, accuracy: 0.000001)
     }
 
+    /// One accurate fix every `step` seconds going north, 12m to either side of the street in turn.
+    private func zigzag(_ prefix: String, _ count: Int, step: TimeInterval, latitudeStep: Double) -> [LogEntry] {
+        (0..<count).map { index in
+            LogEntry(id: "\(prefix)-\(index)", startedAt: origin.addingTimeInterval(Double(index) * step), latitude: 35.6812 + Double(index) * latitudeStep, longitude: 139.7671 + (index % 2 == 1 ? 0.000133 : -0.000133), accuracyMeters: 10, source: .location, updatedAt: origin)
+        }
+    }
+
+    func testWalkIsDrawnThroughTheMiddleOfZigzaggingFixes() {
+        // A walk at about 1.4 m/s.
+        let logs = zigzag("walk", 12, step: 10, latitudeStep: 0.000126)
+        let segments = buildMovementSegments(logs, referenceDate: origin.addingTimeInterval(3600))
+
+        // Both ends are drawn where they were recorded.
+        XCTAssertEqual(segments.first?.from.longitude, logs[0].longitude)
+        XCTAssertEqual(segments.last?.to.longitude, logs[11].longitude)
+        for segment in segments.dropFirst().dropLast() { XCTAssertLessThan(abs(segment.to.longitude - 139.7671), 0.00003) }
+        for segment in segments { XCTAssertGreaterThan(segment.to.latitude, segment.from.latitude) }
+    }
+
+    func testDriveAndFixesAroundAHoleAreDrawnAsRecorded() {
+        for logs in [zigzag("drive", 8, step: 10, latitudeStep: 0.00135), zigzag("sparse", 8, step: 60, latitudeStep: 0.00063)] {
+            let drawn = buildMovementSegments(logs, referenceDate: origin).map(\.to)
+            XCTAssertEqual(drawn.map(\.latitude), logs.dropFirst().map { $0.latitude! })
+            XCTAssertEqual(drawn.map(\.longitude), logs.dropFirst().map { $0.longitude! })
+        }
+    }
+
+    func testWalkThatTurnsAroundNearbyIsNotAStay() {
+        // 110m up the street and back, over and over: never farther than 80m from the middle.
+        let logs = (0..<40).map { index in
+            LogEntry(id: "lap-\(index)", startedAt: origin.addingTimeInterval(Double(index) * 10), latitude: 35.6812 + Double(abs(index % 16 - 8)) * 0.000126, longitude: 139.7671, accuracyMeters: 10, source: .location, updatedAt: origin)
+        }
+        XCTAssertTrue(buildStayClusters(logs).isEmpty)
+    }
+
+    func testStayWhoseFixesWanderAboutThePlaceIsKept() {
+        // A stroll around a square 50m across: always moving, hardly making headway.
+        let logs = (0..<40).map { index in
+            LogEntry(id: "square-\(index)", startedAt: origin.addingTimeInterval(Double(index) * 10), latitude: 35.6812 + sin(Double(index) / 8) * 0.000225, longitude: 139.7671 + cos(Double(index) / 8) * 0.000277, accuracyMeters: 10, source: .location, updatedAt: origin)
+        }
+        XCTAssertEqual(buildStayClusters(logs).count, 1)
+    }
+
     func testFixThatLandsBehindAWalkIsCorrected() {
         // A walk north at about 1.4 m/s; one fix reports a place 50m back.
         let logs = (0..<12).map { index -> LogEntry in
