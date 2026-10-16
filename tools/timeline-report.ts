@@ -112,7 +112,7 @@ function plot(day: string, events: LifeEvent[], snapshot: TimelineRenderSnapshot
 
 for (const [day, events] of [...days].sort(([a], [b]) => a.localeCompare(b))) {
   if (plotDay && day !== plotDay) continue;
-  const snapshot = buildTimelineSnapshot(events, Date.parse(document.exportedAt));
+  const snapshot = buildTimelineSnapshot(events);
   report(day, events, snapshot);
   if (plotDay) plot(day, events, snapshot);
 }

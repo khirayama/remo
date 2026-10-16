@@ -51,6 +51,9 @@ struct TimelineHomeView: View {
     @State private var loadedDate: Date?
     @State private var focus: TimelineMapFocus?
     @State private var cameraRequest: MapCameraRequest?
+    /// How far the day's replay has played, from 0 to 1; nil when not replaying.
+    @State private var replayProgress: Double?
+    @State private var replayPlaying = false
     @State private var expanded = false
     @State private var dragOffset: CGFloat = 0
     @State private var photoSelection: PhotoSelection?
@@ -104,6 +107,7 @@ struct TimelineHomeView: View {
                         insets: insets,
                         cameraRequest: cameraRequest,
                         showsUserLocation: canLocate,
+                        replayProgress: replayProgress,
                         onSelectPhotos: { photoSelection = PhotoSelection(entries: $0) },
                     )
                     .ignoresSafeArea()
@@ -118,8 +122,37 @@ struct TimelineHomeView: View {
                 sheet(height: sheetHeight, peekHeight: peekHeight, maxHeight: maxHeight, safeBottom: safeBottom)
                     .frame(maxHeight: .infinity, alignment: .bottom)
                     .ignoresSafeArea(edges: .bottom)
+
+                if mode == .day, let replayProgress, let replay = snapshot.replay {
+                    ReplayBar(
+                        time: replay.time(at: replayProgress),
+                        progress: Binding(get: { replayProgress }, set: { replayPlaying = false; self.replayProgress = $0 }),
+                        playing: $replayPlaying,
+                        onClose: stopReplay,
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, sheetHeight + 12)
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+                    .ignoresSafeArea(edges: .bottom)
+                }
             }
         }
+        .task(id: replayPlaying) {
+            guard replayPlaying else { return }
+            if (replayProgress ?? 0) >= 1 { replayProgress = 0 }
+            var last = ContinuousClock.now
+            while !Task.isCancelled, replayPlaying, let progress = replayProgress, progress < 1 {
+                try? await Task.sleep(for: .milliseconds(16))
+                let now = ContinuousClock.now
+                let elapsed = (now - last) / .seconds(1)
+                last = now
+                replayProgress = min(1, progress + elapsed / replayPlaybackDuration)
+            }
+            if replayProgress != nil { replayPlaying = false }
+        }
+        // Picking an activity in the sheet hands the map back to that activity.
+        .onChange(of: focus) { _, focus in if focus != nil { stopReplay() } }
+        .onChange(of: snapshotRevision) { _, _ in if snapshot.replay == nil { stopReplay() } }
         .task(id: logs.map { "\($0.id):\($0.updatedAt.timeIntervalSince1970)" }.joined(separator: "|") + "@\(date.timeIntervalSince1970)@\(logsDate?.timeIntervalSince1970 ?? 0)") {
             // The records of the previous day are still shown while the new day is read.
             guard logsDate == date else { return }
@@ -132,14 +165,20 @@ struct TimelineHomeView: View {
             loadedDate = requestedDate
             await placeResolver.resolve(next.stayPlaces)
         }
-        .onChange(of: date) { _, _ in focus = nil }
+        .onChange(of: date) { _, _ in
+            focus = nil
+            stopReplay()
+        }
         // A renamed place shows its new name everywhere at once.
         .onChange(of: namedPlaces.places) { _, _ in
             allPlaceLabels = [:]
             Task { await placeResolver.resolve(snapshot.stayPlaces) }
         }
         // A camera request belongs to the map it was made on.
-        .onChange(of: mode) { _, _ in cameraRequest = nil }
+        .onChange(of: mode) { _, _ in
+            cameraRequest = nil
+            stopReplay()
+        }
         .task(id: "\(stayIndex.revision)@\(period.rawValue)") {
             guard let stays = stayIndex.stays else { return }
             let period = period
@@ -169,6 +208,18 @@ struct TimelineHomeView: View {
         }
     }
 
+    private func startReplay() {
+        focus = nil
+        replayProgress = 0
+        replayPlaying = true
+        cameraRequest = MapCameraRequest(kind: .fitDay)
+    }
+
+    private func stopReplay() {
+        replayPlaying = false
+        replayProgress = nil
+    }
+
     private func selectPlace(_ place: AllTimeStayPlace) {
         selectedPlaceID = place.id
         historyTarget = PlaceHistoryTarget(coordinate: place.coordinate, label: allPlaceLabels[place.id], visits: place.visits)
@@ -192,6 +243,7 @@ struct TimelineHomeView: View {
                     cameraRequest = MapCameraRequest(kind: .fitDay)
                 }
             } else {
+                MapControlButton(systemName: "play.fill", label: "この日をリプレイ", enabled: snapshot.replay != nil && replayProgress == nil, action: startReplay)
                 MapControlButton(systemName: "arrow.up.left.and.arrow.down.right", label: "この日の記録全体を表示", enabled: !snapshot.mapCoordinates.isEmpty) {
                     cameraRequest = MapCameraRequest(kind: .fitDay)
                 }
@@ -268,6 +320,34 @@ struct TimelineHomeView: View {
         .background(RemoStyle.surface)
         .clipShape(UnevenRoundedRectangle(topLeadingRadius: RemoRadius.extraLarge, topTrailingRadius: RemoRadius.extraLarge, style: .continuous))
         .shadow(color: .black.opacity(0.12), radius: 8, y: -1)
+    }
+}
+
+/// Play/pause, the replayed moment's time, a scrubber, and a way out.
+private struct ReplayBar: View {
+    let time: Date
+    @Binding var progress: Double
+    @Binding var playing: Bool
+    let onClose: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Button { playing.toggle() } label: {
+                Image(systemName: playing ? "pause.fill" : "play.fill").frame(width: 44, height: 44)
+            }
+            .accessibilityLabel(playing ? "一時停止" : "再生")
+            Text(formatTime(time)).font(RemoFont.labelLarge.monospacedDigit())
+            Slider(value: $progress, in: 0...1).tint(RemoStyle.tealDark).padding(.horizontal, 12)
+            Button(action: onClose) {
+                Image(systemName: "xmark").frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("リプレイを閉じる")
+        }
+        .foregroundStyle(RemoStyle.ink)
+        .buttonStyle(.plain)
+        .padding(.horizontal, 4)
+        .background(RemoStyle.surface, in: Capsule())
+        .shadow(color: .black.opacity(0.18), radius: 3, y: 1.5)
     }
 }
 
