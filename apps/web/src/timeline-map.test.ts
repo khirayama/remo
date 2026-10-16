@@ -95,7 +95,7 @@ describe("map timeline", () => {
       event({ id: "stay-2", startedAt: "2026-08-31T01:10:00.000Z", latitude: 35.68145 }),
       event({ id: "stay-3", startedAt: "2026-08-31T01:20:00.000Z", latitude: 35.68135, longitude: 139.7672 }),
       event({ id: "move", startedAt: "2026-08-31T01:30:00.000Z", latitude: 35.684, longitude: 139.77 }),
-    ], Date.parse("2026-08-31T02:00:00.000Z"));
+    ]);
 
     expect(stay).toHaveLength(1);
     expect(stay[0].events).toHaveLength(3);
@@ -183,15 +183,17 @@ describe("map timeline", () => {
     expect(activities[0].photos.map((photo) => photo.id)).toEqual(["travel-photo"]);
   });
 
-  it("fades processed movement by distance from the current time", () => {
+  it("fades the route in along the drawn day", () => {
     const movement = buildMovementSegments([
       event({ id: "old", startedAt: "2026-08-31T01:00:00.000Z" }),
       event({ id: "middle", startedAt: "2026-08-31T01:30:00.000Z", latitude: 35.684, longitude: 139.77 }),
       event({ id: "new", startedAt: "2026-08-31T01:55:00.000Z", latitude: 35.69, longitude: 139.78 }),
-    ], Date.parse("2026-08-31T02:00:00.000Z"));
+    ]);
 
+    expect(movement[0].startOpacity).toBeCloseTo(0.25);
+    expect(movement[1].startOpacity).toBeCloseTo(movement[0].opacity);
     expect(movement[0].opacity).toBeLessThan(movement[1].opacity);
-    expect(routeOpacity(0)).toBe(0.95);
+    expect(movement[1].opacity).toBeCloseTo(0.95);
   });
 
   it("counts videos separately in a photo cluster", () => {
@@ -389,8 +391,9 @@ describe("map timeline", () => {
     ]));
   });
 
-  it("makes older route segments lighter", () => {
-    expect(routeOpacity(5 * 60 * 1000)).toBeGreaterThan(routeOpacity(60 * 60 * 1000));
+  it("makes the start of the route lighter than its end", () => {
+    expect(routeOpacity(10, 100)).toBeLessThan(routeOpacity(90, 100));
+    expect(routeOpacity(0, 0)).toBe(0.95);
   });
 
   it("uses the photo cluster radius for nearby photo selection", () => {
@@ -599,7 +602,7 @@ describe("map timeline", () => {
   it("draws a walk through the middle of fixes that zigzag along the street", () => {
     // 12m to either side of the street in turn.
     const events = walk("walk", "2026-08-31T01:00:00.000Z", 12).map((sample, index) => ({ ...sample, longitude: 139.7671 + (index % 2 ? 0.000133 : -0.000133) }));
-    const segments = buildMovementSegments(events, Date.parse("2026-08-31T02:00:00.000Z"));
+    const segments = buildMovementSegments(events);
 
     // Both ends are drawn where they were recorded.
     expect(segments[0].from).toEqual([events[0].latitude, events[0].longitude]);
@@ -612,11 +615,11 @@ describe("map timeline", () => {
     const zigzag = (sample: LifeEvent, index: number) => ({ ...sample, longitude: 139.7671 + (index % 2 ? 0.000133 : -0.000133) });
     const drive = samples("drive", "2026-08-31T01:00:00.000Z", 8, 10, { accuracyMeters: 10 })
       .map((sample, index) => ({ ...sample, latitude: 35.6812 + index * 0.00135 })).map(zigzag);
-    expect(buildMovementSegments(drive, 0).map((segment) => segment.to)).toEqual(drive.slice(1).map((sample) => [sample.latitude, sample.longitude]));
+    expect(buildMovementSegments(drive).map((segment) => segment.to)).toEqual(drive.slice(1).map((sample) => [sample.latitude, sample.longitude]));
 
     const sparse = samples("sparse", "2026-08-31T01:00:00.000Z", 8, 60, { accuracyMeters: 10 })
       .map((sample, index) => ({ ...sample, latitude: 35.6812 + index * 0.00063 })).map(zigzag);
-    expect(buildMovementSegments(sparse, 0).map((segment) => segment.to)).toEqual(sparse.slice(1).map((sample) => [sample.latitude, sample.longitude]));
+    expect(buildMovementSegments(sparse).map((segment) => segment.to)).toEqual(sparse.slice(1).map((sample) => [sample.latitude, sample.longitude]));
   });
 
   it("does not take a walk that turns around nearby for a stay", () => {

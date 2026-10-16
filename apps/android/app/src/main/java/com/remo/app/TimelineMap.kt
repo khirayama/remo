@@ -20,22 +20,33 @@ import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.MyLocation
+import androidx.compose.material.icons.outlined.Pause
+import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.ZoomOutMap
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -52,6 +63,7 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.GoogleMap
 import com.google.android.gms.maps.MapView
+import com.google.android.gms.maps.model.BitmapDescriptor
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.Circle
 import com.google.android.gms.maps.model.CircleOptions
@@ -67,6 +79,9 @@ import com.google.android.gms.maps.model.PatternItem
 import com.google.android.gms.maps.model.Polyline
 import com.google.android.gms.maps.model.PolylineOptions
 import com.google.android.gms.maps.model.RoundCap
+import com.google.android.gms.maps.model.StrokeStyle
+import com.google.android.gms.maps.model.StyleSpan
+import com.google.android.gms.maps.model.TextureStyle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -119,7 +134,14 @@ internal fun TimelineMap(
     val processedLocations = timeline.processedLocations
     val routeSegments = timeline.routeSegments
     val routeRgb = MapColors.routeRgb
-    val routePaths = remember(routeSegments, focusTarget != null, routeRgb) { routeRenderPaths(routeSegments, focusTarget != null, routeRgb) }
+    val replay = remember(routeSegments) { RouteReplay.of(routeSegments) }
+    var replaying by remember(viewKey) { mutableStateOf(false) }
+    var replayPlaying by remember(viewKey) { mutableStateOf(false) }
+    var replayProgress by remember(viewKey) { mutableFloatStateOf(0f) }
+    // Picking an activity in the sheet hands the map back to that activity.
+    LaunchedEffect(focusTarget, replay) { if (focusTarget != null || replay == null) replaying = false }
+    val dimmed = focusTarget != null || replaying
+    val routePaths = remember(routeSegments, dimmed) { routeRenderPaths(routeSegments, dimmed) }
     val stayClusters = timeline.stayClusters
     var stayLabels by remember { mutableStateOf<Map<String, StayPlaceLabel>>(emptyMap()) }
     LaunchedEffect(stayClusters) {
@@ -151,18 +173,21 @@ internal fun TimelineMap(
     val canLocate = hasLocationPermission(context)
     var readyMap by remember { mutableStateOf<GoogleMap?>(null) }
     val focusedViewKey = remember { mutableStateOf<String?>(null) }
-    val mapRenderKey = remember(viewKey, loaded, routeSegments, stayClusters, stayLabels, photoClusters, photoThumbnails, focusTarget) {
-        MapRenderKey(viewKey, loaded, routeSegments, stayClusters, stayLabels, photoClusters, photoThumbnails, focusTarget)
+    val mapRenderKey = remember(viewKey, loaded, routeSegments, routeRgb, stayClusters, stayLabels, photoClusters, photoThumbnails, focusTarget, replaying) {
+        MapRenderKey(viewKey, loaded, routeSegments, routeRgb, stayClusters, stayLabels, photoClusters, photoThumbnails, focusTarget, replaying)
     }
     var renderedMapKey by remember { mutableStateOf<MapRenderKey?>(null) }
     var openInfoWindowKey by remember { mutableStateOf<String?>(null) }
-    val routeLines = remember { mutableListOf<Pair<RouteRenderPath, Polyline>>() }
+    val routeLines = remember { mutableListOf<RenderedRoute>() }
     val stayCircles = remember { mutableMapOf<String, Circle>() }
     val stayInfoMarkers = remember { mutableMapOf<String, Marker>() }
     val renderedStays = remember { mutableMapOf<String, Pair<StayCluster, StayPlaceLabel?>>() }
     val photoMarkers = remember { mutableMapOf<String, Marker>() }
     val renderedPhotos = remember { mutableMapOf<String, Pair<PhotoCluster, Bitmap?>>() }
     val focusLine = remember { arrayOfNulls<Polyline>(1) }
+    val replayLine = remember { arrayOfNulls<Polyline>(1) }
+    val replayHead = remember { arrayOfNulls<Marker>(1) }
+    val chevrons = remember { mutableMapOf<Int, BitmapDescriptor>() }
     val mapView = rememberMapView()
     val px = context.resources.displayMetrics.density
 
@@ -187,23 +212,39 @@ internal fun TimelineMap(
                         if (mapLocations.isEmpty()) moveToCurrentLocation(context, map) else fitMap(map, mapLocations, px)
                         focusedViewKey.value = viewKey
                     }
-                    while (routeLines.size > routePaths.size) routeLines.removeAt(routeLines.lastIndex).second.remove()
+                    while (routeLines.size > routePaths.size) routeLines.removeAt(routeLines.lastIndex).remove()
+                    val chevron = chevrons.getOrPut(MapColors.focusRouteRgb) { chevronStamp(MapColors.focusRouteRgb, px) }
                     routePaths.forEachIndexed { index, path ->
-                        val previous = routeLines.getOrNull(index)
-                        if (previous == null) {
-                            routeLines += path to map.addPolyline(
-                                PolylineOptions().addAll(path.points).color(path.color).width(routeWidth(path) * px)
+                        val rendered = routeLines.getOrNull(index)
+                        if (rendered == null) {
+                            routeLines += RenderedRoute(path, routeRgb, map.addPolyline(
+                                PolylineOptions().addAll(path.points).addAllSpans(routeSpans(path, routeRgb)).width(routeWidth(path) * px)
                                     .pattern(routePattern(path, px))
                                     .jointType(JointType.ROUND).startCap(RoundCap()).endCap(RoundCap())
-                            )
-                        } else if (previous.first != path) {
-                            if (previous.first.points != path.points) previous.second.points = path.points
-                            if (previous.first.color != path.color) previous.second.color = path.color
-                            if (previous.first.untracked != path.untracked) {
-                                previous.second.width = routeWidth(path) * px
-                                previous.second.pattern = routePattern(path, px)
+                            ))
+                        } else if (rendered.path != path || rendered.rgb != routeRgb) {
+                            if (rendered.path.points != path.points) {
+                                rendered.line.points = path.points
+                                rendered.chevrons?.points = path.points
                             }
-                            routeLines[index] = path to previous.second
+                            rendered.line.spans = routeSpans(path, routeRgb)
+                            if (rendered.path.untracked != path.untracked) {
+                                rendered.line.width = routeWidth(path) * px
+                                rendered.line.pattern = routePattern(path, px)
+                            }
+                            if (rendered.rgb != routeRgb) rendered.chevrons?.let { it.spans = chevronSpans(chevron) }
+                            rendered.path = path
+                            rendered.rgb = routeRgb
+                        }
+                        val route = routeLines[index]
+                        // Chevrons only on recorded lines: an unrecorded gap has no direction to show.
+                        if (!path.untracked && !dimmed) {
+                            if (route.chevrons == null) route.chevrons = map.addPolyline(
+                                PolylineOptions().addAll(path.points).width(CHEVRON_WIDTH_DP * px).zIndex(1f).addAllSpans(chevronSpans(chevron))
+                            )
+                        } else {
+                            route.chevrons?.remove()
+                            route.chevrons = null
                         }
                     }
                     val stayKeys = stayClusters.map { "stay:${it.entries.firstOrNull()?.entry?.id ?: it.id}" }.toSet()
@@ -219,11 +260,7 @@ internal fun TimelineMap(
                         val label = stayLabels[stay.id].named(stay.coordinate)
                         val circle = stayCircles.getOrPut(popupKey) { map.addCircle(CircleOptions().center(stay.coordinate).clickable(true)) }
                         if (renderedStays[popupKey]?.first != stay) circle.center = stay.coordinate
-                        circle.radius = stayCircleRadiusMeters(stay.durationMs) + if (selected) 8.0 else 0.0
-                        circle.strokeColor = MapColors.argb(if (focusTarget == null) 170 else if (selected) 255 else 50, MapColors.stayRgb)
-                        circle.strokeWidth = (if (selected) 2.5f else 1.5f) * px
-                        circle.fillColor = MapColors.argb(if (focusTarget == null) 46 else if (selected) 90 else 14, MapColors.stayRgb)
-                        circle.zIndex = if (selected) 1f else 0f
+                        circle.applyStayStyle(stay, if (selected) StayCircleState.SELECTED else if (dimmed) StayCircleState.DIMMED else StayCircleState.NORMAL, px)
                         circle.tag = popupKey
                         val stayDetails = listOfNotNull(
                             label?.address?.takeIf { it != label.primary },
@@ -255,16 +292,19 @@ internal fun TimelineMap(
                                 it.title = mediaSummary(cluster.photoCount, cluster.videoCount)
                                 it.setIcon(photoMarkerIcon(context, thumbnail, cluster.photoCount + cluster.videoCount, log.mediaType == MediaType.VIDEO))
                             }
-                            it.alpha = if (focusTarget == null) 1f else 0.4f
+                            it.alpha = if (dimmed) 0.4f else 1f
                         }
                         renderedPhotos[cluster.id] = cluster to thumbnail
                     }
-                    if (focusTarget?.kind == TimelineActivityKind.MOVEMENT && focusTarget.path.size > 1) {
+                    if (!replaying && focusTarget?.kind == TimelineActivityKind.MOVEMENT && focusTarget.path.size > 1) {
                         val line = focusLine[0] ?: map.addPolyline(
-                            PolylineOptions().color(MapColors.argb(255, MapColors.focusRouteRgb)).width(6 * px).zIndex(2f)
+                            PolylineOptions().width(6 * px).zIndex(2f)
                                 .jointType(JointType.ROUND).startCap(RoundCap()).endCap(RoundCap())
                         ).also { focusLine[0] = it }
+                        // Spans refer to segments, so the points must be in place first.
                         line.points = focusTarget.path
+                        line.spans = listOf(StyleSpan(StrokeStyle.colorBuilder(MapColors.argb(255, MapColors.focusRouteRgb))
+                            .stamp(TextureStyle.newBuilder(chevrons.getOrPut(0xFFFFFF) { chevronStamp(0xFFFFFF, px) }).build()).build()))
                     } else {
                         focusLine[0]?.remove()
                         focusLine[0] = null
@@ -299,11 +339,73 @@ internal fun TimelineMap(
                     readyMap?.let { moveToCurrentLocation(context, it, animate = true) }
                 }
             }
+            MapControlButton(Icons.Outlined.PlayArrow, "この日をリプレイ", enabled = readyMap != null && replay != null && !replaying) {
+                replayProgress = 0f
+                replayPlaying = true
+                replaying = true
+                readyMap?.let { fitMap(it, mapLocations, px, animate = true) }
+            }
             MapControlButton(Icons.Outlined.ZoomOutMap, "この日の記録全体を表示", enabled = readyMap != null && mapLocations.isNotEmpty()) {
                 readyMap?.let { fitMap(it, mapLocations, px, animate = true) }
             }
         }
         overlay()
+        if (replaying && replay != null) {
+            ReplayBar(
+                time = replay.timeAt(replayProgress),
+                progress = replayProgress,
+                playing = replayPlaying,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(start = 12.dp, end = 12.dp, bottom = contentPadding.calculateBottomPadding() + 12.dp),
+                onTogglePlaying = { replayPlaying = !replayPlaying },
+                onSeek = { replayPlaying = false; replayProgress = it },
+                onClose = { replayPlaying = false; replaying = false },
+            )
+        }
+    }
+    LaunchedEffect(replaying, replayPlaying) {
+        if (!replaying || !replayPlaying) return@LaunchedEffect
+        if (replayProgress >= 1f) replayProgress = 0f
+        var last = withFrameNanos { it }
+        while (replayProgress < 1f) {
+            val now = withFrameNanos { it }
+            replayProgress = (replayProgress + (now - last) / 1_000_000f / REPLAY_PLAYBACK_MS).coerceAtMost(1f)
+            last = now
+        }
+        replayPlaying = false
+    }
+    // Restarts after every full render so the replay's styling wins over it.
+    LaunchedEffect(readyMap, replaying, replay, renderedMapKey) {
+        val map = readyMap ?: return@LaunchedEffect
+        if (!replaying || replay == null) {
+            replayLine[0]?.remove()
+            replayLine[0] = null
+            replayHead[0]?.remove()
+            replayHead[0] = null
+            return@LaunchedEffect
+        }
+        snapshotFlow { replayProgress }.collect { progress ->
+            val frame = replay.frame(progress)
+            val line = replayLine[0] ?: map.addPolyline(
+                PolylineOptions().color(MapColors.argb(255, MapColors.focusRouteRgb)).width(6 * px).zIndex(2f)
+                    .jointType(JointType.ROUND).startCap(RoundCap()).endCap(RoundCap())
+            ).also { replayLine[0] = it }
+            line.points = frame.drawn
+            val head = replayHead[0] ?: map.addMarker(
+                MarkerOptions().position(frame.head).anchor(0.5f, 0.5f).zIndex(4f).icon(replayHeadIcon(px))
+            )?.also { replayHead[0] = it }
+            head?.position = frame.head
+            stayClusters.forEach { stay ->
+                val state = when {
+                    frame.time < stay.startedAt -> StayCircleState.DIMMED
+                    frame.time <= stay.endedAt -> StayCircleState.SELECTED
+                    else -> StayCircleState.NORMAL
+                }
+                stayCircles["stay:${stay.entries.firstOrNull()?.entry?.id ?: stay.id}"]?.applyStayStyle(stay, state, px)
+            }
+            photoClusters.forEach { cluster ->
+                photoMarkers[cluster.id]?.alpha = if (cluster.entries.first().startedAt <= frame.time) 1f else 0.25f
+            }
+        }
     }
     DisposableEffect(mapView, lifecycleOwner) { bindMapLifecycle(mapView, lifecycleOwner.lifecycle) }
     LaunchedEffect(readyMap, padding) {
@@ -463,12 +565,112 @@ private data class MapRenderKey(
     val viewKey: String,
     val loaded: Boolean,
     val routeSegments: List<RouteSegment>,
+    val routeRgb: Int,
     val stayClusters: List<StayCluster>,
     val stayLabels: Map<String, StayPlaceLabel>,
     val photoClusters: List<PhotoCluster>,
     val photoThumbnails: Map<String, Bitmap?>,
     val focusTarget: TimelineMapFocus?,
+    val replaying: Boolean,
 )
+
+private class RenderedRoute(var path: RouteRenderPath, var rgb: Int, val line: Polyline, var chevrons: Polyline? = null) {
+    fun remove() {
+        line.remove()
+        chevrons?.remove()
+    }
+}
+
+private fun routeSpans(path: RouteRenderPath, rgb: Int): List<StyleSpan> = gradientRuns(path.alphas).map { (segments, start, end) ->
+    StyleSpan(StrokeStyle.gradientBuilder(MapColors.argb((start * 255).toInt(), rgb), MapColors.argb((end * 255).toInt(), rgb)).build(), segments.toDouble())
+}
+
+private enum class StayCircleState { NORMAL, SELECTED, DIMMED }
+
+private fun Circle.applyStayStyle(stay: StayCluster, state: StayCircleState, px: Float) {
+    val selected = state == StayCircleState.SELECTED
+    radius = stayCircleRadiusMeters(stay.durationMs) + if (selected) 8.0 else 0.0
+    strokeColor = MapColors.argb(when (state) { StayCircleState.NORMAL -> 170; StayCircleState.SELECTED -> 255; StayCircleState.DIMMED -> 50 }, MapColors.stayRgb)
+    strokeWidth = (if (selected) 2.5f else 1.5f) * px
+    fillColor = MapColors.argb(when (state) { StayCircleState.NORMAL -> 46; StayCircleState.SELECTED -> 90; StayCircleState.DIMMED -> 14 }, MapColors.stayRgb)
+    zIndex = if (selected) 1f else 0f
+}
+
+/** The chevron line is wider than the route so its marks overhang the line slightly. */
+private const val CHEVRON_WIDTH_DP = 8f
+/** Distance between chevrons along the line. */
+private const val CHEVRON_SPACING_DP = 72f
+
+/** A transparent stroke that only carries the repeating chevron texture. */
+private fun chevronSpans(stamp: BitmapDescriptor) =
+    listOf(StyleSpan(StrokeStyle.colorBuilder(android.graphics.Color.TRANSPARENT).stamp(TextureStyle.newBuilder(stamp).build()).build()))
+
+/**
+ * One tile of the texture repeated along a line: a small open chevron in the
+ * middle of a long transparent strip. The texture's width is scaled to the
+ * line's width, so the strip's length sets the spacing.
+ */
+private fun chevronStamp(rgb: Int, px: Float): BitmapDescriptor {
+    val width = (CHEVRON_WIDTH_DP * px).toInt()
+    val height = (CHEVRON_SPACING_DP * px).toInt()
+    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    val center = width / 2f
+    val middle = height / 2f
+    val half = width * 0.32f
+    val depth = width * 0.2f
+    // Maps lays the strip's bottom edge toward the end of the line, so the chevron points down.
+    Canvas(bitmap).drawPath(Path().apply {
+        moveTo(center - half, middle - depth)
+        lineTo(center, middle + depth)
+        lineTo(center + half, middle - depth)
+    }, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.6f * px
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = MapColors.argb(230, rgb)
+    })
+    return BitmapDescriptorFactory.fromBitmap(bitmap)
+}
+
+/** The replay's current position: a filled dot in a white ring. */
+private fun replayHeadIcon(px: Float): BitmapDescriptor {
+    val size = (22 * px).toInt()
+    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+    val center = size / 2f
+    canvas.drawCircle(center, center, 8 * px, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.WHITE
+        setShadowLayer(2 * px, 0f, 1 * px, android.graphics.Color.argb(70, 0, 0, 0))
+    })
+    canvas.drawCircle(center, center, 5.5f * px, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = MapColors.argb(255, MapColors.focusRouteRgb) })
+    return BitmapDescriptorFactory.fromBitmap(bitmap)
+}
+
+/** Play/pause, the replayed moment's time, a scrubber, and a way out. */
+@Composable
+private fun ReplayBar(
+    time: Long,
+    progress: Float,
+    playing: Boolean,
+    modifier: Modifier = Modifier,
+    onTogglePlaying: () -> Unit,
+    onSeek: (Float) -> Unit,
+    onClose: () -> Unit,
+) {
+    Surface(modifier.fillMaxWidth(), shape = CircleShape, color = AppColors.surface, shadowElevation = 3.dp) {
+        Row(Modifier.padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onTogglePlaying) {
+                Icon(if (playing) Icons.Outlined.Pause else Icons.Outlined.PlayArrow, if (playing) "一時停止" else "再生", tint = AppColors.ink, modifier = Modifier.size(24.dp))
+            }
+            Text(formatTime(time), style = MaterialTheme.typography.labelLarge, color = AppColors.ink)
+            Slider(value = progress, onValueChange = onSeek, modifier = Modifier.weight(1f).padding(horizontal = 12.dp))
+            IconButton(onClick = onClose) {
+                Icon(Icons.Outlined.Close, "リプレイを閉じる", tint = AppColors.ink, modifier = Modifier.size(24.dp))
+            }
+        }
+    }
+}
 
 /** 48dp round photo marker: white ring, soft shadow, thumbnail or a camera glyph, and a count badge. */
 private fun photoMarkerIcon(context: Context, thumbnail: Bitmap?, photoCount: Int, isVideo: Boolean = false) = BitmapDescriptorFactory.fromBitmap(run {

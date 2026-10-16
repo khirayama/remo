@@ -67,7 +67,7 @@ class TimelineAggregationTest {
             entry("end", 120_000L, latitude = 35.6813, longitude = 139.7672, accuracyMeters = 10.0),
         )
         val raw = buildRawRouteSegments(entries)
-        val movement = buildMovementSegments(entries, referenceTimeMs = 180_000L)
+        val movement = buildMovementSegments(entries)
 
         assertEquals(2, raw.size)
         assertEquals(LatLng(35.682, 139.7671), raw.first().to)
@@ -85,7 +85,7 @@ class TimelineAggregationTest {
         )
 
         val stays = buildStayClusters(entries)
-        val movement = buildMovementSegments(entries, referenceTimeMs = 60 * 60 * 1000L)
+        val movement = buildMovementSegments(entries)
 
         assertEquals(1, stays.size)
         assertEquals(3, stays.first().entries.size)
@@ -163,14 +163,18 @@ class TimelineAggregationTest {
         assertEquals(listOf(LatLng(35.6812, 139.7671), LatLng(35.684, 139.77), LatLng(35.688, 139.775),), activities[0].path)
     }
 
-    @Test fun processedMovementFadesWithDistanceFromNow() {
+    @Test fun routeFadesInAcrossTheDrawnDay() {
         val movement = buildMovementSegments(listOf(
             entry("old", 0),
             entry("middle", 30 * 60 * 1000L, latitude = 35.684, longitude = 139.77),
             entry("new", 55 * 60 * 1000L, latitude = 35.69, longitude = 139.78),
-        ), referenceTimeMs = 60 * 60 * 1000L)
+        ))
 
+        assertEquals(0.25f, movement.first().startOpacity, 0.0001f)
+        assertEquals(movement[0].opacity, movement[1].startOpacity, 0.0001f)
         assertTrue(movement[0].opacity < movement[1].opacity)
+        assertEquals(0.95f, movement.last().opacity, 0.0001f)
+        assertEquals(55 * 60 * 1000L, movement.last().endedAt)
     }
 
     @Test fun stayCircleRadiusGrowsButHasAMaximum() {
@@ -365,7 +369,7 @@ class TimelineAggregationTest {
         val logs = (0 until 12).map { index ->
             entry("walk-$index", index * 10_000L, latitude = 35.6812 + index * 0.000126, longitude = 139.7671 + if (index % 2 == 1) 0.000133 else -0.000133, accuracyMeters = 10.0)
         }
-        val segments = buildMovementSegments(logs, referenceTimeMs = 3_600_000L)
+        val segments = buildMovementSegments(logs)
 
         // Both ends are drawn where they were recorded.
         assertEquals(LatLng(logs.first().latitude!!, logs.first().longitude!!), segments.first().from)
@@ -379,7 +383,7 @@ class TimelineAggregationTest {
             entry("$prefix-$index", index * step, latitude = 35.6812 + index * latitudeStep, longitude = 139.7671 + if (index % 2 == 1) 0.000133 else -0.000133, accuracyMeters = 10.0)
         }
         listOf(zigzag("drive", 10_000L, 0.00135), zigzag("sparse", 60_000L, 0.00063)).forEach { logs ->
-            assertEquals(logs.drop(1).map { LatLng(it.latitude!!, it.longitude!!) }, buildMovementSegments(logs, referenceTimeMs = 0L).map { it.to })
+            assertEquals(logs.drop(1).map { LatLng(it.latitude!!, it.longitude!!) }, buildMovementSegments(logs).map { it.to })
         }
     }
 
@@ -418,8 +422,8 @@ class TimelineAggregationTest {
             buildTimelineActivities(logs, snapshot),
         )
         assertEquals(
-            buildMovementSegments(logs, referenceTimeMs = 60 * 60 * 1000L),
-            buildMovementSegments(logs, snapshot, referenceTimeMs = 60 * 60 * 1000L),
+            buildMovementSegments(logs),
+            buildMovementSegments(logs, snapshot),
         )
         assertEquals(displayPhotoLogs(logs), displayPhotoLogs(logs, snapshot))
     }

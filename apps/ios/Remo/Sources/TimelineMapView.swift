@@ -44,6 +44,8 @@ struct TimelineMapView: UIViewRepresentable {
     let insets: UIEdgeInsets
     let cameraRequest: MapCameraRequest?
     let showsUserLocation: Bool
+    /// How far the day's replay has played, from 0 to 1; nil when not replaying.
+    var replayProgress: Double?
     let onSelectPhotos: ([LogEntry]) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -68,14 +70,18 @@ struct TimelineMapView: UIViewRepresentable {
         map.layoutMargins = insets
 
         let focusChanged = coordinator.renderedFocus != focus
-        if coordinator.renderedRevision != snapshotRevision || focusChanged {
-            coordinator.renderOverlays(snapshot: snapshot, focus: focus)
+        let replaying = replayProgress != nil
+        let replayChanged = coordinator.renderedReplaying != replaying
+        if coordinator.renderedRevision != snapshotRevision || focusChanged || replayChanged {
+            coordinator.renderOverlays(snapshot: snapshot, focus: focus, replaying: replaying)
         }
         if coordinator.renderedRevision != snapshotRevision || coordinator.renderedLabels != stayLabels.mapValues(\.primary) {
             coordinator.renderAnnotations(snapshot: snapshot, labels: stayLabels, assets: assets)
         }
-        if focusChanged { coordinator.applyFocusDimming(focus) }
+        if focusChanged || replayChanged { coordinator.applyFocusDimming() }
         coordinator.renderedRevision = snapshotRevision
+        coordinator.renderedReplaying = replaying
+        if let replayProgress { coordinator.applyReplay(progress: replayProgress) }
 
         if loaded, coordinator.fittedViewKey != viewKey {
             coordinator.fittedViewKey = viewKey
@@ -99,25 +105,33 @@ struct TimelineMapView: UIViewRepresentable {
         var parent: TimelineMapView?
         var renderedRevision = -1
         var renderedFocus: TimelineMapFocus?
+        var renderedReplaying = false
         var renderedLabels: [String: String] = [:]
         var fittedViewKey: Date?
         var handledRequest: UUID?
         private var circleSelection: (StayAnnotation, Date)?
         private var thumbnails: [String: UIImage] = [:]
         private var loadingThumbnails: Set<String> = []
+        private var replayLine: ReplayPolyline?
+        private let replayHead = ReplayHeadAnnotation()
 
         private var insets: UIEdgeInsets { parent?.insets ?? .zero }
 
         // MARK: Rendering
 
-        func renderOverlays(snapshot: TimelineRenderSnapshot, focus: TimelineMapFocus?) {
+        /// Photos and the rest of the day step back while one activity or the replay is shown.
+        private var dimmed: Bool { parent?.focus != nil || parent?.replayProgress != nil }
+
+        func renderOverlays(snapshot: TimelineRenderSnapshot, focus: TimelineMapFocus?, replaying: Bool) {
             guard let map else { return }
             map.removeOverlays(map.overlays)
-            let dimmed = focus != nil
+            let dimmed = focus != nil || replaying
             for path in routeRenderPaths(snapshot.routeSegments, dimmed: dimmed) {
                 let line = RoutePolyline(coordinates: path.points, count: path.points.count)
                 line.untracked = path.untracked
-                line.alpha = path.alpha
+                line.alphas = path.alphas
+                // Chevrons only on recorded lines: an unrecorded gap has no direction to show.
+                line.showsChevrons = !path.untracked && !dimmed
                 map.addOverlay(line, level: .aboveRoads)
             }
             for stay in snapshot.analysis.stayClusters {
@@ -127,10 +141,42 @@ struct TimelineMapView: UIViewRepresentable {
                 circle.stayID = stay.id
                 map.addOverlay(circle, level: .aboveRoads)
             }
-            if let focus, focus.kind == .movement, focus.path.count > 1 {
+            if !replaying, let focus, focus.kind == .movement, focus.path.count > 1 {
                 let line = RoutePolyline(coordinates: focus.path, count: focus.path.count)
                 line.isFocus = true
+                line.showsChevrons = true
                 map.addOverlay(line, level: .aboveLabels)
+            }
+            replayLine = nil
+            if replaying, let first = snapshot.routeSegments.first {
+                let points = [first.from] + snapshot.routeSegments.map(\.to)
+                let line = ReplayPolyline(coordinates: points, count: points.count)
+                map.addOverlay(line, level: .aboveLabels)
+                replayLine = line
+            } else {
+                map.removeAnnotation(replayHead)
+            }
+        }
+
+        /// Moves the replay to `progress`: the line so far, its head, and the
+        /// stays and photos it has reached.
+        func applyReplay(progress: Double) {
+            guard let map, let replay = parent?.snapshot.replay else { return }
+            let frame = replay.frame(at: progress)
+            if let replayLine, let renderer = map.renderer(for: replayLine) as? ReplayRenderer { renderer.drawn = frame.drawn }
+            replayHead.coordinate = frame.head
+            if !map.annotations.contains(where: { $0 === replayHead }) { map.addAnnotation(replayHead) }
+            let stays = Dictionary(uniqueKeysWithValues: (parent?.snapshot.analysis.stayClusters ?? []).map { ($0.id, $0) })
+            for circle in map.overlays.compactMap({ $0 as? StayCircle }) {
+                guard let stay = stays[circle.stayID] else { continue }
+                let state: StayCircle.State = frame.time < stay.startedAt ? .dimmed : frame.time <= stay.endedAt ? .selected : .normal
+                guard circle.state != state else { continue }
+                circle.state = state
+                if let renderer = map.renderer(for: circle) as? MKCircleRenderer { styleStayCircle(renderer, state: state) }
+            }
+            for annotation in map.annotations.compactMap({ $0 as? PhotoAnnotation }) {
+                let reached = annotation.cluster.entries.first.map { $0.startedAt <= frame.time } ?? false
+                map.view(for: annotation)?.alpha = reached ? 1 : 0.25
             }
         }
 
@@ -157,14 +203,15 @@ struct TimelineMapView: UIViewRepresentable {
             if let selectedStay, let annotation = stays.first(where: { $0.stayID == selectedStay }) {
                 map.selectAnnotation(annotation, animated: false)
             }
-            applyFocusDimming(parent?.focus)
+            applyFocusDimming()
         }
 
-        func applyFocusDimming(_ focus: TimelineMapFocus?) {
+        func applyFocusDimming() {
             guard let map else { return }
             for annotation in map.annotations.compactMap({ $0 as? PhotoAnnotation }) {
-                map.view(for: annotation)?.alpha = focus == nil ? 1 : 0.4
+                map.view(for: annotation)?.alpha = dimmed ? 0.4 : 1
             }
+            if let replayProgress = parent?.replayProgress { applyReplay(progress: replayProgress) }
         }
 
         // MARK: Camera
@@ -240,9 +287,23 @@ struct TimelineMapView: UIViewRepresentable {
         // MARK: MKMapViewDelegate
 
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            if let line = overlay as? ReplayPolyline {
+                let renderer = ReplayRenderer(overlay: line)
+                renderer.strokeColor = RemoMapColor.focusRoute
+                renderer.lineWidth = 6
+                renderer.lineCap = .round
+                renderer.lineJoin = .round
+                return renderer
+            }
             if let line = overlay as? RoutePolyline {
-                let renderer = MKPolylineRenderer(polyline: line)
-                renderer.strokeColor = line.isFocus ? RemoMapColor.focusRoute : RemoMapColor.route.withAlphaComponent(line.alpha)
+                let renderer = RouteRenderer(polyline: line)
+                if line.isFocus {
+                    renderer.strokeColor = RemoMapColor.focusRoute
+                } else {
+                    let stops = gradientStops(line.alphas)
+                    renderer.setColors(stops.map { RemoMapColor.route.withAlphaComponent(line.alphas[$0]) }, locations: stops.map { line.location(atPointIndex: $0) })
+                }
+                if line.showsChevrons { renderer.chevronColor = line.isFocus ? .white : RemoMapColor.focusRoute.withAlphaComponent(0.9) }
                 renderer.lineWidth = line.isFocus ? 6 : line.untracked ? 3 : 4
                 // Dotted where nothing was recorded, so a straight connection is not read as the route taken.
                 if line.untracked { renderer.lineDashPattern = [0, 8] }
@@ -252,14 +313,7 @@ struct TimelineMapView: UIViewRepresentable {
             }
             if let circle = overlay as? StayCircle {
                 let renderer = MKCircleRenderer(circle: circle)
-                let (stroke, fill): (CGFloat, CGFloat) = switch circle.state {
-                case .normal: (170, 46)
-                case .selected: (255, 90)
-                case .dimmed: (50, 14)
-                }
-                renderer.strokeColor = RemoMapColor.stay.withAlphaComponent(stroke / 255)
-                renderer.fillColor = RemoMapColor.stay.withAlphaComponent(fill / 255)
-                renderer.lineWidth = circle.state == .selected ? 2.5 : 1.5
+                styleStayCircle(renderer, state: circle.state)
                 return renderer
             }
             return MKOverlayRenderer(overlay: overlay)
@@ -279,8 +333,13 @@ struct TimelineMapView: UIViewRepresentable {
                 let view = mapView.dequeueReusableAnnotationView(withIdentifier: PhotoMarkerView.reuseID, for: photo) as! PhotoMarkerView
                 let key = photo.cluster.entries.first?.id ?? photo.cluster.id
                 view.configure(cluster: photo.cluster, thumbnail: thumbnails[key])
-                view.alpha = parent?.focus == nil ? 1 : 0.4
+                view.alpha = dimmed ? 0.4 : 1
                 loadThumbnail(for: photo, key: key)
+                return view
+            }
+            if annotation is ReplayHeadAnnotation {
+                let view = mapView.dequeueReusableAnnotationView(withIdentifier: ReplayHeadView.reuseID) ?? ReplayHeadView(annotation: annotation, reuseIdentifier: ReplayHeadView.reuseID)
+                view.annotation = annotation
                 return view
             }
             if let stay = annotation as? StayAnnotation {
@@ -390,41 +449,158 @@ func fitMap(_ map: MKMapView, to coordinates: [CLLocationCoordinate2D], insets: 
 
 // MARK: - Route paths
 
+/// One continuous line. `alphas` holds the opacity at each of `points`.
 struct RouteRenderPath {
     let points: [CLLocationCoordinate2D]
-    let alpha: CGFloat
+    let alphas: [CGFloat]
     /// Only connects two known points: nothing was recorded along it.
     var untracked = false
 }
 
-/// Join only adjacent segments with the exact same rendered alpha. No points are simplified.
+/// Join connected segments of the same kind into one line. No points are simplified.
 func routeRenderPaths(_ segments: [RouteSegment], dimmed: Bool) -> [RouteRenderPath] {
     var result: [RouteRenderPath] = []
     var points: [CLLocationCoordinate2D] = []
-    var previousAlpha: CGFloat?
+    var alphas: [CGFloat] = []
     var previousUntracked = false
+    let alpha = { (opacity: Double) in CGFloat(dimmed ? opacity * 0.2 : opacity) }
     for segment in segments {
         let untracked = segment.gap >= untrackedGap
-        let alpha = (CGFloat(dimmed ? segment.opacity * 0.2 : segment.opacity) * 255).rounded(.down) / 255
         let continues = points.last.map { $0.latitude == segment.from.latitude && $0.longitude == segment.from.longitude } ?? false
-        if alpha != previousAlpha || untracked != previousUntracked || !continues {
-            if let previousAlpha, !points.isEmpty { result.append(RouteRenderPath(points: points, alpha: previousAlpha, untracked: previousUntracked)) }
+        if untracked != previousUntracked || !continues {
+            if !points.isEmpty { result.append(RouteRenderPath(points: points, alphas: alphas, untracked: previousUntracked)) }
             points = [segment.from]
+            alphas = [alpha(segment.startOpacity)]
         }
         points.append(segment.to)
-        previousAlpha = alpha
+        alphas.append(alpha(segment.opacity))
         previousUntracked = untracked
     }
-    if let previousAlpha, !points.isEmpty { result.append(RouteRenderPath(points: points, alpha: previousAlpha, untracked: previousUntracked)) }
+    if !points.isEmpty { result.append(RouteRenderPath(points: points, alphas: alphas, untracked: previousUntracked)) }
     return result
+}
+
+/// The point indices where the gradient gets a color stop: both ends, and
+/// wherever the opacity has moved by `step` since the last stop. This keeps a
+/// day of thousands of points to a few dozen stops.
+func gradientStops(_ alphas: [CGFloat], step: CGFloat = 0.03) -> [Int] {
+    guard !alphas.isEmpty else { return [] }
+    var stops = [0]
+    for index in alphas.indices.dropFirst() where index == alphas.count - 1 || abs(alphas[index] - alphas[stops[stops.count - 1]]) >= step {
+        stops.append(index)
+    }
+    return stops
 }
 
 // MARK: - Overlays and annotations
 
 private final class RoutePolyline: MKPolyline {
-    var alpha: CGFloat = 1
+    var alphas: [CGFloat] = []
     var isFocus = false
     var untracked = false
+    var showsChevrons = false
+}
+
+/// Distance between chevrons along a line, in screen points.
+private let chevronSpacing: CGFloat = 72
+
+/// A route line with small open chevrons along it that point the way it was travelled.
+private final class RouteRenderer: MKGradientPolylineRenderer {
+    var chevronColor: UIColor?
+
+    override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
+        super.draw(mapRect, zoomScale: zoomScale, in: context)
+        guard let chevronColor, polyline.pointCount > 1 else { return }
+        // Renderer units are map points; screen sizes are divided by the zoom scale.
+        let spacing = chevronSpacing / zoomScale
+        let half = 2.6 / zoomScale
+        let depth = 1.6 / zoomScale
+        let clip = rect(for: mapRect).insetBy(dx: -spacing, dy: -spacing)
+        let points = polyline.points()
+        // Placed by distance from the start so every map tile agrees on where they go.
+        var next = spacing / 2
+        var travelled: CGFloat = 0
+        var previous = point(for: points[0])
+        let path = CGMutablePath()
+        for index in 1..<polyline.pointCount {
+            let current = point(for: points[index])
+            let dx = current.x - previous.x, dy = current.y - previous.y
+            let length = hypot(dx, dy)
+            if length > 0 {
+                let ux = dx / length, uy = dy / length
+                while next <= travelled + length {
+                    let t = next - travelled
+                    let center = CGPoint(x: previous.x + ux * t, y: previous.y + uy * t)
+                    if clip.contains(center) {
+                        path.move(to: CGPoint(x: center.x - ux * depth - uy * half, y: center.y - uy * depth + ux * half))
+                        path.addLine(to: CGPoint(x: center.x + ux * depth, y: center.y + uy * depth))
+                        path.addLine(to: CGPoint(x: center.x - ux * depth + uy * half, y: center.y - uy * depth - ux * half))
+                    }
+                    next += spacing
+                }
+            }
+            travelled += length
+            previous = current
+        }
+        context.addPath(path)
+        context.setStrokeColor(chevronColor.cgColor)
+        context.setLineWidth(1.6 / zoomScale)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.strokePath()
+    }
+}
+
+/// The whole day's line; its renderer only draws the part the replay has reached.
+private final class ReplayPolyline: MKPolyline {}
+
+private final class ReplayRenderer: MKOverlayPathRenderer {
+    var drawn: [CLLocationCoordinate2D] = [] { didSet { invalidatePath() } }
+
+    override func createPath() {
+        guard let first = drawn.first else { path = nil; return }
+        let path = CGMutablePath()
+        path.move(to: point(for: MKMapPoint(first)))
+        for coordinate in drawn.dropFirst() { path.addLine(to: point(for: MKMapPoint(coordinate))) }
+        self.path = path
+    }
+}
+
+private final class ReplayHeadAnnotation: MKPointAnnotation {}
+
+/// The replay's current position: a filled dot in a white ring.
+private final class ReplayHeadView: MKAnnotationView {
+    static let reuseID = "replay-head"
+
+    override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
+        super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
+        displayPriority = .required
+        zPriority = .max
+        canShowCallout = false
+        isUserInteractionEnabled = false
+        image = UIGraphicsImageRenderer(size: CGSize(width: 22, height: 22)).image { context in
+            context.cgContext.setShadow(offset: CGSize(width: 0, height: 1), blur: 2, color: UIColor.black.withAlphaComponent(0.27).cgColor)
+            UIColor.white.setFill()
+            UIBezierPath(ovalIn: CGRect(x: 3, y: 3, width: 16, height: 16)).fill()
+            context.cgContext.setShadow(offset: .zero, blur: 0)
+            RemoMapColor.focusRoute.setFill()
+            UIBezierPath(ovalIn: CGRect(x: 5.5, y: 5.5, width: 11, height: 11)).fill()
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+private func styleStayCircle(_ renderer: MKCircleRenderer, state: StayCircle.State) {
+    let (stroke, fill): (CGFloat, CGFloat) = switch state {
+    case .normal: (170, 46)
+    case .selected: (255, 90)
+    case .dimmed: (50, 14)
+    }
+    renderer.strokeColor = RemoMapColor.stay.withAlphaComponent(stroke / 255)
+    renderer.fillColor = RemoMapColor.stay.withAlphaComponent(fill / 255)
+    renderer.lineWidth = state == .selected ? 2.5 : 1.5
+    renderer.setNeedsDisplay()
 }
 
 private final class StayCircle: MKCircle {

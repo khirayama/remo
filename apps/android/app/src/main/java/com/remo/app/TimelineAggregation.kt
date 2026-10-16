@@ -4,7 +4,6 @@ import com.google.android.gms.maps.model.LatLng
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
-import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
@@ -25,11 +24,14 @@ data class PhotoCluster(
     val videoCount: Int get() = entries.filter { it.mediaType == MediaType.VIDEO }.sumOf { it.photoCount }
 }
 
+/** [startOpacity] and [opacity] are the line's opacity at [from] and [to]. [endedAt] is when [to] was recorded. */
 data class RouteSegment(
     val from: LatLng,
     val to: LatLng,
     val gapMs: Long,
     val opacity: Float,
+    val startOpacity: Float = opacity,
+    val endedAt: Long = 0L,
 )
 
 data class RawRouteSegment(
@@ -527,9 +529,18 @@ fun clusterPhotoLogs(logs: List<LogEntry>): List<PhotoCluster> {
     return clusters
 }
 
-fun routeOpacity(ageMs: Long): Float {
-    val ageMinutes = ageMs.coerceAtLeast(0) / 60_000.0
-    return max(0.18, min(0.95, 0.95 - log10(ageMinutes + 1) * 0.18)).toFloat()
+private const val ROUTE_START_OPACITY = 0.25f
+private const val ROUTE_END_OPACITY = 0.95f
+
+/**
+ * The day's route fades in from its first point to its last, measured along
+ * the drawn line, so every day uses the full range and the line reads as
+ * going from faint to strong.
+ */
+fun routeOpacity(travelledMeters: Double, totalMeters: Double): Float {
+    if (totalMeters <= 0.0) return ROUTE_END_OPACITY
+    val progress = (travelledMeters / totalMeters).coerceIn(0.0, 1.0).toFloat()
+    return ROUTE_START_OPACITY + (ROUTE_END_OPACITY - ROUTE_START_OPACITY) * progress
 }
 
 fun buildRawRouteSegments(logs: List<LogEntry>): List<RawRouteSegment> {
@@ -1038,12 +1049,10 @@ fun stayCircleRadiusMeters(durationMs: Long): Double {
     return min(75.0, 20.0 + sqrt(minutes) * 6.0)
 }
 
-fun buildMovementSegments(logs: List<LogEntry>, referenceTimeMs: Long = System.currentTimeMillis()): List<RouteSegment> {
-    return buildMovementSegments(logs, analyzeTimeline(logs), referenceTimeMs)
-}
+fun buildMovementSegments(logs: List<LogEntry>): List<RouteSegment> = buildMovementSegments(logs, analyzeTimeline(logs))
 
 /** Builds route segments from a previously computed snapshot. */
-fun buildMovementSegments(logs: List<LogEntry>, analysis: TimelineAnalysis, referenceTimeMs: Long = System.currentTimeMillis()): List<RouteSegment> {
+fun buildMovementSegments(logs: List<LogEntry>, analysis: TimelineAnalysis): List<RouteSegment> {
     val locations = analysis.correctedPositions
     val stayClusters = analysis.stayClusters
     val stayEntryIds = stayClusters.flatMap { stay -> stay.entries.map { it.entry.id } }.toSet()
@@ -1052,17 +1061,25 @@ fun buildMovementSegments(logs: List<LogEntry>, analysis: TimelineAnalysis, refe
     // processed endpoint per stay so the movement line remains continuous
     // when the samples inside that stay are omitted.
     val routeLocations = locations.filter { it.entry.id !in stayEntryIds || it.entry.id in stayEndEntryIds }
-    return routeLocations.zipWithNext().map { (previous, next) ->
+    val pairs = routeLocations.zipWithNext()
+    val lengths = pairs.map { (previous, next) -> distanceMeters(previous.coordinate, next.coordinate) }
+    val totalMeters = lengths.sum()
+    var travelledMeters = 0.0
+    return pairs.mapIndexed { index, (previous, next) ->
+        val startOpacity = routeOpacity(travelledMeters, totalMeters)
+        travelledMeters += lengths[index]
         RouteSegment(
-            from = LatLng(previous.latitude, previous.longitude),
-            to = LatLng(next.latitude, next.longitude),
+            from = previous.coordinate,
+            to = next.coordinate,
             gapMs = (next.entry.startedAt - previous.entry.startedAt).coerceAtLeast(0L),
-            opacity = routeOpacity((referenceTimeMs - next.entry.startedAt).coerceAtLeast(0L)),
+            opacity = routeOpacity(travelledMeters, totalMeters),
+            startOpacity = startOpacity,
+            endedAt = next.entry.startedAt,
         )
     }
 }
 
-fun buildRouteSegments(logs: List<LogEntry>, referenceTimeMs: Long = System.currentTimeMillis()): List<RouteSegment> = buildMovementSegments(logs, referenceTimeMs)
+fun buildRouteSegments(logs: List<LogEntry>): List<RouteSegment> = buildMovementSegments(logs)
 
 fun coordinatePair(latitude: Double?, longitude: Double?): Pair<Double, Double>? {
     if (!hasUsableCoordinates(latitude, longitude)) return null

@@ -56,8 +56,10 @@ final class RemoTests: XCTestCase {
         XCTAssertEqual(points.map(\.id), [entries[0].id, entries[1].id, entries[2].id, entries[3].id])
     }
 
-    func testRouteOpacityFadesForOlderSegments() {
-        XCTAssertGreaterThan(routeOpacity(5 * 60), routeOpacity(60 * 60))
+    func testRouteOpacityFadesInAlongTheDrawnLine() {
+        XCTAssertEqual(routeOpacity(travelled: 0, total: 100), 0.25, accuracy: 0.0001)
+        XCTAssertEqual(routeOpacity(travelled: 100, total: 100), 0.95, accuracy: 0.0001)
+        XCTAssertLessThan(routeOpacity(travelled: 30, total: 100), routeOpacity(travelled: 60, total: 100))
     }
 
     func testRawRouteKeepsEveryLocationSample() {
@@ -103,7 +105,7 @@ final class RemoTests: XCTestCase {
         ]
 
         let raw = buildRawRouteSegments(entries)
-        let movement = buildMovementSegments(entries, referenceDate: start.addingTimeInterval(180))
+        let movement = buildMovementSegments(entries)
 
         XCTAssertEqual(raw.count, 2)
         XCTAssertEqual(raw[0].to.latitude, 35.682, accuracy: 0.000001)
@@ -122,7 +124,7 @@ final class RemoTests: XCTestCase {
         ]
 
         let stays = buildStayClusters(entries)
-        let movement = buildMovementSegments(entries, referenceDate: start.addingTimeInterval(60 * 60))
+        let movement = buildMovementSegments(entries)
 
         XCTAssertEqual(stays.count, 1)
         XCTAssertEqual(stays[0].entries.count, 3)
@@ -214,9 +216,13 @@ final class RemoTests: XCTestCase {
             LogEntry(id: "new", startedAt: start.addingTimeInterval(55 * 60), latitude: 35.69, longitude: 139.78, source: .location, updatedAt: start),
         ]
 
-        let movement = buildMovementSegments(entries, referenceDate: start.addingTimeInterval(60 * 60))
+        let movement = buildMovementSegments(entries)
 
+        XCTAssertEqual(movement[0].startOpacity, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(movement[1].startOpacity, movement[0].opacity, accuracy: 0.0001)
         XCTAssertLessThan(movement[0].opacity, movement[1].opacity)
+        XCTAssertEqual(movement[1].opacity, 0.95, accuracy: 0.0001)
+        XCTAssertEqual(movement[1].endedAt, start.addingTimeInterval(55 * 60))
     }
 
     func testStayCircleRadiusGrowsButHasAMaximum() {
@@ -434,21 +440,49 @@ final class RemoTests: XCTestCase {
         XCTAssertFalse(isHouseNumber("桜坂1丁目"))
     }
 
-    func testRouteRenderPathsJoinSameOpacityRuns() {
+    func testRouteRenderPathsJoinConnectedLinesOfTheSameKind() {
         let a = CLLocationCoordinate2D(latitude: 35, longitude: 139)
         let b = CLLocationCoordinate2D(latitude: 35.001, longitude: 139)
         let c = CLLocationCoordinate2D(latitude: 35.002, longitude: 139)
         let segments = [
-            RouteSegment(id: "1", from: a, to: b, gap: 10, opacity: 1),
-            RouteSegment(id: "2", from: b, to: c, gap: 10, opacity: 1),
-            RouteSegment(id: "3", from: c, to: a, gap: 10, opacity: 0.5),
+            RouteSegment(id: "1", from: a, to: b, gap: 10, opacity: 0.5),
+            RouteSegment(id: "2", from: b, to: c, gap: 10, opacity: 0.6),
+            RouteSegment(id: "3", from: c, to: a, gap: untrackedGap, opacity: 0.7),
+            RouteSegment(id: "4", from: b, to: c, gap: 10, opacity: 0.8),
         ]
 
         let paths = routeRenderPaths(segments, dimmed: false)
-        XCTAssertEqual(paths.count, 2)
-        XCTAssertEqual(paths[0].points.count, 3)
-        XCTAssertEqual(paths[1].points.count, 2)
-        XCTAssertLessThan(routeRenderPaths(segments, dimmed: true)[0].alpha, 0.21)
+        XCTAssertEqual(paths.map(\.points.count), [3, 2, 2])
+        XCTAssertEqual(paths[0].alphas, [0.5, 0.5, 0.6])
+        XCTAssertEqual(routeRenderPaths(segments, dimmed: true)[0].alphas[0], 0.1, accuracy: 0.0001)
+    }
+
+    func testGradientStopsKeepBothEndsAndThinTheMiddle() {
+        let alphas = (0...1_000).map { 0.25 + 0.7 * CGFloat($0) / 1_000 }
+        let stops = gradientStops(alphas)
+        XCTAssertEqual(stops.first, 0)
+        XCTAssertEqual(stops.last, 1_000)
+        XCTAssertLessThan(stops.count, 31)
+    }
+
+    func testReplayShortensLongWaits() throws {
+        let a = CLLocationCoordinate2D(latitude: 35, longitude: 139)
+        let b = CLLocationCoordinate2D(latitude: 35.1, longitude: 139)
+        let c = CLLocationCoordinate2D(latitude: 35.2, longitude: 139)
+        let start = Date(timeIntervalSince1970: 0)
+        // 10 minutes of moving, then a 5-hour stay that plays back as 10 minutes.
+        let replay = try XCTUnwrap(RouteReplay([
+            RouteSegment(id: "1", from: a, to: b, gap: 10 * 60, opacity: 1, endedAt: start.addingTimeInterval(10 * 60)),
+            RouteSegment(id: "2", from: b, to: c, gap: 5 * 3600, opacity: 1, endedAt: start.addingTimeInterval(5 * 3600 + 10 * 60)),
+        ]))
+        XCTAssertEqual(replay.clock, 20 * 60, accuracy: 0.0001)
+        let halfway = replay.frame(at: 0.5)
+        XCTAssertEqual(halfway.head.latitude, 35.1, accuracy: 0.000001)
+        XCTAssertEqual(halfway.time, start.addingTimeInterval(10 * 60))
+        XCTAssertEqual(halfway.drawn.count, 3)
+        XCTAssertEqual(replay.frame(at: 0.75).head.latitude, 35.15, accuracy: 0.000001)
+        XCTAssertEqual(replay.frame(at: 1).head.latitude, 35.2, accuracy: 0.000001)
+        XCTAssertNil(RouteReplay([]))
     }
 
     // MARK: - Stay detection
@@ -540,7 +574,7 @@ final class RemoTests: XCTestCase {
     func testWalkIsDrawnThroughTheMiddleOfZigzaggingFixes() {
         // A walk at about 1.4 m/s.
         let logs = zigzag("walk", 12, step: 10, latitudeStep: 0.000126)
-        let segments = buildMovementSegments(logs, referenceDate: origin.addingTimeInterval(3600))
+        let segments = buildMovementSegments(logs)
 
         // Both ends are drawn where they were recorded.
         XCTAssertEqual(segments.first?.from.longitude, logs[0].longitude)
@@ -551,7 +585,7 @@ final class RemoTests: XCTestCase {
 
     func testDriveAndFixesAroundAHoleAreDrawnAsRecorded() {
         for logs in [zigzag("drive", 8, step: 10, latitudeStep: 0.00135), zigzag("sparse", 8, step: 60, latitudeStep: 0.00063)] {
-            let drawn = buildMovementSegments(logs, referenceDate: origin).map(\.to)
+            let drawn = buildMovementSegments(logs).map(\.to)
             XCTAssertEqual(drawn.map(\.latitude), logs.dropFirst().map { $0.latitude! })
             XCTAssertEqual(drawn.map(\.longitude), logs.dropFirst().map { $0.longitude! })
         }

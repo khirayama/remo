@@ -14,12 +14,25 @@ struct PhotoCluster: Identifiable {
     var videoCount: Int { entries.filter { $0.mediaType == .video }.reduce(0) { $0 + max(0, $1.photoCount) } }
 }
 
+/// `startOpacity` and `opacity` are the line's opacity at `from` and `to`. `endedAt` is when `to` was recorded.
 struct RouteSegment: Identifiable {
     let id: String
     let from: CLLocationCoordinate2D
     let to: CLLocationCoordinate2D
     let gap: TimeInterval
     let opacity: Double
+    let startOpacity: Double
+    let endedAt: Date
+
+    init(id: String, from: CLLocationCoordinate2D, to: CLLocationCoordinate2D, gap: TimeInterval, opacity: Double, startOpacity: Double? = nil, endedAt: Date = .distantPast) {
+        self.id = id
+        self.from = from
+        self.to = to
+        self.gap = gap
+        self.opacity = opacity
+        self.startOpacity = startOpacity ?? opacity
+        self.endedAt = endedAt
+    }
 }
 
 struct RawRouteSegment: Identifiable {
@@ -91,21 +104,23 @@ struct TimelineRenderSnapshot {
     let stayPlaces: [StayPlace]
     let activities: [TimelineActivity]
     let routeSegments: [RouteSegment]
+    let replay: RouteReplay?
     let mapCoordinates: [CLLocationCoordinate2D]
 
-    init(logs: [LogEntry], referenceDate: Date = Date()) {
+    init(logs: [LogEntry]) {
         let analysis = analyzeTimeline(logs)
         let displayLogs = displayPhotoLogs(logs, locations: analysis.correctedLocations)
         let photoClusters = clusterPhotoLogs(displayLogs)
         let stayPlaces = buildStayPlaces(from: analysis.stayClusters)
         let activities = buildTimelineActivities(displayLogs, analysis: analysis)
-        let routeSegments = buildMovementSegments(analysis.correctedPositions, stays: analysis.stayClusters, referenceDate: referenceDate)
+        let routeSegments = buildMovementSegments(analysis.correctedPositions, stays: analysis.stayClusters)
         self.analysis = analysis
         self.displayLogs = displayLogs
         self.photoClusters = photoClusters
         self.stayPlaces = stayPlaces
         self.activities = activities
         self.routeSegments = routeSegments
+        self.replay = RouteReplay(routeSegments)
         self.mapCoordinates = analysis.correctedLocations.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
             + analysis.stayClusters.map(\.coordinate)
             + photoClusters.map(\.coordinate)
@@ -598,9 +613,16 @@ func clusterPhotoLogs(_ logs: [LogEntry]) -> [PhotoCluster] {
     return clusters
 }
 
-func routeOpacity(_ age: TimeInterval) -> Double {
-    let minutes = max(0, age) / 60
-    return max(0.18, min(0.95, 0.95 - log10(minutes + 1) * 0.18))
+private let routeStartOpacity = 0.25
+private let routeEndOpacity = 0.95
+
+/// The day's route fades in from its first point to its last, measured along
+/// the drawn line, so every day uses the full range and the line reads as
+/// going from faint to strong.
+func routeOpacity(travelled: Double, total: Double) -> Double {
+    guard total > 0 else { return routeEndOpacity }
+    let progress = min(1, max(0, travelled / total))
+    return routeStartOpacity + (routeEndOpacity - routeStartOpacity) * progress
 }
 
 func buildRawRouteSegments(_ logs: [LogEntry]) -> [RawRouteSegment] {
@@ -1162,31 +1184,38 @@ func elapsedStayLabel(_ duration: TimeInterval) -> String {
     return hours > 0 ? "\(hours)時間\(remainder > 0 ? "\(remainder)分" : "")" : "\(minutes)分"
 }
 
-func buildMovementSegments(_ logs: [LogEntry], referenceDate: Date = Date(), analysis: TimelineAnalysis? = nil) -> [RouteSegment] {
+func buildMovementSegments(_ logs: [LogEntry], analysis: TimelineAnalysis? = nil) -> [RouteSegment] {
     let resolvedAnalysis = analysis ?? analyzeTimeline(logs)
-    return buildMovementSegments(resolvedAnalysis.correctedPositions, stays: resolvedAnalysis.stayClusters, referenceDate: referenceDate)
+    return buildMovementSegments(resolvedAnalysis.correctedPositions, stays: resolvedAnalysis.stayClusters)
 }
 
-private func buildMovementSegments(_ locations: [CorrectedLocation], stays: [StayCluster], referenceDate: Date) -> [RouteSegment] {
+private func buildMovementSegments(_ locations: [CorrectedLocation], stays: [StayCluster]) -> [RouteSegment] {
     let stayEntryIDs = Set(stays.flatMap { $0.entries.map { $0.entry.id } })
     let stayEndEntryIDs = Set(stays.compactMap { $0.entries.last?.entry.id })
     // Stationary samples are represented by the stay circle. Keep one
     // processed endpoint per stay so the movement line remains continuous
     // when the samples inside that stay are omitted.
     let routeLocations = locations.filter { !stayEntryIDs.contains($0.entry.id) || stayEndEntryIDs.contains($0.entry.id) }
-    return zip(routeLocations, routeLocations.dropFirst()).enumerated().map { index, pair in
-        let gap = max(0, pair.1.entry.startedAt.timeIntervalSince(pair.0.entry.startedAt))
-        let age = max(0, referenceDate.timeIntervalSince(pair.1.entry.startedAt))
+    let pairs = Array(zip(routeLocations, routeLocations.dropFirst()))
+    let coordinate = { (location: CorrectedLocation) in CLLocationCoordinate2D(latitude: location.latitude, longitude: location.longitude) }
+    let lengths = pairs.map { distanceMeters(coordinate($0.0), coordinate($0.1)) }
+    let total = lengths.reduce(0, +)
+    var travelled = 0.0
+    return pairs.enumerated().map { index, pair in
+        let startOpacity = routeOpacity(travelled: travelled, total: total)
+        travelled += lengths[index]
         return RouteSegment(
             id: "segment:\(index)",
-            from: CLLocationCoordinate2D(latitude: pair.0.latitude, longitude: pair.0.longitude),
-            to: CLLocationCoordinate2D(latitude: pair.1.latitude, longitude: pair.1.longitude),
-            gap: gap,
-            opacity: routeOpacity(age),
+            from: coordinate(pair.0),
+            to: coordinate(pair.1),
+            gap: max(0, pair.1.entry.startedAt.timeIntervalSince(pair.0.entry.startedAt)),
+            opacity: routeOpacity(travelled: travelled, total: total),
+            startOpacity: startOpacity,
+            endedAt: pair.1.entry.startedAt,
         )
     }
 }
 
-func buildRouteSegments(_ logs: [LogEntry], referenceDate: Date = Date()) -> [RouteSegment] {
-    buildMovementSegments(logs, referenceDate: referenceDate)
+func buildRouteSegments(_ logs: [LogEntry]) -> [RouteSegment] {
+    buildMovementSegments(logs)
 }

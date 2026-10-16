@@ -354,7 +354,9 @@ export type RouteSegment = {
   from: [number, number];
   to: [number, number];
   gapMs: number;
+  /** The line's opacity at `to`; `startOpacity` is its opacity at `from`. */
   opacity: number;
+  startOpacity: number;
 };
 
 export type RawRouteSegment = {
@@ -557,9 +559,18 @@ export function clusterPhotoEvents(events: LifeEvent[]): PhotoCluster[] {
   return clusters;
 }
 
-export function routeOpacity(ageMs: number) {
-  const ageMinutes = Math.max(0, ageMs) / 60_000;
-  return Math.max(0.18, Math.min(0.95, 0.95 - Math.log10(ageMinutes + 1) * 0.18));
+const ROUTE_START_OPACITY = 0.25;
+const ROUTE_END_OPACITY = 0.95;
+
+/**
+ * The day's route fades in from its first point to its last, measured along
+ * the drawn line, so every day uses the full range and the line reads as
+ * going from faint to strong.
+ */
+export function routeOpacity(travelledMeters: number, totalMeters: number) {
+  if (totalMeters <= 0) return ROUTE_END_OPACITY;
+  const progress = Math.min(1, Math.max(0, travelledMeters / totalMeters));
+  return ROUTE_START_OPACITY + (ROUTE_END_OPACITY - ROUTE_START_OPACITY) * progress;
 }
 
 export function buildRawRouteSegments(events: LifeEvent[]): RawRouteSegment[] {
@@ -1097,7 +1108,7 @@ export function stayCircleRadiusMeters(durationMs: number) {
   return Math.min(75, 20 + Math.sqrt(minutes) * 6);
 }
 
-export function buildMovementSegments(events: LifeEvent[], referenceTimeMs = Date.now(), analysis?: TimelineAnalysis): RouteSegment[] {
+export function buildMovementSegments(events: LifeEvent[], analysis?: TimelineAnalysis): RouteSegment[] {
   const resolvedAnalysis = analysis ?? analyzeTimeline(events);
   const locations = resolvedAnalysis.correctedPositions;
   const stayClusters = resolvedAnalysis.stayClusters;
@@ -1108,20 +1119,25 @@ export function buildMovementSegments(events: LifeEvent[], referenceTimeMs = Dat
   // when the samples inside that stay are omitted.
   const routeLocations = locations.filter((location) => !stayEventIds.has(location.event.id) || stayEndEventIds.has(location.event.id));
 
-  return routeLocations.slice(1).flatMap((location, index) => {
+  const lengths = routeLocations.slice(1).map((location, index) => distanceMeters(routeLocations[index], location));
+  const totalMeters = lengths.reduce((sum, length) => sum + length, 0);
+  let travelledMeters = 0;
+  return routeLocations.slice(1).map((location, index) => {
     const previous = routeLocations[index];
-    const gapMs = Math.max(0, timestamp(location.event.startedAt) - timestamp(previous.event.startedAt));
-    return [{
+    const startOpacity = routeOpacity(travelledMeters, totalMeters);
+    travelledMeters += lengths[index];
+    return {
       from: [previous.latitude, previous.longitude],
       to: [location.latitude, location.longitude],
-      gapMs,
-      opacity: routeOpacity(Math.max(0, referenceTimeMs - timestamp(location.event.startedAt))),
-    }];
+      gapMs: Math.max(0, timestamp(location.event.startedAt) - timestamp(previous.event.startedAt)),
+      opacity: routeOpacity(travelledMeters, totalMeters),
+      startOpacity,
+    };
   });
 }
 
-export function buildRouteSegments(events: LifeEvent[], referenceTimeMs = Date.now()): RouteSegment[] {
-  return buildMovementSegments(events, referenceTimeMs);
+export function buildRouteSegments(events: LifeEvent[]): RouteSegment[] {
+  return buildMovementSegments(events);
 }
 
 function suggestPhotoLocationFromLocations(event: LifeEvent, locations: CorrectedLocation[]): PhotoLocationSuggestion | undefined {
@@ -1194,13 +1210,13 @@ function analyzeTimeline(events: LifeEvent[]): TimelineAnalysis {
   };
 }
 
-export function buildTimelineSnapshot(events: LifeEvent[], referenceTimeMs = Date.now()): TimelineRenderSnapshot {
+export function buildTimelineSnapshot(events: LifeEvent[]): TimelineRenderSnapshot {
   const analysis = analyzeTimeline(events);
   const displayEvents = displayPhotoEventsWithLocations(events, analysis.correctedLocations);
   const photoClusters = clusterPhotoEvents(displayEvents);
   const stayPlaces = buildStayPlaces(events, analysis);
   const activities = buildTimelineActivities(displayEvents, analysis);
-  const movementSegments = buildMovementSegments(events, referenceTimeMs, analysis);
+  const movementSegments = buildMovementSegments(events, analysis);
   const mapNodes: [number, number][] = [
     ...analysis.correctedLocations.map((location) => [location.latitude, location.longitude] as [number, number]),
     ...analysis.stayClusters.map((stay) => [stay.latitude, stay.longitude] as [number, number]),

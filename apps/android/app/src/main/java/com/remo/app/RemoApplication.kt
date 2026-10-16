@@ -2,6 +2,7 @@ package com.remo.app
 
 import android.app.Application
 import android.content.Context
+import com.google.android.gms.maps.MapsInitializer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -14,6 +15,8 @@ class RemoApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        // Line gradients and chevron textures need the current Maps renderer.
+        MapsInitializer.initialize(this, MapsInitializer.Renderer.LATEST) {}
     }
 
     companion object {
