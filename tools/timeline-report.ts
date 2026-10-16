@@ -7,7 +7,8 @@
  *
  * The first form lists each day's stays and movements. A movement whose path
  * is much longer than the straight line between its ends, or has a long
- * single segment, is worth looking at. The second form also draws one time
+ * single segment, is worth looking at; so is a stay whose fixes lie far from
+ * its center. `recorded` is the length of the fixes joined as they are. The second form also draws one time
  * window as an SVG: the recorded fixes in grey (orange: accuracy over 50m,
  * red: over 100m and not used) and the route the map draws on top of them.
  */
@@ -30,7 +31,11 @@ const clock = (value: string) => new Date(value).toTimeString().slice(0, 8);
 const minutes = (ms: number) => `${Math.round(ms / 60_000)}min`.padStart(7);
 const point = ([latitude, longitude]: [number, number]) => ({ latitude, longitude });
 
-function report(day: string, snapshot: TimelineRenderSnapshot, eventCount: number) {
+function report(day: string, events: LifeEvent[], snapshot: TimelineRenderSnapshot) {
+  const eventCount = events.length;
+  const fixes = events
+    .filter((event) => event.source === "location" && typeof event.latitude === "number" && typeof event.longitude === "number" && (event.accuracyMeters ?? 0) <= MAX_DISPLAY_ACCURACY_METERS)
+    .sort((a, b) => a.startedAt.localeCompare(b.startedAt)) as (LifeEvent & { latitude: number; longitude: number })[];
   const corrected = snapshot.correctedPositions.filter((location) => location.corrected).length;
   console.log(`\n${day}  records ${eventCount}, used ${snapshot.correctedPositions.length}, corrected ${corrected}, stays ${snapshot.stayClusters.length}`);
   for (const activity of snapshot.activities) {
@@ -41,7 +46,10 @@ function report(day: string, snapshot: TimelineRenderSnapshot, eventCount: numbe
         + `  from center: median ${spread[spread.length >> 1].toFixed(0)}m, max ${spread[spread.length - 1].toFixed(0)}m  photos ${activity.photos.length}`);
     } else {
       const longest = Math.max(...activity.path.slice(1).map((to, index) => distanceMeters(point(activity.path[index]), point(to))));
-      console.log(`  move ${time}  path ${activity.distanceMeters.toFixed(0)}m, straight ${distanceMeters(point(activity.from), point(activity.to)).toFixed(0)}m`
+      // The fixes as recorded, joined in order: how much longer than the drawn path says how noisy they were.
+      const recorded = fixes.filter((fix) => fix.startedAt >= activity.startedAt && fix.startedAt <= activity.endedAt);
+      const recordedMeters = recorded.slice(1).reduce((total, fix, index) => total + distanceMeters(recorded[index], fix), 0);
+      console.log(`  move ${time}  path ${activity.distanceMeters.toFixed(0)}m (recorded ${recordedMeters.toFixed(0)}m), straight ${distanceMeters(point(activity.from), point(activity.to)).toFixed(0)}m`
         + `, longest segment ${longest.toFixed(0)}m, points ${activity.path.length}${isMostlyUntracked(activity) ? "  [not recorded]" : ""}  photos ${activity.photos.length}`);
     }
   }
@@ -105,6 +113,6 @@ function plot(day: string, events: LifeEvent[], snapshot: TimelineRenderSnapshot
 for (const [day, events] of [...days].sort(([a], [b]) => a.localeCompare(b))) {
   if (plotDay && day !== plotDay) continue;
   const snapshot = buildTimelineSnapshot(events, Date.parse(document.exportedAt));
-  report(day, snapshot, events.length);
+  report(day, events, snapshot);
   if (plotDay) plot(day, events, snapshot);
 }

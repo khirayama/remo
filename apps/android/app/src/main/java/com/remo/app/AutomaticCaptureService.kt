@@ -731,10 +731,7 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         fun sensor(type: Int) = runCatching { sensorManager.getDefaultSensor(type, true) ?: sensorManager.getDefaultSensor(type) }.getOrNull()
             ?.let { if (it.isWakeUpSensor) "wakeup" else "non_wakeup" } ?: "none"
-        diagnose("service_start", mapOf(
-            "app" to BuildConfig.VERSION_NAME,
-            "sdk" to Build.VERSION.SDK_INT,
-            "device" to "${Build.MANUFACTURER} ${Build.MODEL}",
+        diagnose("service_start", CaptureDiagnostics.appFields(this) + mapOf(
             "sinceLastRecordMs" to if (lastLoggedAt > 0L) System.currentTimeMillis() - lastLoggedAt else null,
             "lastExit" to lastProcessExit(),
             "fineLocation" to (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED),
@@ -789,6 +786,8 @@ class AutomaticCaptureService : Service(), SensorEventListener {
             "mode" to summarizedMode.wireName,
             "activity" to activityState.name.lowercase(),
             "batteryPct" to if (level >= 0 && scale > 0) level * 100.0 / scale else null,
+            // A percent is hours of the 5-minute mode; the charge counter shows what one wake-up cost.
+            "chargeUah" to (getSystemService(Context.BATTERY_SERVICE) as BatteryManager).getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER).takeIf { it > 0 },
             "charging" to ((battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0),
         ) + deviceState())
         stats.reset(nowElapsed)

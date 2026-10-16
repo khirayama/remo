@@ -6,8 +6,9 @@
 Prints, per local day, how many fixes were recorded, their accuracy and
 spacing, and every hole in the record. When the export carries the Android
 capture log (`diagnostics.captureLog`), it also prints how long the service
-spent in each mode, the battery drain per mode, what ended each stay, why the
-5-minute mode was not entered, and why the process was restarted. With the
+spent in each mode, the battery drain per mode, what ended each stay, how much
+of the 10-second mode was spent on false alarms, why the 5-minute mode was not
+entered, and why the process was restarted. With the
 per-fix journal (`diagnostics.fixLog`), it also prints what kinds of fixes
 arrived and which of them jumped.
 """
@@ -109,12 +110,97 @@ def report_fix_log(fixes):
     jumps = [fix for fix in fixes if fix.get("fromPrevM", 0) >= 80 and 0 < fix.get("sincePrevMs", 0) <= 30_000
              and fix["fromPrevM"] / (fix["sincePrevMs"] / 1000) >= 8]
     print(f"  jumps (80m or more from the fix before, faster than 8 m/s): {len(jumps)}")
+    # The fix's own speed is measured apart from its position: a jump it rules out is not a trip.
+    impossible = [fix for fix in jumps if "spd" in fix
+                  and fix["fromPrevM"] / (fix["sincePrevMs"] / 1000) > fix["spd"] + 2 * fix.get("spdAcc", 1.5) + 2]
     if jumps:
+        print(f"  {'':2s}faster than the fix's own speed allows: {len(impossible)}")
         print(f"  {'':2s}kind of the fix that jumped:  {top(collections.Counter(map(kind, jumps)))}")
         print(f"  {'':2s}what happened to it:          {top(collections.Counter(fix.get('r', '?') for fix in jumps))}")
         for fix in jumps[:12]:
             print(f"    {datetime.fromtimestamp(fix['t'] / 1000):%m-%d %H:%M:%S} {fix['fromPrevM']:.0f}m in {fix['sincePrevMs'] / 1000:.0f}s"
                   f"  accuracy {fix.get('acc', '?')}m  {kind(fix)}  {fix.get('o', '?')}  {fix.get('r', '?')}")
+
+
+def report_false_alarms(log):
+    """How much of the 10-second mode ended back in the stay it had left."""
+    modes = [entry for entry in log if entry.get("e") == "mode"]
+    periods = collections.defaultdict(lambda: [0, 0, 0, 0])  # wake reason -> [periods, ms, false alarms, ms of them]
+    for start, end in zip(modes, modes[1:]):
+        if start.get("to") != "normal" or end.get("to") != "stationary":
+            continue
+        reason = start.get("reason", "?")
+        period = periods["left_anchor" if reason.startswith("left_anchor") else reason]
+        length = end["t"] - start["t"]
+        period[0] += 1
+        period[1] += length
+        if end.get("evidence", "").startswith("resumed"):
+            period[2] += 1
+            period[3] += length
+    if not periods:
+        return
+    print("\n10-second mode periods, and how many ended back in the same stay (false alarms):")
+    for reason, (count, ms, false_count, false_ms) in sorted(periods.items(), key=lambda item: -item[1][1]):
+        print(f"  {reason:20s} {count:4d} periods {hours(ms):>6s}   false alarms {false_count:4d} ({hours(false_ms)})")
+    total = sum(period[1] for period in periods.values()) or 1
+    print(f"  false alarms took {100 * sum(period[3] for period in periods.values()) / total:.0f}% of the 10-second mode")
+    quick = sorted(end["t"] - start["t"] for start, end in zip(modes, modes[1:])
+                   if start.get("to") == "normal" and end.get("evidence", "").startswith("resumed"))
+    if quick:
+        print(f"  a false alarm lasted: median {statistics.median(quick) / 1000:.0f}s, p90 {quick[int(len(quick) * 0.9)] / 1000:.0f}s"
+              f", ended by the quick check: {sum(end.get('evidence') == 'resumed_quick' for end in modes)}")
+
+
+def solve(rows, values):
+    """Least squares: the coefficients that best explain `values` from `rows`."""
+    size = len(rows[0])
+    matrix = [[sum(row[i] * row[j] for row in rows) for j in range(size)] + [sum(row[i] * value for row, value in zip(rows, values))] for i in range(size)]
+    for i in range(size):
+        if abs(matrix[i][i]) < 1e-9:
+            return None
+        matrix[i] = [value / matrix[i][i] for value in matrix[i]]
+        for other in range(size):
+            if other != i:
+                matrix[other] = [value - matrix[other][i] * pivot for value, pivot in zip(matrix[other], matrix[i])]
+    return [row[-1] for row in matrix]
+
+
+def report_battery(log):
+    """What the battery lost per hour on its own, per hour of the 10-second mode and per hour of screen.
+
+    The three are fitted over the stretches the device spent off the charger. The
+    10-second mode runs while the device is out and in use, so its figure also
+    holds whatever else the phone did then: read it as an upper bound.
+    """
+    summaries = [entry for entry in log if entry.get("e") == "summary" and "batteryPct" in entry]
+    runs, run = [], []
+    for entry in summaries:
+        if entry.get("charging") or (run and entry["t"] - run[-1]["t"] > 30 * 60_000):
+            runs.append(run)
+            run = []
+        if not entry.get("charging"):
+            run.append(entry)
+    runs = [run for run in runs + [run] if len(run) > 1 and run[-1]["t"] - run[0]["t"] >= 3_600_000]
+    if not runs:
+        return
+    # With the charge counter the loss is known to the mAh instead of to the percent.
+    exact = all("chargeUah" in run[0] and "chargeUah" in run[-1] for run in runs)
+    unit = "mAh" if exact else "%"
+    print(f"\nbattery, per stretch off the charger of an hour or more ({unit}):")
+    print("  start         length   lost   per hour   10-second mode   screen on")
+    rows, losses = [], []
+    for run in runs:
+        length = (run[-1]["t"] - run[0]["t"]) / 3_600_000
+        lost = (run[0]["chargeUah"] - run[-1]["chargeUah"]) / 1000 if exact else run[0]["batteryPct"] - run[-1]["batteryPct"]
+        # Each summary covers the period before it.
+        normal = sum(entry.get("periodMs", 0) for entry in run[1:] if entry.get("mode") == "normal") / 3_600_000
+        screen = sum(entry.get("periodMs", 0) for entry in run[1:] if entry.get("screenOn")) / 3_600_000
+        rows.append((length, normal, screen))
+        losses.append(lost)
+        print(f"  {datetime.fromtimestamp(run[0]['t'] / 1000):%m-%d %H:%M}  {length:5.1f}h  {lost:5.0f}  {lost / length:9.1f}  {100 * normal / length:14.0f}%  {100 * screen / length:9.0f}%")
+    fit = solve(rows, losses) if len(rows) >= 4 else None
+    if fit:
+        print(f"  fitted: {fit[0]:.1f} {unit}/h at rest, {fit[1]:+.1f} per hour of the 10-second mode (upper bound), {fit[2]:+.1f} per hour of screen")
 
 
 def report_capture_log(log):
@@ -200,8 +286,14 @@ def main():
     if not log:
         print("\nno capture log in this export (recorded before the diagnostics journal existed, or not on Android)")
         return
+    app = document.get("diagnostics", {}).get("app")
+    if app:
+        installed = f", installed {datetime.fromtimestamp(app['installedAt'] / 1000):%m-%d %H:%M}" if app.get("installedAt") else ""
+        print(f"\nexported by {app.get('app')} ({app.get('versionCode')}){installed}, {app.get('device')}, sdk {app.get('sdk')}")
     print(f"\ncapture log: {len(log)} entries\nservice lifecycle:")
     report_capture_log(log)
+    report_false_alarms(log)
+    report_battery(log)
     fixes = sorted(document.get("diagnostics", {}).get("fixLog", []), key=lambda entry: entry.get("t", 0))
     if fixes:
         report_fix_log(fixes)

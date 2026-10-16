@@ -1,6 +1,7 @@
 package com.remo.app
 
 import android.content.Context
+import android.os.Build
 import android.util.JsonWriter
 import android.util.Log
 import org.json.JSONObject
@@ -83,6 +84,8 @@ internal object CaptureDiagnostics {
     fun writeExport(context: Context, output: JsonWriter, fromMs: Long, toMs: Long) {
         val directory = context.applicationContext.filesDir
         output.beginObject()
+        output.name("app")
+        writeValue(output, JSONObject(appFields(context)))
         mapOf("captureLog" to FILE_NAME, "fixLog" to FIX_FILE_NAME).forEach { (name, fileName) ->
             val entries = runCatching { writer.submit<List<JSONObject>> { read(directory, fromMs, toMs, fileName) }.get() }.getOrDefault(emptyList())
             output.name(name).beginArray()
@@ -91,6 +94,18 @@ internal object CaptureDiagnostics {
         }
         output.endObject()
     }
+
+    /**
+     * Which build is running. The version name rarely changes between two installs,
+     * so the install time is what tells whether a change was on the device yet.
+     */
+    fun appFields(context: Context): Map<String, Any?> = mapOf(
+        "app" to BuildConfig.VERSION_NAME,
+        "versionCode" to BuildConfig.VERSION_CODE,
+        "installedAt" to runCatching { context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime }.getOrNull(),
+        "sdk" to Build.VERSION.SDK_INT,
+        "device" to "${Build.MANUFACTURER} ${Build.MODEL}",
+    )
 
     private fun writeValue(output: JsonWriter, value: Any?) {
         when (value) {

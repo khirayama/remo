@@ -26,3 +26,4 @@ ios_*.png
 
 # Database exports made before a migration
 remo-db-backup*.sql
+remo-timeline-*.json
