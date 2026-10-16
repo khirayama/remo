@@ -411,6 +411,20 @@ internal fun hasLocationPermission(context: Context): Boolean =
     ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
         ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
+/** How far the location permission goes. Recording works from [APPROXIMATE] up, and each step below [ALWAYS] loses something. */
+internal enum class LocationAccess { NONE, APPROXIMATE, WHILE_IN_USE, ALWAYS }
+
+internal fun currentLocationAccess(context: Context): LocationAccess {
+    fun granted(permission: String) = ContextCompat.checkSelfPermission(context, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    return when {
+        !hasLocationPermission(context) -> LocationAccess.NONE
+        !granted(android.Manifest.permission.ACCESS_FINE_LOCATION) -> LocationAccess.APPROXIMATE
+        // Before Android 10 the location permission covers the background as well.
+        android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q && !granted(android.Manifest.permission.ACCESS_BACKGROUND_LOCATION) -> LocationAccess.WHILE_IN_USE
+        else -> LocationAccess.ALWAYS
+    }
+}
+
 @SuppressLint("MissingPermission")
 internal fun enableMyLocation(map: GoogleMap, context: Context) {
     if (hasLocationPermission(context)) runCatching { map.isMyLocationEnabled = true }
