@@ -301,9 +301,9 @@ struct TimelineMapView: UIViewRepresentable {
                     renderer.strokeColor = RemoMapColor.focusRoute
                 } else {
                     let stops = gradientStops(line.alphas)
-                    renderer.setColors(stops.map { RemoMapColor.route.withAlphaComponent(line.alphas[$0]) }, locations: stops.map { line.location(atPointIndex: $0) })
+                    renderer.setColors(stops.map { RemoMapColor.route(alpha: line.alphas[$0]) }, locations: stops.map { line.location(atPointIndex: $0) })
                 }
-                if line.showsChevrons { renderer.chevronColor = line.isFocus ? .white : RemoMapColor.focusRoute.withAlphaComponent(0.9) }
+                if line.showsChevrons { renderer.chevronColor = line.isFocus ? .white.withAlphaComponent(0.6) : RemoMapColor.routeChevron.withAlphaComponent(0.75) }
                 renderer.lineWidth = line.isFocus ? 6 : line.untracked ? 3 : 4
                 // Dotted where nothing was recorded, so a straight connection is not read as the route taken.
                 if line.untracked { renderer.lineDashPattern = [0, 8] }
@@ -502,9 +502,10 @@ private final class RoutePolyline: MKPolyline {
 }
 
 /// Distance between chevrons along a line, in screen points.
-private let chevronSpacing: CGFloat = 72
+private let chevronSpacing: CGFloat = 96
 
-/// A route line with small open chevrons along it that point the way it was travelled.
+/// A route line with small open chevrons along it that point the way it was
+/// travelled. They stay inside the line as a quiet accent; the gradient carries most of the direction.
 private final class RouteRenderer: MKGradientPolylineRenderer {
     var chevronColor: UIColor?
 
@@ -513,8 +514,8 @@ private final class RouteRenderer: MKGradientPolylineRenderer {
         guard let chevronColor, polyline.pointCount > 1 else { return }
         // Renderer units are map points; screen sizes are divided by the zoom scale.
         let spacing = chevronSpacing / zoomScale
-        let half = 2.6 / zoomScale
-        let depth = 1.6 / zoomScale
+        let half = 1.2 / zoomScale
+        let depth = 0.7 / zoomScale
         let clip = rect(for: mapRect).insetBy(dx: -spacing, dy: -spacing)
         let points = polyline.points()
         // Placed by distance from the start so every map tile agrees on where they go.
@@ -544,7 +545,7 @@ private final class RouteRenderer: MKGradientPolylineRenderer {
         }
         context.addPath(path)
         context.setStrokeColor(chevronColor.cgColor)
-        context.setLineWidth(1.6 / zoomScale)
+        context.setLineWidth(1.1 / zoomScale)
         context.setLineCap(.round)
         context.setLineJoin(.round)
         context.strokePath()

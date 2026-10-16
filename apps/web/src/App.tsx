@@ -29,6 +29,14 @@ const MAP_COLORS = {
   dark: { route: "rgb(88, 203, 185)", focusRoute: "rgb(160, 235, 222)", stay: "rgb(134, 211, 169)" },
 };
 const DARK_QUERY = "(prefers-color-scheme: dark)";
+
+/** `from` blended toward `to` by `amount` (0 to 1); both are `rgb(r, g, b)`. */
+function mixColor(from: string, to: string, amount: number) {
+  const channels = (color: string) => color.match(/\d+/g)!.map(Number);
+  const [a, b] = [channels(from), channels(to)];
+  const t = Math.min(1, Math.max(0, amount));
+  return `rgb(${a.map((value, index) => Math.round(value + (b[index] - value) * t)).join(", ")})`;
+}
 const DEFAULT_CENTER: [number, number] = [35.6812, 139.7671];
 const MAP_MAX_ZOOM = 19;
 // OpenStreetMap's own tile servers are for light use only; a production
@@ -322,7 +330,8 @@ function LeafletMap({ timeline, previews, viewKey, focus, currentLocation, place
     movementSegments.forEach((segment) => {
       // Nothing was recorded along this segment: it only connects two known points.
       const untracked = segment.gapMs >= UNTRACKED_GAP_MS;
-      L.polyline([segment.from, segment.to], { color: ROUTE_COLOR, weight: untracked ? 2 : 4, dashArray: untracked ? "2 8" : undefined, opacity: dimmed ? segment.opacity * 0.2 : segment.opacity, lineCap: "round", lineJoin: "round", interactive: false }).addTo(layer);
+      // Deepens in shade as well as opacity toward the end of the day, so the line shows its direction.
+      L.polyline([segment.from, segment.to], { color: mixColor(ROUTE_COLOR, FOCUS_ROUTE_COLOR, segment.opacity), weight: untracked ? 2 : 4, dashArray: untracked ? "2 8" : undefined, opacity: dimmed ? segment.opacity * 0.2 : segment.opacity, lineCap: "round", lineJoin: "round", interactive: false }).addTo(layer);
     });
     stayClusters.forEach((stay) => {
       const selected = focus?.kind === "stay" && focus.activityId === stay.id;

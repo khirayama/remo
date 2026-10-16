@@ -46,6 +46,18 @@ enum RemoMapColor {
     static let route = UIColor(light: 0x0E8577, dark: 0x58CBB9)
     static let focusRoute = UIColor(light: 0x085E54, dark: 0xA0EBDE)
     static let stay = UIColor(light: 0x2F5A45, dark: 0x86D3A9)
+    /// A tint of the route's hue that sits quietly on top of the line: lighter on light maps, darker on dark ones.
+    static let routeChevron = UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? focusRoute.resolvedColor(with: traits).mixed(with: UIColor(hex: 0x0F1512), amount: 0.6)
+            : route.resolvedColor(with: traits).mixed(with: .white, amount: 0.6)
+    }
+
+    /// The route color at a point whose opacity is `alpha`: it deepens toward the
+    /// focus tone as it strengthens, so the line reads from faint to strong.
+    static func route(alpha: CGFloat) -> UIColor {
+        UIColor { route.resolvedColor(with: $0).mixed(with: focusRoute.resolvedColor(with: $0), amount: alpha).withAlphaComponent(alpha) }
+    }
 }
 
 extension Color {
@@ -69,6 +81,16 @@ extension UIColor {
 extension UIColor {
     convenience init(hex: UInt32, alpha: CGFloat = 1) {
         self.init(red: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255, blue: CGFloat(hex & 0xFF) / 255, alpha: alpha)
+    }
+
+    /// This color blended toward `other` by `amount` (0 to 1), channel by channel.
+    func mixed(with other: UIColor, amount: CGFloat) -> UIColor {
+        var (r1, g1, b1, a1): (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0)
+        var (r2, g2, b2, a2): (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0)
+        getRed(&r1, green: &g1, blue: &b1, alpha: &a1)
+        other.getRed(&r2, green: &g2, blue: &b2, alpha: &a2)
+        let t = min(1, max(0, amount))
+        return UIColor(red: r1 + (r2 - r1) * t, green: g1 + (g2 - g1) * t, blue: b1 + (b2 - b1) * t, alpha: a1 + (a2 - a1) * t)
     }
 }
 

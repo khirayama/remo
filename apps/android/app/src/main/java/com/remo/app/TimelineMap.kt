@@ -9,7 +9,26 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.outlined.PhotoCamera
+import androidx.compose.material.icons.outlined.Place
+import androidx.compose.material.icons.outlined.Bedtime
+import androidx.compose.material.icons.outlined.WbSunny
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -111,6 +130,7 @@ internal fun TimelineMap(
     loaded: Boolean,
     viewKey: String,
     photos: List<LibraryPhoto>,
+    sleepMoments: List<SleepMoment>,
     contentPadding: PaddingValues,
     focusTarget: TimelineMapFocus?,
     modifier: Modifier = Modifier,
@@ -163,6 +183,30 @@ internal fun TimelineMap(
             }
         }
     }
+    // What the replay calls out as it goes: the photos it just passed and the stay it is in.
+    val photoTimes = remember(photoClusters) { photoClusters.map { it.entries.first().startedAt } }
+    val replayPhoto by remember(replay, photoClusters) {
+        derivedStateOf {
+            if (!replaying || replay == null) null else replay.recentlyReached(photoTimes, replayProgress, REPLAY_PHOTO_POP_MS)?.let(photoClusters::get)
+        }
+    }
+    val replayStay by remember(replay, stayClusters) {
+        derivedStateOf {
+            if (!replaying || replay == null) null else replay.timeAt(replayProgress).let { time -> stayClusters.firstOrNull { time in it.startedAt..it.endedAt } }
+        }
+    }
+    val replaySleep by remember(replay, sleepMoments) {
+        derivedStateOf {
+            if (!replaying || replay == null) null else replay.recentlyReached(sleepMoments.map(SleepMoment::time), replayProgress, REPLAY_PHOTO_POP_MS)?.let(sleepMoments::get)
+        }
+    }
+    // The marker's thumbnail is too small for the pop, so a larger one is loaded for it.
+    var replayPhotoImage by remember { mutableStateOf<Pair<String, Bitmap?>?>(null) }
+    LaunchedEffect(replayPhoto?.id) {
+        val cluster = replayPhoto ?: return@LaunchedEffect
+        val photo = nearestLibraryPhoto(cluster.entries.first(), photos) ?: return@LaunchedEffect
+        withContext(Dispatchers.IO) { PhotoLibrary.loadThumbnail(context, photo, REPLAY_PHOTO_PX) }?.let { replayPhotoImage = cluster.id to it }
+    }
     val mapLocations: List<LatLng> = remember(processedLocations, stayClusters, photoClusters) {
         buildList {
             addAll(processedLocations.map { LatLng(it.latitude, it.longitude) })
@@ -213,7 +257,7 @@ internal fun TimelineMap(
                         focusedViewKey.value = viewKey
                     }
                     while (routeLines.size > routePaths.size) routeLines.removeAt(routeLines.lastIndex).remove()
-                    val chevron = chevrons.getOrPut(MapColors.focusRouteRgb) { chevronStamp(MapColors.focusRouteRgb, px) }
+                    val chevron = chevrons.getOrPut(MapColors.routeChevronRgb) { chevronStamp(MapColors.routeChevronRgb, CHEVRON_ALPHA, px) }
                     routePaths.forEachIndexed { index, path ->
                         val rendered = routeLines.getOrNull(index)
                         if (rendered == null) {
@@ -304,7 +348,7 @@ internal fun TimelineMap(
                         // Spans refer to segments, so the points must be in place first.
                         line.points = focusTarget.path
                         line.spans = listOf(StyleSpan(StrokeStyle.colorBuilder(MapColors.argb(255, MapColors.focusRouteRgb))
-                            .stamp(TextureStyle.newBuilder(chevrons.getOrPut(0xFFFFFF) { chevronStamp(0xFFFFFF, px) }).build()).build()))
+                            .stamp(TextureStyle.newBuilder(chevrons.getOrPut(0xFFFFFF) { chevronStamp(0xFFFFFF, FOCUS_CHEVRON_ALPHA, px) }).build()).build()))
                     } else {
                         focusLine[0]?.remove()
                         focusLine[0] = null
@@ -351,15 +395,26 @@ internal fun TimelineMap(
         }
         overlay()
         if (replaying && replay != null) {
-            ReplayBar(
-                time = replay.timeAt(replayProgress),
-                progress = replayProgress,
-                playing = replayPlaying,
-                modifier = Modifier.align(Alignment.BottomCenter).padding(start = 12.dp, end = 12.dp, bottom = contentPadding.calculateBottomPadding() + 12.dp),
-                onTogglePlaying = { replayPlaying = !replayPlaying },
-                onSeek = { replayPlaying = false; replayProgress = it },
-                onClose = { replayPlaying = false; replaying = false },
-            )
+            Column(
+                Modifier.align(Alignment.BottomCenter).padding(start = 12.dp, end = 12.dp, bottom = contentPadding.calculateBottomPadding() + 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                ReplayPop(replayPhoto, { it.id }) { cluster ->
+                    val image = replayPhotoImage?.takeIf { it.first == cluster.id }?.second ?: photoThumbnails[cluster.entries.first().id]
+                    ReplayPhotoPop(cluster, image) { replayPlaying = false; onSelectPhotosState(cluster.entries) }
+                }
+                ReplayPop(replaySleep, { "${it.wake}:${it.time}" }) { ReplaySleepPop(it) }
+                ReplayPop(replayStay, { it.id }) { stay -> ReplayStayPop(stay, stayLabels[stay.id].named(stay.coordinate)) }
+                ReplayBar(
+                    time = replay.timeAt(replayProgress),
+                    progress = replayProgress,
+                    playing = replayPlaying,
+                    onTogglePlaying = { replayPlaying = !replayPlaying },
+                    onSeek = { replayPlaying = false; replayProgress = it },
+                    onClose = { replayPlaying = false; replaying = false },
+                )
+            }
         }
     }
     LaunchedEffect(replaying, replayPlaying) {
@@ -581,8 +636,13 @@ private class RenderedRoute(var path: RouteRenderPath, var rgb: Int, val line: P
     }
 }
 
+/**
+ * The line deepens in both opacity and shade toward the end of the day, from
+ * the route color to its deeper focus tone, so its direction reads without marks.
+ */
 private fun routeSpans(path: RouteRenderPath, rgb: Int): List<StyleSpan> = gradientRuns(path.alphas).map { (segments, start, end) ->
-    StyleSpan(StrokeStyle.gradientBuilder(MapColors.argb((start * 255).toInt(), rgb), MapColors.argb((end * 255).toInt(), rgb)).build(), segments.toDouble())
+    fun color(alpha: Float) = MapColors.argb((alpha * 255).toInt(), MapColors.mix(rgb, MapColors.focusRouteRgb, alpha))
+    StyleSpan(StrokeStyle.gradientBuilder(color(start), color(end)).build(), segments.toDouble())
 }
 
 private enum class StayCircleState { NORMAL, SELECTED, DIMMED }
@@ -596,10 +656,13 @@ private fun Circle.applyStayStyle(stay: StayCluster, state: StayCircleState, px:
     zIndex = if (selected) 1f else 0f
 }
 
-/** The chevron line is wider than the route so its marks overhang the line slightly. */
-private const val CHEVRON_WIDTH_DP = 8f
+/** The chevron line matches the route's width so its marks stay inside the line. */
+private const val CHEVRON_WIDTH_DP = 4f
 /** Distance between chevrons along the line. */
-private const val CHEVRON_SPACING_DP = 72f
+private const val CHEVRON_SPACING_DP = 96f
+/** Chevrons are a quiet accent; the gradient carries most of the direction. */
+private const val CHEVRON_ALPHA = 190
+private const val FOCUS_CHEVRON_ALPHA = 150
 
 /** A transparent stroke that only carries the repeating chevron texture. */
 private fun chevronSpans(stamp: BitmapDescriptor) =
@@ -610,14 +673,14 @@ private fun chevronSpans(stamp: BitmapDescriptor) =
  * middle of a long transparent strip. The texture's width is scaled to the
  * line's width, so the strip's length sets the spacing.
  */
-private fun chevronStamp(rgb: Int, px: Float): BitmapDescriptor {
+private fun chevronStamp(rgb: Int, alpha: Int, px: Float): BitmapDescriptor {
     val width = (CHEVRON_WIDTH_DP * px).toInt()
     val height = (CHEVRON_SPACING_DP * px).toInt()
     val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     val center = width / 2f
     val middle = height / 2f
-    val half = width * 0.32f
-    val depth = width * 0.2f
+    val half = width * 0.3f
+    val depth = width * 0.18f
     // Maps lays the strip's bottom edge toward the end of the line, so the chevron points down.
     Canvas(bitmap).drawPath(Path().apply {
         moveTo(center - half, middle - depth)
@@ -625,10 +688,10 @@ private fun chevronStamp(rgb: Int, px: Float): BitmapDescriptor {
         lineTo(center + half, middle - depth)
     }, Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 1.6f * px
+        strokeWidth = 1.1f * px
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
-        color = MapColors.argb(230, rgb)
+        color = MapColors.argb(alpha, rgb)
     })
     return BitmapDescriptorFactory.fromBitmap(bitmap)
 }
@@ -667,6 +730,77 @@ private fun ReplayBar(
             Slider(value = progress, onValueChange = onSeek, modifier = Modifier.weight(1f).padding(horizontal = 12.dp))
             IconButton(onClick = onClose) {
                 Icon(Icons.Outlined.Close, "リプレイを閉じる", tint = AppColors.ink, modifier = Modifier.size(24.dp))
+            }
+        }
+    }
+}
+
+/** The pop's photo is loaded at this size, in pixels. */
+private const val REPLAY_PHOTO_PX = 480
+
+/** Pops [value] up from the replay bar with a little bounce, and lets it go when it turns null. */
+@Composable
+private fun <T : Any> ReplayPop(value: T?, key: (T) -> String, content: @Composable (T) -> Unit) {
+    AnimatedContent(
+        targetState = value,
+        contentKey = { it?.let(key) },
+        transitionSpec = {
+            val origin = TransformOrigin(0.5f, 1f)
+            (scaleIn(spring(dampingRatio = 0.55f, stiffness = Spring.StiffnessMediumLow), initialScale = 0.6f, transformOrigin = origin) + fadeIn()) togetherWith
+                (scaleOut(targetScale = 0.85f, transformOrigin = origin) + fadeOut())
+        },
+        label = "replayPop",
+    ) { current -> if (current != null) content(current) }
+}
+
+/** The photo the replay just passed, with when it was taken. Tapping opens it. */
+@Composable
+private fun ReplayPhotoPop(cluster: PhotoCluster, image: Bitmap?, onClick: () -> Unit) {
+    Surface(onClick = onClick, shape = RoundedCornerShape(16.dp), color = AppColors.surface, shadowElevation = 4.dp) {
+        Column(Modifier.padding(6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            val shape = RoundedCornerShape(12.dp)
+            if (image != null) {
+                Image(image.asImageBitmap(), mediaSummary(cluster.photoCount, cluster.videoCount), Modifier.size(148.dp).clip(shape), contentScale = ContentScale.Crop)
+            } else {
+                Box(Modifier.size(148.dp).clip(shape).background(AppColors.surfaceMuted), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Outlined.PhotoCamera, null, tint = AppColors.inkTertiary, modifier = Modifier.size(32.dp))
+                }
+            }
+            Text(
+                "${formatTime(cluster.entries.first().startedAt)} · ${mediaSummary(cluster.photoCount, cluster.videoCount)}",
+                style = MaterialTheme.typography.labelMedium,
+                color = AppColors.inkSecondary,
+                modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
+            )
+        }
+    }
+}
+
+/** Going to bed or getting up, as the replay passes it. */
+@Composable
+private fun ReplaySleepPop(moment: SleepMoment) {
+    Surface(shape = CircleShape, color = AppColors.surface, shadowElevation = 3.dp) {
+        Row(Modifier.padding(start = 12.dp, end = 16.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Icon(if (moment.wake) Icons.Outlined.WbSunny else Icons.Outlined.Bedtime, null, tint = AppColors.indigo, modifier = Modifier.size(20.dp))
+            Text(if (moment.wake) "起床" else "就寝", style = MaterialTheme.typography.titleSmall, color = AppColors.ink)
+            Text(formatTime(moment.time), style = MaterialTheme.typography.titleSmall, color = AppColors.inkSecondary)
+        }
+    }
+}
+
+/** The stay the replay is in: where, and from when to when. */
+@Composable
+private fun ReplayStayPop(stay: StayCluster, label: StayPlaceLabel?) {
+    Surface(shape = CircleShape, color = AppColors.surface, shadowElevation = 3.dp) {
+        Row(Modifier.padding(start = 12.dp, end = 18.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Icon(Icons.Outlined.Place, null, tint = AppColors.green, modifier = Modifier.size(20.dp))
+            Column {
+                Text(label?.primary ?: "滞在", style = MaterialTheme.typography.titleSmall, color = AppColors.ink, maxLines = 1)
+                Text(
+                    "${formatTime(stay.startedAt)} – ${formatTime(stay.endedAt)} · ${elapsedStayLabel(stay.durationMs)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AppColors.inkSecondary,
+                )
             }
         }
     }

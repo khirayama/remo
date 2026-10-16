@@ -71,7 +71,15 @@ object MapColors {
     val routeRgb get() = if (AppColors.dark) 0x58CBB9 else 0x0E8577
     val focusRouteRgb get() = if (AppColors.dark) 0xA0EBDE else 0x085E54
     val stayRgb get() = if (AppColors.dark) 0x86D3A9 else 0x2F5A45
+    /** A tint of the route's hue that sits quietly on top of the line: lighter on light maps, darker on dark ones. */
+    val routeChevronRgb get() = if (AppColors.dark) mix(focusRouteRgb, 0x0F1512, 0.6f) else mix(routeRgb, 0xFFFFFF, 0.6f)
     fun argb(alpha: Int, rgb: Int): Int = (alpha.coerceIn(0, 255) shl 24) or rgb
+    /** [from] blended toward [to] by [amount] (0 to 1), channel by channel. */
+    fun mix(from: Int, to: Int, amount: Float): Int {
+        val t = amount.coerceIn(0f, 1f)
+        fun channel(shift: Int) = ((from shr shift and 0xFF) + ((to shr shift and 0xFF) - (from shr shift and 0xFF)) * t).toInt() shl shift
+        return channel(16) or channel(8) or channel(0)
+    }
 }
 
 private val baseTypography = Typography()
