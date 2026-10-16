@@ -37,6 +37,8 @@ struct TimelineHomeView: View {
     let assets: [PHAsset]
     /// Sleep that ended on `date`, read from HealthKit.
     let sleep: [SleepSession]
+    /// Bedtimes and wake-ups on `date`, including tonight's bedtime.
+    let sleepMoments: [SleepMoment]
     let isCapturing: Bool
     let canLocate: Bool
     let onEditPhoto: (LogEntry) -> Void
@@ -54,6 +56,8 @@ struct TimelineHomeView: View {
     /// How far the day's replay has played, from 0 to 1; nil when not replaying.
     @State private var replayProgress: Double?
     @State private var replayPlaying = false
+    /// A larger thumbnail of the photo the replay just passed, by cluster id.
+    @State private var replayPhotoImage: (id: String, image: UIImage)?
     @State private var expanded = false
     @State private var dragOffset: CGFloat = 0
     @State private var photoSelection: PhotoSelection?
@@ -124,18 +128,45 @@ struct TimelineHomeView: View {
                     .ignoresSafeArea(edges: .bottom)
 
                 if mode == .day, let replayProgress, let replay = snapshot.replay {
-                    ReplayBar(
-                        time: replay.time(at: replayProgress),
-                        progress: Binding(get: { replayProgress }, set: { replayPlaying = false; self.replayProgress = $0 }),
-                        playing: $replayPlaying,
-                        onClose: stopReplay,
-                    )
+                    VStack(spacing: 8) {
+                        // What the replay calls out as it goes: the photos it just passed and the stay it is in.
+                        ReplayPop(id: replayPhoto?.id) {
+                            if let cluster = replayPhoto {
+                                ReplayPhotoPop(cluster: cluster, image: replayPhotoImage?.id == cluster.id ? replayPhotoImage?.image : nil) {
+                                    replayPlaying = false
+                                    photoSelection = PhotoSelection(entries: cluster.entries)
+                                }
+                            }
+                        }
+                        ReplayPop(id: replaySleep.map { "\($0.wake):\($0.time.timeIntervalSince1970)" }) {
+                            if let moment = replaySleep { ReplaySleepPop(moment: moment) }
+                        }
+                        ReplayPop(id: replayStay?.id) {
+                            if let stay = replayStay { ReplayStayPop(stay: stay, label: placeResolver.labels[stay.id]) }
+                        }
+                        ReplayBar(
+                            time: replay.time(at: replayProgress),
+                            progress: Binding(get: { replayProgress }, set: { replayPlaying = false; self.replayProgress = $0 }),
+                            playing: $replayPlaying,
+                            onClose: stopReplay,
+                        )
+                    }
                     .padding(.horizontal, 12)
                     .padding(.bottom, sheetHeight + 12)
                     .frame(maxHeight: .infinity, alignment: .bottom)
                     .ignoresSafeArea(edges: .bottom)
                 }
             }
+        }
+        .task(id: replayPhoto?.id) {
+            // The marker's thumbnail is too small for the pop, so a larger one is loaded for it.
+            guard let cluster = replayPhoto, let first = cluster.entries.first else { return }
+            let image: UIImage? = if let asset = nearestPhotoAsset(first, assets: assets) {
+                await PhotoLibraryStore.thumbnail(for: asset, size: CGSize(width: 480, height: 480))
+            } else {
+                await PhotoBackup.remoteThumbnail(eventID: first.id)
+            }
+            if let image, !Task.isCancelled { replayPhotoImage = (cluster.id, image) }
         }
         .task(id: replayPlaying) {
             guard replayPlaying else { return }
@@ -206,6 +237,26 @@ struct TimelineHomeView: View {
                 date = day
             }
         }
+    }
+
+    /// The photo the replay passed within the last moment of playback.
+    private var replayPhoto: PhotoCluster? {
+        guard mode == .day, let replayProgress, let replay = snapshot.replay else { return nil }
+        let clusters = snapshot.photoClusters.filter { !$0.entries.isEmpty }
+        return replay.recentlyReached(clusters.map { $0.entries[0].startedAt }, progress: replayProgress, window: replayPhotoPopDuration).map { clusters[$0] }
+    }
+
+    /// The bedtime or wake-up the replay passed within the last moment of playback.
+    private var replaySleep: SleepMoment? {
+        guard mode == .day, let replayProgress, let replay = snapshot.replay else { return nil }
+        return replay.recentlyReached(sleepMoments.map(\.time), progress: replayProgress, window: replayPhotoPopDuration).map { sleepMoments[$0] }
+    }
+
+    /// The stay the replay is in.
+    private var replayStay: StayCluster? {
+        guard mode == .day, let replayProgress, let replay = snapshot.replay else { return nil }
+        let time = replay.time(at: replayProgress)
+        return snapshot.analysis.stayClusters.first { $0.startedAt <= time && time <= $0.endedAt }
     }
 
     private func startReplay() {
@@ -320,6 +371,99 @@ struct TimelineHomeView: View {
         .background(RemoStyle.surface)
         .clipShape(UnevenRoundedRectangle(topLeadingRadius: RemoRadius.extraLarge, topTrailingRadius: RemoRadius.extraLarge, style: .continuous))
         .shadow(color: .black.opacity(0.12), radius: 8, y: -1)
+    }
+}
+
+/// Pops its content up from the replay bar with a little bounce whenever `id`
+/// changes, and lets it go when the content is empty.
+private struct ReplayPop<Content: View>: View {
+    let id: String?
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        ZStack {
+            if id != nil {
+                content
+                    .id(id)
+                    .transition(.asymmetric(
+                        insertion: .scale(scale: 0.6, anchor: .bottom).combined(with: .opacity),
+                        removal: .scale(scale: 0.85, anchor: .bottom).combined(with: .opacity),
+                    ))
+            }
+        }
+        .animation(.spring(response: 0.38, dampingFraction: 0.6), value: id)
+    }
+}
+
+/// The photo the replay just passed, with when it was taken. Tapping opens it.
+private struct ReplayPhotoPop: View {
+    let cluster: PhotoCluster
+    let image: UIImage?
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                ZStack {
+                    RemoStyle.surfaceMuted
+                    if let image {
+                        Image(uiImage: image).resizable().scaledToFill()
+                    } else {
+                        Image(systemName: "camera").font(.system(size: 28)).foregroundStyle(RemoStyle.inkTertiary)
+                    }
+                }
+                .frame(width: 148, height: 148)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                Text("\(cluster.entries.first.map { formatTime($0.startedAt) } ?? "") · \(mediaSummary(photoCount: cluster.photoCount, videoCount: cluster.videoCount))")
+                    .font(RemoFont.labelMedium)
+                    .foregroundStyle(RemoStyle.inkSecondary)
+                    .padding(.bottom, 2)
+            }
+            .padding(6)
+            .background(RemoStyle.surface, in: RoundedRectangle(cornerRadius: 16))
+            .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(mediaSummary(photoCount: cluster.photoCount, videoCount: cluster.videoCount))
+    }
+}
+
+/// Going to bed or getting up, as the replay passes it.
+private struct ReplaySleepPop: View {
+    let moment: SleepMoment
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: moment.wake ? "sun.max" : "moon.zzz").foregroundStyle(RemoStyle.indigo)
+            Text(moment.wake ? "起床" : "就寝").font(RemoFont.titleSmall).foregroundStyle(RemoStyle.ink)
+            Text(formatTime(moment.time)).font(RemoFont.titleSmall.monospacedDigit()).foregroundStyle(RemoStyle.inkSecondary)
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 16)
+        .padding(.vertical, 8)
+        .background(RemoStyle.surface, in: Capsule())
+        .shadow(color: .black.opacity(0.18), radius: 3, y: 1.5)
+    }
+}
+
+/// The stay the replay is in: where, and from when to when.
+private struct ReplayStayPop: View {
+    let stay: StayCluster
+    let label: StayPlaceLabel?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "mappin.and.ellipse").foregroundStyle(RemoStyle.green)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label?.primary ?? "滞在").font(RemoFont.titleSmall).foregroundStyle(RemoStyle.ink).lineLimit(1)
+                Text(stayTimeRange(stay)).font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkSecondary)
+            }
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 18)
+        .padding(.vertical, 8)
+        .background(RemoStyle.surface, in: Capsule())
+        .shadow(color: .black.opacity(0.18), radius: 3, y: 1.5)
     }
 }
 

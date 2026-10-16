@@ -35,6 +35,18 @@ fun sleepSessionsEndingIn(sessions: List<SleepSession>, day: LongRange): List<Sl
     return merged.filter { it.endedAt in day }
 }
 
+/** Falling asleep ([wake] false) or waking up ([wake] true) at [time]. */
+data class SleepMoment(val time: Long, val wake: Boolean)
+
+/**
+ * The bedtimes and wake-ups that fall within [day], oldest first. [sessions]
+ * can include the night that ends on the next day, whose bedtime is still in [day].
+ */
+fun sleepMoments(sessions: List<SleepSession>, day: LongRange): List<SleepMoment> =
+    sessions.flatMap { listOf(SleepMoment(it.startedAt, wake = false), SleepMoment(it.endedAt, wake = true)) }
+        .filter { it.time in day }
+        .sortedBy(SleepMoment::time)
+
 /**
  * Sleep is read from Health Connect whenever a day is shown or exported.
  * It is never stored or backed up: Health Connect stays the only copy on the device.

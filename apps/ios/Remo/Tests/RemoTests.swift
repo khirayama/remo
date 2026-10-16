@@ -485,6 +485,37 @@ final class RemoTests: XCTestCase {
         XCTAssertNil(RouteReplay([]))
     }
 
+    func testReplayProgressInvertsTheCompressedClock() throws {
+        let a = CLLocationCoordinate2D(latitude: 35.0, longitude: 139.0)
+        let b = CLLocationCoordinate2D(latitude: 35.1, longitude: 139.0)
+        let c = CLLocationCoordinate2D(latitude: 35.2, longitude: 139.0)
+        let start = Date(timeIntervalSince1970: 0)
+        let replay = try XCTUnwrap(RouteReplay([
+            RouteSegment(id: "1", from: a, to: b, gap: 10 * 60, opacity: 1, endedAt: start.addingTimeInterval(10 * 60)),
+            RouteSegment(id: "2", from: b, to: c, gap: 5 * 3600, opacity: 1, endedAt: start.addingTimeInterval(5 * 3600 + 10 * 60)),
+        ]))
+        XCTAssertEqual(replay.progress(at: start.addingTimeInterval(5 * 60)), 0.25, accuracy: 0.0001)
+        XCTAssertEqual(replay.progress(at: start.addingTimeInterval(10 * 60)), 0.5, accuracy: 0.0001)
+        // Halfway through the long stay is halfway through its shortened playback.
+        XCTAssertEqual(replay.progress(at: start.addingTimeInterval(160 * 60)), 0.75, accuracy: 0.0001)
+        XCTAssertEqual(replay.progress(at: start.addingTimeInterval(-1)), 0)
+        XCTAssertEqual(replay.progress(at: .distantFuture), 1)
+    }
+
+    func testReplayKeepsTheLatestPhotoUpForItsWindow() throws {
+        let start = Date(timeIntervalSince1970: 0)
+        let replay = try XCTUnwrap(RouteReplay([
+            RouteSegment(id: "1", from: CLLocationCoordinate2D(latitude: 35.0, longitude: 139.0), to: CLLocationCoordinate2D(latitude: 35.2, longitude: 139.0), gap: 100, opacity: 1, endedAt: start.addingTimeInterval(100)),
+        ]))
+        let times = [10, 20, 90].map { start.addingTimeInterval($0) }
+        // Each 10% of the day is 2.4 seconds of playback.
+        XCTAssertNil(replay.recentlyReached(times, progress: 0.05, window: replayPhotoPopDuration))
+        XCTAssertEqual(replay.recentlyReached(times, progress: 0.15, window: replayPhotoPopDuration), 0)
+        XCTAssertEqual(replay.recentlyReached(times, progress: 0.25, window: replayPhotoPopDuration), 1)
+        XCTAssertNil(replay.recentlyReached(times, progress: 0.5, window: replayPhotoPopDuration))
+        XCTAssertEqual(replay.recentlyReached(times, progress: 1, window: replayPhotoPopDuration), 2)
+    }
+
     // MARK: - Stay detection
 
     /// One sample every `step` seconds from `start` at a fixed coordinate.

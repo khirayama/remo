@@ -436,11 +436,14 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
             sleepRevision++
         }
     }
+    // Also the night that ends the next day: its bedtime belongs to the selected day's replay.
     val sleepByDay by produceState<Pair<LongRange, List<SleepSession>>?>(null, dayRange, sleepAccess, sleepRevision) {
-        value = if (sleepAccess) dayRange to SleepData.sessionsEndingIn(context, dayRange) else null
+        value = if (sleepAccess) dayRange to SleepData.sessionsEndingIn(context, dayRange.first..dayRange.last + SLEEP_LOOKAHEAD_MS) else null
     }
     // Another day's sleep is not shown while the selected day is being read.
-    val sleep = remember(sleepByDay, dayRange) { sleepByDay?.takeIf { it.first == dayRange }?.second.orEmpty() }
+    val sleepAround = remember(sleepByDay, dayRange) { sleepByDay?.takeIf { it.first == dayRange }?.second.orEmpty() }
+    val sleep = remember(sleepAround, dayRange) { sleepAround.filter { it.endedAt in dayRange } }
+    val sleepMoments = remember(sleepAround, dayRange) { sleepMoments(sleepAround, dayRange) }
     val stayIndex = rememberStayIndex(context, store)
     LaunchedEffect(store.revision) { NamedPlaces.places = store.places() }
     // Location samples around the photo being corrected: the suggestion reads the track near it.
@@ -514,6 +517,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                 timeline = timeline,
                 libraryPhotos = libraryPhotos,
                 sleep = sleep,
+                sleepMoments = sleepMoments,
                 autoCapture = autoCapture,
                 focus = mapFocusTarget,
                 onDateChange = { selectedDate = it; mapFocusTarget = null },
@@ -665,6 +669,7 @@ private fun TimelineHome(
     timeline: TimelineRenderSnapshot?,
     libraryPhotos: List<LibraryPhoto>,
     sleep: List<SleepSession>,
+    sleepMoments: List<SleepMoment>,
     autoCapture: Boolean,
     focus: TimelineMapFocus?,
     onDateChange: (String) -> Unit,
@@ -771,6 +776,7 @@ private fun TimelineHome(
                     loaded = timeline != null,
                     viewKey = selectedDate,
                     photos = libraryPhotos,
+                    sleepMoments = sleepMoments,
                     contentPadding = mapPadding,
                     focusTarget = focus,
                     modifier = Modifier.fillMaxSize(),
@@ -781,6 +787,9 @@ private fun TimelineHome(
         }
     }
 }
+
+/** How far past the selected day sleep is read, to find the night that starts on it. */
+private const val SLEEP_LOOKAHEAD_MS = 24 * 60 * 60 * 1000L
 
 /** Height of the controls stacked over the top of the map. */
 private val MapTopInset = 112.dp

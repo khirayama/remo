@@ -37,6 +37,20 @@ func sleepSessionsEnding(in day: Range<Date>, asleep: [SleepSession], inBed: [Sl
     return (nights + unmeasured).sorted { $0.startedAt < $1.startedAt }.filter { day.contains($0.endedAt) }
 }
 
+/// Falling asleep (`wake` false) or waking up (`wake` true) at `time`.
+struct SleepMoment: Equatable {
+    let time: Date
+    let wake: Bool
+}
+
+/// The bedtimes and wake-ups that fall within `day`, oldest first. `sessions`
+/// can include the night that ends on the next day, whose bedtime is still in `day`.
+func sleepMoments(_ sessions: [SleepSession], in day: Range<Date>) -> [SleepMoment] {
+    sessions.flatMap { [SleepMoment(time: $0.startedAt, wake: false), SleepMoment(time: $0.endedAt, wake: true)] }
+        .filter { day.contains($0.time) }
+        .sorted { $0.time < $1.time }
+}
+
 /// Sleep is read from HealthKit whenever a day is shown or exported.
 /// It is never stored or backed up: HealthKit stays the only copy on the device.
 enum SleepData {

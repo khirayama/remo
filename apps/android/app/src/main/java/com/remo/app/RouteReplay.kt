@@ -9,6 +9,9 @@ private const val REPLAY_MAX_STEP_MS = 10 * 60_000L
 /** A whole day plays back in this many milliseconds. */
 const val REPLAY_PLAYBACK_MS = 24_000L
 
+/** A photo pops up for this long of playback after the replay reaches it. */
+const val REPLAY_PHOTO_POP_MS = 2_400L
+
 /** Where the replay is at one moment: the line drawn so far ends at [head]. */
 data class ReplayFrame(val drawn: List<LatLng>, val head: LatLng, val time: Long)
 
@@ -34,6 +37,31 @@ class RouteReplay private constructor(
     }
 
     fun timeAt(progress: Float): Long = locate(progress).let { (index, fraction) -> timeAt(index, fraction) }
+
+    /** How far into the replay [time] is reached, from 0 to 1. */
+    fun progressAt(time: Long): Float {
+        if (time <= times.first()) return 0f
+        if (time >= times.last()) return 1f
+        var low = 0
+        var high = times.lastIndex
+        while (low < high) {
+            val middle = (low + high + 1) / 2
+            if (times[middle] <= time) low = middle else high = middle - 1
+        }
+        val span = times[low + 1] - times[low]
+        val fraction = if (span <= 0L) 0.0 else (time - times[low]).toDouble() / span
+        return ((clocks[low] + (clocks[low + 1] - clocks[low]) * fraction) / clockMs).toFloat()
+    }
+
+    /**
+     * The index of the latest of [times] the replay reached within the last
+     * [windowMs] of playback before [progress], or null when none was. At the
+     * end of the replay the last one stays up, since playback has stopped.
+     */
+    fun recentlyReached(times: List<Long>, progress: Float, windowMs: Long): Int? {
+        val window = windowMs.toFloat() / REPLAY_PLAYBACK_MS
+        return times.indices.filter { progressAt(times[it]).let { reached -> reached <= progress && (progress < reached + window || progress >= 1f) } }.maxByOrNull { times[it] }
+    }
 
     private fun timeAt(index: Int, fraction: Double): Long =
         if (index == times.lastIndex) times.last() else times[index] + ((times[index + 1] - times[index]) * fraction).toLong()

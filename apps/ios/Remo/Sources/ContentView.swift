@@ -270,7 +270,7 @@ private struct TrackerHomeView: View {
     @State private var sleepAccess = SleepData.Access.unavailable
     @State private var sleepRevision = 0
     /// Read from HealthKit for the selected day; it is read again whenever the app comes back to the foreground.
-    @State private var daySleep: (date: Date, sessions: [SleepSession])?
+    @State private var daySleep: (date: Date, sessions: [SleepSession], moments: [SleepMoment])?
     @State private var syncStatus = "端末に保存済み"
     @State private var status: String?
     @State private var confirmingDeleteAll = false
@@ -308,6 +308,7 @@ private struct TrackerHomeView: View {
                 assets: photoLibrary.assets,
                 // Another day's sleep is not shown while the selected day is being read.
                 sleep: daySleep.flatMap { $0.date == selectedDate ? $0.sessions : nil } ?? [],
+                sleepMoments: daySleep.flatMap { $0.date == selectedDate ? $0.moments : nil } ?? [],
                 isCapturing: capturing,
                 canLocate: canLocate,
                 onEditPhoto: { selectedLog = $0 },
@@ -340,10 +341,12 @@ private struct TrackerHomeView: View {
         }
         .task(id: "\(sleepRevision)@\(selectedDate.timeIntervalSince1970)") {
             let date = selectedDate
-            guard sleepAccess.requested, let end = Calendar.current.date(byAdding: .day, value: 1, to: date) else { daySleep = nil; return }
-            let sessions = await SleepData.sessions(endingIn: date..<end)
+            guard sleepAccess.requested, let end = Calendar.current.date(byAdding: .day, value: 1, to: date),
+                  let lookahead = Calendar.current.date(byAdding: .day, value: 1, to: end) else { daySleep = nil; return }
+            // Also the night that ends the next day: its bedtime belongs to the selected day's replay.
+            let sessions = await SleepData.sessions(endingIn: date..<lookahead)
             guard !Task.isCancelled else { return }
-            daySleep = (date, sessions)
+            daySleep = (date, sessions.filter { (date..<end).contains($0.endedAt) }, sleepMoments(sessions, in: date..<end))
         }
         .task(id: "\(store.revision)@\(selectedDate.timeIntervalSince1970)") {
             let date = selectedDate, database = store.database

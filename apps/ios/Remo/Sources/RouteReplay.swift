@@ -7,6 +7,9 @@ private let replayMaxStep: TimeInterval = 10 * 60
 /// A whole day plays back in this many seconds.
 let replayPlaybackDuration: TimeInterval = 24
 
+/// A photo pops up for this long of playback after the replay reaches it.
+let replayPhotoPopDuration: TimeInterval = 2.4
+
 /// Where the replay is at one moment: the line drawn so far ends at `head`.
 struct ReplayFrame {
     let drawn: [CLLocationCoordinate2D]
@@ -51,6 +54,31 @@ struct RouteReplay {
     func time(at progress: Double) -> Date {
         let (index, fraction) = locate(progress)
         return time(index, fraction)
+    }
+
+    /// How far into the replay `time` is reached, from 0 to 1.
+    func progress(at time: Date) -> Double {
+        guard let first = times.first, let last = times.last, time > first else { return 0 }
+        guard time < last else { return 1 }
+        var low = 0, high = times.count - 1
+        while low < high {
+            let middle = (low + high + 1) / 2
+            if times[middle] <= time { low = middle } else { high = middle - 1 }
+        }
+        let span = times[low + 1].timeIntervalSince(times[low])
+        let fraction = span <= 0 ? 0 : time.timeIntervalSince(times[low]) / span
+        return (clocks[low] + (clocks[low + 1] - clocks[low]) * fraction) / clock
+    }
+
+    /// The index of the latest of `times` the replay reached within the last
+    /// `window` seconds of playback before `progress`, or nil when none was. At
+    /// the end of the replay the last one stays up, since playback has stopped.
+    func recentlyReached(_ times: [Date], progress: Double, window: TimeInterval) -> Int? {
+        let share = window / replayPlaybackDuration
+        return times.indices.filter { index in
+            let reached = self.progress(at: times[index])
+            return reached <= progress && (progress < reached + share || progress >= 1)
+        }.max { times[$0] < times[$1] }
     }
 
     private func time(_ index: Int, _ fraction: Double) -> Date {

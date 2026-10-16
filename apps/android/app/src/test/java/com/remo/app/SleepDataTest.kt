@@ -21,6 +21,16 @@ class SleepDataTest {
     }
 
     @Test
+    fun momentsIncludeTonightsBedtimeButNotTomorrowsWakeUp() {
+        val lastNight = SleepSession(23 * hour, 30 * hour)
+        val tonight = SleepSession(47 * hour, 54 * hour)
+        assertEquals(
+            listOf(SleepMoment(30 * hour, wake = true), SleepMoment(47 * hour, wake = false)),
+            sleepMoments(listOf(tonight, lastNight), day),
+        )
+    }
+
+    @Test
     fun emptySessionsAreIgnored() {
         assertEquals(emptyList<SleepSession>(), sleepSessionsEndingIn(listOf(SleepSession(30 * hour, 30 * hour)), day))
     }

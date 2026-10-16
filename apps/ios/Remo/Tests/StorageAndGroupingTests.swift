@@ -245,6 +245,14 @@ final class StorageAndGroupingTests: XCTestCase {
         XCTAssertEqual(sleepSessionsEnding(in: sleepDay, asleep: [sleep(47, 54), sleep(23, 30)]), [sleep(23, 30)])
     }
 
+    func testSleepMomentsIncludeTonightsBedtimeButNotTomorrowsWakeUp() {
+        let day = Date(timeIntervalSince1970: 24 * 3_600)..<Date(timeIntervalSince1970: 48 * 3_600)
+        XCTAssertEqual(sleepMoments([sleep(47, 54), sleep(23, 30)], in: day), [
+            SleepMoment(time: Date(timeIntervalSince1970: 30 * 3_600), wake: true),
+            SleepMoment(time: Date(timeIntervalSince1970: 47 * 3_600), wake: false),
+        ])
+    }
+
     func testSleepStagesOfOneNightBecomeOneSession() {
         // Core, deep and REM stretches with the times awake left out, and a nap in the afternoon.
         let stages = [sleep(23, 25), sleep(25.2, 27), sleep(27, 28.5), sleep(28.75, 30), sleep(37, 38)]
