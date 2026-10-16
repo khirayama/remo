@@ -54,6 +54,8 @@ object AppColors {
     val tealContainer get() = pick(0xFFD9F0EB, 0xFF173F39)
     val amber get() = pick(0xFF9E6A2C, 0xFFE3B578)
     val amberContainer get() = pick(0xFFF5EADB, 0xFF47361E)
+    val indigo get() = pick(0xFF4A5A9E, 0xFFAAB6F0)
+    val indigoContainer get() = pick(0xFFE3E7F6, 0xFF2A3157)
 
     val danger get() = pick(0xFFB3261E, 0xFFF2B8B5)
     val dangerContainer get() = pick(0xFFFBEAE8, 0xFF5C2420)

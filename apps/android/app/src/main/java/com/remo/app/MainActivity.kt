@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
 import androidx.activity.ComponentActivity
@@ -57,8 +58,11 @@ import androidx.compose.material3.rememberBottomSheetScaffoldState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.PermissionController
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -144,9 +148,14 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     var selectedPlaceId by remember { mutableStateOf<String?>(null) }
     val savedAllPlacesCamera = remember { SavedCamera() }
     var autoCapture by remember { mutableStateOf(AutomaticCaptureService.isEnabled(context)) }
+    var locationAccess by remember { mutableStateOf(currentLocationAccess(context)) }
+    var locationAccessRequestedAt by remember { mutableLongStateOf(0L) }
     var photoAccess by remember { mutableStateOf(PhotoLibrary.hasAnyAccess(context)) }
     var photoLocationAccess by remember { mutableStateOf(PhotoLibrary.hasMediaLocationAccess(context)) }
     var libraryPhotos by remember { mutableStateOf<List<LibraryPhoto>>(emptyList()) }
+    val sleepAvailable = remember { SleepData.isAvailable(context) }
+    var sleepAccess by remember { mutableStateOf(false) }
+    var sleepRevision by remember { mutableIntStateOf(0) }
     var syncStatus by remember { mutableStateOf(if (user == null) "端末に保存済み" else "バックアップ待ち") }
     var lastBackupAt by remember { mutableStateOf<Long?>(BackupCoordinator.lastSuccessAt(context)) }
     var status by remember { mutableStateOf<String?>(null) }
@@ -175,7 +184,11 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                 // Written a day at a time, so a year of records is never held in memory.
                 runCatching {
                     withContext(Dispatchers.IO) {
-                        context.contentResolver.openOutputStream(uri)?.use { output -> writeTimelineExport(output, store, range.first, range.second) { writer, fromMs, toMs -> CaptureDiagnostics.writeExport(context, writer, fromMs, toMs) } }
+                        // null without the permission: the export then has no sleep at all, rather than an empty list.
+                        val sleep = if (SleepData.hasAccess(context)) {
+                            SleepData.sessionsEndingIn(context, parseDate(range.first).timeInMillis until parseDate(shiftDay(range.second, 1)).timeInMillis)
+                        } else null
+                        context.contentResolver.openOutputStream(uri)?.use { output -> writeTimelineExport(output, store, range.first, range.second, sleep) { writer, fromMs, toMs -> CaptureDiagnostics.writeExport(context, writer, fromMs, toMs) } }
                             ?: error("ファイルを開けませんでした")
                     }
                 }.onSuccess { status = "JSONを書き出しました" }
@@ -185,6 +198,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     }
 
     val locationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        locationAccess = currentLocationAccess(context)
         if (hasLocationPermission(context)) {
             AutomaticCaptureService.setEnabled(context, true)
             autoCapture = true
@@ -193,6 +207,23 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
             autoCapture = false
             status = "位置情報の記録には許可が必要です"
         }
+    }
+    // Asked from the settings row, which widens what was granted before.
+    val locationAccessPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        val before = locationAccess
+        locationAccess = currentLocationAccess(context)
+        if (locationAccess == before) {
+            // The system stops showing a request that was declined before and answers at once; its settings are then the only way.
+            if (SystemClock.elapsedRealtime() - locationAccessRequestedAt < 500L) openAppSettings(context)
+        } else if (before == LocationAccess.NONE) {
+            AutomaticCaptureService.setEnabled(context, true)
+            autoCapture = true
+            status = "位置情報の記録を開始しました"
+        }
+    }
+    val sleepPermission = rememberLauncherForActivityResult(PermissionController.createRequestPermissionResultContract()) { granted ->
+        sleepAccess = SleepData.permission in granted
+        if (!sleepAccess) status = "睡眠の表示にはヘルスコネクトでの許可が必要です"
     }
     val photoPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         refreshPhotoState(context, scope) { access, locationAccess, photos ->
@@ -218,12 +249,24 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
         }
     }
 
+    fun requestLocationAccess() {
+        val permissions = when (locationAccess) {
+            LocationAccess.ALWAYS -> return openAppSettings(context)
+            // Only Android 10 and later tell the background apart.
+            LocationAccess.WHILE_IN_USE -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION) else return
+            LocationAccess.APPROXIMATE -> arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+            LocationAccess.NONE -> requiredLocationPermissions(context)
+        }
+        locationAccessRequestedAt = SystemClock.elapsedRealtime()
+        locationAccessPermission.launch(permissions)
+    }
+
     fun requestPhotos() {
         val missing = PhotoLibrary.missingPermissions(context)
         if (missing.isNotEmpty()) {
             photoPermission.launch(missing)
         } else {
-            openPhotoSettings(context)
+            openAppSettings(context)
         }
     }
 
@@ -385,6 +428,19 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
             }
         }
     }
+    // While the app is in the background the permissions can change in the system settings and last night's sleep can arrive.
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            locationAccess = currentLocationAccess(context)
+            sleepAccess = SleepData.hasAccess(context)
+            sleepRevision++
+        }
+    }
+    val sleepByDay by produceState<Pair<LongRange, List<SleepSession>>?>(null, dayRange, sleepAccess, sleepRevision) {
+        value = if (sleepAccess) dayRange to SleepData.sessionsEndingIn(context, dayRange) else null
+    }
+    // Another day's sleep is not shown while the selected day is being read.
+    val sleep = remember(sleepByDay, dayRange) { sleepByDay?.takeIf { it.first == dayRange }?.second.orEmpty() }
     val stayIndex = rememberStayIndex(context, store)
     LaunchedEffect(store.revision) { NamedPlaces.places = store.places() }
     // Location samples around the photo being corrected: the suggestion reads the track near it.
@@ -423,11 +479,13 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     Box(Modifier.fillMaxSize()) {
         if (showSettings) {
             SettingsScreen(
-                SettingsState(autoCapture, photoAccess, photoLocationAccess, syncStatus, lastBackupAt, user),
+                SettingsState(autoCapture, locationAccess, photoAccess, photoLocationAccess, sleepAccess.takeIf { sleepAvailable }, syncStatus, lastBackupAt, user),
                 SettingsActions(
                     onBack = { showSettings = false },
                     onCapture = ::requestLocation,
+                    onLocationAccess = ::requestLocationAccess,
                     onPhotos = ::requestPhotos,
+                    onSleep = { if (sleepAccess) openHealthConnect(context) else sleepPermission.launch(setOf(SleepData.permission)) },
                     onExport = ::openExportDialog,
                     onImport = { importLauncher.launch(arrayOf("application/json", "text/plain")) },
                     onDeleteAll = { confirmDelete = true },
@@ -455,6 +513,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                 selectedDate = selectedDate,
                 timeline = timeline,
                 libraryPhotos = libraryPhotos,
+                sleep = sleep,
                 autoCapture = autoCapture,
                 focus = mapFocusTarget,
                 onDateChange = { selectedDate = it; mapFocusTarget = null },
@@ -605,6 +664,7 @@ private fun TimelineHome(
     selectedDate: String,
     timeline: TimelineRenderSnapshot?,
     libraryPhotos: List<LibraryPhoto>,
+    sleep: List<SleepSession>,
     autoCapture: Boolean,
     focus: TimelineMapFocus?,
     onDateChange: (String) -> Unit,
@@ -668,6 +728,7 @@ private fun TimelineHome(
                         timeline = timeline ?: TimelineRenderSnapshot(),
                         loaded = timeline != null,
                         photos = libraryPhotos,
+                        sleep = sleep,
                         autoCapture = autoCapture,
                         selectedActivityId = focus?.activityId,
                         listState = listState,
@@ -744,8 +805,12 @@ private fun requiredLocationPermissions(context: Context): Array<String> = build
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) add(Manifest.permission.POST_NOTIFICATIONS)
 }.filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }.toTypedArray()
 
-private fun openPhotoSettings(context: Context) {
+private fun openAppSettings(context: Context) {
     context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { data = Uri.parse("package:${context.packageName}") })
+}
+
+private fun openHealthConnect(context: Context) {
+    runCatching { context.startActivity(HealthConnectClient.getHealthConnectManageDataIntent(context)) }
 }
 
 private fun refreshPhotoState(context: Context, scope: kotlinx.coroutines.CoroutineScope, onLoaded: (Boolean, Boolean, List<LibraryPhoto>) -> Unit) {
@@ -765,6 +830,7 @@ internal suspend fun writeTimelineExport(
     store: LogStore,
     from: String,
     to: String,
+    sleep: List<SleepSession>? = null,
     writeDiagnostics: ((android.util.JsonWriter, fromMs: Long, toMs: Long) -> Unit)? = null,
 ) {
     val writer = android.util.JsonWriter(output.bufferedWriter(Charsets.UTF_8))
@@ -806,6 +872,17 @@ internal suspend fun writeTimelineExport(
         .name("photoRecordCount").value(photoRecordCount.toLong())
         .name("photoCount").value(photoCount.toLong())
         .endObject()
+    if (sleep != null) {
+        // Read from Health Connect for this export and listed under the day each one ended on; importers ignore it.
+        writer.name("sleep").beginArray()
+        for (session in sleep) {
+            writer.beginObject()
+                .name("startedAt").value(isoTimestamp(session.startedAt))
+                .name("endedAt").value(isoTimestamp(session.endedAt))
+                .endObject()
+        }
+        writer.endArray()
+    }
     if (writeDiagnostics != null) {
         // What the recording service decided and why; importers ignore it.
         writer.name("diagnostics")

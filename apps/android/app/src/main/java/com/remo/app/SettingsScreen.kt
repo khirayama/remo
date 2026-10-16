@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Logout
+import androidx.compose.material.icons.outlined.Bedtime
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.CloudDone
@@ -27,9 +28,11 @@ import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.FileOpen
 import androidx.compose.material.icons.outlined.IosShare
 import androidx.compose.material.icons.outlined.LocationOn
+import androidx.compose.material.icons.outlined.MyLocation
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.PersonRemove
 import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -64,8 +67,11 @@ import kotlinx.coroutines.launch
 
 internal data class SettingsState(
     val autoCapture: Boolean,
+    val locationAccess: LocationAccess,
     val photoAccess: Boolean,
     val photoLocationAccess: Boolean,
+    /** null when Health Connect is not available on this device. */
+    val sleepAccess: Boolean?,
     val syncStatus: String,
     val lastBackupAt: Long?,
     val user: RemoUser?,
@@ -74,7 +80,9 @@ internal data class SettingsState(
 internal class SettingsActions(
     val onBack: () -> Unit,
     val onCapture: () -> Unit,
+    val onLocationAccess: () -> Unit,
     val onPhotos: () -> Unit,
+    val onSleep: () -> Unit,
     val onExport: () -> Unit,
     val onImport: () -> Unit,
     val onDeleteAll: () -> Unit,
@@ -118,6 +126,32 @@ internal fun SettingsScreen(state: SettingsState, actions: SettingsActions) {
                         onClick = actions.onCapture,
                     )
                     GroupDivider()
+                    // Anything short of "all the time" still records, so it is a warning rather than an error.
+                    val locationReady = state.locationAccess == LocationAccess.ALWAYS
+                    ActionRow(
+                        if (locationReady) Icons.Outlined.MyLocation else Icons.Outlined.WarningAmber,
+                        "位置情報の許可",
+                        tint = if (locationReady) AppColors.green else AppColors.amber,
+                        subtitle = when (state.locationAccess) {
+                            LocationAccess.ALWAYS -> "常に許可されています。アプリを閉じている間も記録できます"
+                            LocationAccess.WHILE_IN_USE -> "「常に許可」になっていません。端末の再起動後やシステムがアプリを終了した後に、Remoを開くまで記録が止まることがあります"
+                            LocationAccess.APPROXIMATE -> "おおよその位置だけが許可されています。滞在や移動を正しく記録するには「正確な位置情報」が必要です"
+                            LocationAccess.NONE -> "位置情報が許可されていません。記録するには許可が必要です"
+                        },
+                        trailing = {
+                            TrailingLabel(
+                                when (state.locationAccess) {
+                                    LocationAccess.ALWAYS -> "許可済み"
+                                    LocationAccess.WHILE_IN_USE -> "常に許可する"
+                                    LocationAccess.APPROXIMATE -> "正確にする"
+                                    LocationAccess.NONE -> "許可する"
+                                },
+                                emphasized = !locationReady,
+                            )
+                        },
+                        onClick = actions.onLocationAccess,
+                    )
+                    GroupDivider()
                     val photosReady = state.photoAccess && state.photoLocationAccess
                     ActionRow(
                         Icons.Outlined.PhotoLibrary,
@@ -130,6 +164,16 @@ internal fun SettingsScreen(state: SettingsState, actions: SettingsActions) {
                         trailing = { TrailingLabel(if (photosReady) "許可済み" else "許可する", emphasized = !photosReady) },
                         onClick = actions.onPhotos,
                     )
+                    state.sleepAccess?.let { sleepAccess ->
+                        GroupDivider()
+                        ActionRow(
+                            Icons.Outlined.Bedtime,
+                            "睡眠",
+                            subtitle = if (sleepAccess) "ヘルスコネクトの睡眠をタイムラインに表示しています" else "ヘルスコネクトの睡眠をタイムラインに表示します。バックアップはしません",
+                            trailing = { TrailingLabel(if (sleepAccess) "許可済み" else "許可する", emphasized = !sleepAccess) },
+                            onClick = actions.onSleep,
+                        )
+                    }
                 }
             }
             item {
@@ -150,7 +194,7 @@ internal fun SettingsScreen(state: SettingsState, actions: SettingsActions) {
             }
             item {
                 SettingsGroup("データ") {
-                    ActionRow(Icons.Outlined.IosShare, "JSONをエクスポート", subtitle = "期間を指定して位置と写真の情報、記録の診断ログを書き出します", trailing = { Chevron() }, onClick = actions.onExport)
+                    ActionRow(Icons.Outlined.IosShare, "JSONをエクスポート", subtitle = "期間を指定して位置と写真の情報、許可している場合は睡眠、記録の診断ログを書き出します", trailing = { Chevron() }, onClick = actions.onExport)
                     GroupDivider()
                     ActionRow(Icons.Outlined.FileOpen, "JSONをインポート", subtitle = "書き出したファイルから記録を読み込みます", trailing = { Chevron() }, onClick = actions.onImport)
                 }

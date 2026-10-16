@@ -235,9 +235,23 @@ struct ContentView: View {
     }
 }
 
-private func locationAuthorized() -> Bool {
-    let status = CLLocationManager().authorizationStatus
-    return status == .authorizedAlways || status == .authorizedWhenInUse
+/// How far the location permission goes. Recording works from `approximate` up, and each step below `always` loses something.
+enum LocationAccess {
+    case none
+    case approximate
+    case whileInUse
+    case always
+
+    static var current: LocationAccess {
+        let manager = CLLocationManager()
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse:
+            if manager.accuracyAuthorization == .reducedAccuracy { return .approximate }
+            return manager.authorizationStatus == .authorizedAlways ? .always : .whileInUse
+        default:
+            return .none
+        }
+    }
 }
 
 private struct TrackerHomeView: View {
@@ -252,7 +266,11 @@ private struct TrackerHomeView: View {
     @State private var dayRecords: (date: Date, logs: [LogEntry])?
     @State private var selectedLog: LogEntry?
     @State private var showingSettings = false
-    @State private var canLocate = locationAuthorized()
+    @State private var locationAccess = LocationAccess.current
+    @State private var sleepAccess = SleepData.Access.unavailable
+    @State private var sleepRevision = 0
+    /// Read from HealthKit for the selected day; it is read again whenever the app comes back to the foreground.
+    @State private var daySleep: (date: Date, sessions: [SleepSession])?
     @State private var syncStatus = "端末に保存済み"
     @State private var status: String?
     @State private var confirmingDeleteAll = false
@@ -277,6 +295,7 @@ private struct TrackerHomeView: View {
     @StateObject private var stayIndex = StayIndexStore()
 
     private static let introShownKey = "remo.intro.shown"
+    private var canLocate: Bool { locationAccess != .none }
     private var capturing: Bool { automaticCapture.isEnabled && canLocate }
     private var signedIn: Bool { auth.phase == .signedIn }
 
@@ -287,6 +306,8 @@ private struct TrackerHomeView: View {
                 logs: dayRecords?.logs ?? [],
                 logsDate: dayRecords?.date,
                 assets: photoLibrary.assets,
+                // Another day's sleep is not shown while the selected day is being read.
+                sleep: daySleep.flatMap { $0.date == selectedDate ? $0.sessions : nil } ?? [],
                 isCapturing: capturing,
                 canLocate: canLocate,
                 onEditPhoto: { selectedLog = $0 },
@@ -313,8 +334,16 @@ private struct TrackerHomeView: View {
             // The system prompts appear without context of their own: on a first
             // launch the intro explains them and starts recording from there.
             if !showingIntro { automaticCapture.startIfPossible(); photoLibrary.requestAccess() }
+            await refreshSleep()
             await indexPhotos(syncAfter: false)
             await sync(force: true)
+        }
+        .task(id: "\(sleepRevision)@\(selectedDate.timeIntervalSince1970)") {
+            let date = selectedDate
+            guard sleepAccess.requested, let end = Calendar.current.date(byAdding: .day, value: 1, to: date) else { daySleep = nil; return }
+            let sessions = await SleepData.sessions(endingIn: date..<end)
+            guard !Task.isCancelled else { return }
+            daySleep = (date, sessions)
         }
         .task(id: "\(store.revision)@\(selectedDate.timeIntervalSince1970)") {
             let date = selectedDate, database = store.database
@@ -324,7 +353,7 @@ private struct TrackerHomeView: View {
         }
         .onChange(of: photoLibrary.status) { _, _ in Task { await indexPhotos() } }
         .onReceive(photoLibrary.$revision.dropFirst()) { _ in Task { await indexPhotos() } }
-        .onReceive(automaticCapture.$status) { _ in canLocate = locationAuthorized() }
+        .onReceive(automaticCapture.$status) { _ in locationAccess = .current }
         .onReceive(store.$revision) { _ in
             stayIndex.schedule(database: store.database)
             namedPlaces.reload(from: store.database)
@@ -335,10 +364,11 @@ private struct TrackerHomeView: View {
             store.writeFailed = false
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-            canLocate = locationAuthorized()
+            locationAccess = .current
             if !showingIntro { automaticCapture.startIfPossible() }
             photoLibrary.reload()
-            Task { await indexPhotos(syncAfter: false); await sync(force: true) }
+            // While the app is in the background the access can be taken away and last night's sleep can arrive.
+            Task { await refreshSleep(); await indexPhotos(syncAfter: false); await sync(force: true) }
         }
         .onReceive(NotificationCenter.default.publisher(for: .remoAutomaticLogSaved)) { _ in Task { await sync() } }
         .fullScreenCover(item: $selectedLog) { log in
@@ -427,14 +457,16 @@ private struct TrackerHomeView: View {
     private let sessionExpiredStatus = "再ログインが必要です"
 
     private var settingsState: SettingsState {
-        SettingsState(autoCapture: capturing, photoAccess: photoLibrary.hasAccess, syncStatus: syncStatus, lastBackupAt: lastBackupAt, email: auth.phase == .signedIn ? auth.user.flatMap { $0.email.isEmpty ? nil : $0.email } ?? "ログイン中" : nil)
+        SettingsState(autoCapture: capturing, locationAccess: locationAccess, photoAccess: photoLibrary.hasAccess, sleepAccess: sleepAccess, syncStatus: syncStatus, lastBackupAt: lastBackupAt, email: auth.phase == .signedIn ? auth.user.flatMap { $0.email.isEmpty ? nil : $0.email } ?? "ログイン中" : nil)
     }
 
     private var settingsActions: SettingsActions {
         SettingsActions(
             onBack: { withAnimation(.easeOut(duration: 0.25)) { showingSettings = false } },
             onCapture: toggleCapture,
+            onLocationAccess: requestLocationAccess,
             onPhotos: requestPhotoAccess,
+            onSleep: { Task { await requestSleepAccess() } },
             onExport: {
                 exportStartDate = selectedDate
                 exportEndDate = selectedDate
@@ -463,7 +495,7 @@ private struct TrackerHomeView: View {
     }
 
     private func toggleCapture() {
-        canLocate = locationAuthorized()
+        locationAccess = .current
         if capturing {
             automaticCapture.toggle()
             status = "位置情報の記録を停止しました"
@@ -474,7 +506,33 @@ private struct TrackerHomeView: View {
             if !automaticCapture.isEnabled { automaticCapture.toggle() } else { automaticCapture.startIfPossible() }
         } else {
             status = "位置情報の記録には許可が必要です"
-            if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+            openAppSettings()
+        }
+    }
+
+    private func openAppSettings() {
+        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+    }
+
+    private func requestLocationAccess() {
+        locationAccess = .current
+        // The system asks only once; after that the choice is changed in the Settings app.
+        if locationAccess == .none, CLLocationManager().authorizationStatus == .notDetermined { toggleCapture() } else { openAppSettings() }
+    }
+
+    private func refreshSleep() async {
+        sleepAccess = await SleepData.access()
+        sleepRevision += 1
+    }
+
+    private func requestSleepAccess() async {
+        if sleepAccess == .notRequested {
+            await SleepData.requestAccess()
+            await refreshSleep()
+            if sleepAccess == .noData { status = "睡眠を読み取れません。ヘルスケアに睡眠の記録があるか確認してください" }
+        } else if let url = URL(string: "x-apple-health://") {
+            // The access to health data is changed in the Health app, not on this app's page in Settings.
+            if await !UIApplication.shared.open(url) { status = "ヘルスケアアプリでRemoへの共有を確認してください" }
         }
     }
 
@@ -582,7 +640,7 @@ private struct TrackerHomeView: View {
             status = (error as? TimelineImportError)?.localizedDescription ?? "インポートに失敗しました"
         }
     }
-    private func requestPhotoAccess() { if photoLibrary.status == .notDetermined { photoLibrary.requestAccess() } else if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) } }
+    private func requestPhotoAccess() { if photoLibrary.status == .notDetermined { photoLibrary.requestAccess() } else { openAppSettings() } }
     private func indexPhotos(syncAfter: Bool = true) async {
         guard photoLibrary.hasAccess, !photoIndexer.isIndexing else { return }
         let database = store.database
@@ -598,11 +656,14 @@ private struct TrackerHomeView: View {
     private func exportLogs(from startDate: Date, through endDate: Date) {
         let range = dayRange(startDate, endDate)
         let database = store.database
+        let includesSleep = sleepAccess.requested
         status = "JSONを書き出し中…"
         Task {
             do {
+                // nil without the access: the export then has no sleep at all, rather than an empty list.
+                let sleep = includesSleep ? await SleepData.sessions(endingIn: range.from..<range.to) : nil
                 let url = try await Task.detached(priority: .userInitiated) {
-                    try TimelineExportWriter.write(database: database, from: range.from, to: range.to)
+                    try TimelineExportWriter.write(database: database, from: range.from, to: range.to, sleep: sleep)
                 }.value
                 exportFile = ExportFile(url: url)
                 status = nil
@@ -684,7 +745,7 @@ private struct IntroView: View {
 
 /// Writes a Remo JSON document for a range of days into a temporary file.
 enum TimelineExportWriter {
-    static func write(database: LogDatabase, from: Date, to: Date, calendar: Calendar = .current) throws -> URL {
+    static func write(database: LogDatabase, from: Date, to: Date, sleep: [SleepSession]? = nil, calendar: Calendar = .current) throws -> URL {
         let dayFormatter = DateFormatter()
         dayFormatter.calendar = calendar
         dayFormatter.locale = Locale(identifier: "en_US_POSIX")
@@ -722,6 +783,11 @@ enum TimelineExportWriter {
         }
         try put("\n  ],\n  \"summary\": ")
         try handle.write(contentsOf: try encoder.encode(summary))
+        if let sleep {
+            // Read from HealthKit for this export and listed under the day each one ended on; importers ignore it.
+            try put(",\n  \"sleep\": ")
+            try handle.write(contentsOf: try encoder.encode(sleep))
+        }
         try put("\n}\n")
         return url
     }

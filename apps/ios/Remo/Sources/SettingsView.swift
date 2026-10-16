@@ -2,7 +2,9 @@ import SwiftUI
 
 struct SettingsState {
     let autoCapture: Bool
+    let locationAccess: LocationAccess
     let photoAccess: Bool
+    let sleepAccess: SleepData.Access
     let syncStatus: String
     let lastBackupAt: Date?
     let email: String?
@@ -11,7 +13,9 @@ struct SettingsState {
 struct SettingsActions {
     let onBack: () -> Void
     let onCapture: () -> Void
+    let onLocationAccess: () -> Void
     let onPhotos: () -> Void
+    let onSleep: () -> Void
     let onExport: () -> Void
     let onImport: () -> Void
     let onDeleteAll: () -> Void
@@ -49,13 +53,31 @@ struct SettingsView: View {
                                 .allowsHitTesting(false)
                         }
                         GroupDivider()
+                        // Anything short of "always" still records, so it is a warning rather than an error.
+                        let locationReady = state.locationAccess == .always
+                        ActionRow(
+                            systemName: locationReady ? "location" : "exclamationmark.triangle",
+                            title: "位置情報の許可",
+                            tint: locationReady ? RemoStyle.green : RemoStyle.amber,
+                            subtitle: locationAccessSubtitle,
+                            action: actions.onLocationAccess,
+                        ) {
+                            TrailingLabel(text: locationAccessLabel, emphasized: !locationReady)
+                        }
+                        GroupDivider()
                         ActionRow(
                             systemName: "photo.on.rectangle",
                             title: "写真と動画",
                             subtitle: state.photoAccess ? "撮影日時と位置を読み込んでいます" : "撮影日時と位置をタイムラインに表示するには許可が必要です",
                             action: actions.onPhotos,
                         ) {
-                            Text(state.photoAccess ? "許可済み" : "許可する").font(RemoFont.labelLarge).foregroundStyle(state.photoAccess ? RemoStyle.inkTertiary : RemoStyle.green)
+                            TrailingLabel(text: state.photoAccess ? "許可済み" : "許可する", emphasized: !state.photoAccess)
+                        }
+                        if state.sleepAccess != .unavailable {
+                            GroupDivider()
+                            ActionRow(systemName: "moon", title: "睡眠", subtitle: sleepSubtitle, action: actions.onSleep) {
+                                TrailingLabel(text: sleepLabel, emphasized: state.sleepAccess != .granted)
+                            }
                         }
                     }
 
@@ -79,7 +101,7 @@ struct SettingsView: View {
                     }
 
                     SettingsGroup("データ") {
-                        ActionRow(systemName: "square.and.arrow.up", title: "JSONをエクスポート", subtitle: "期間を指定して位置と写真の情報を書き出します", action: actions.onExport) { RowChevron() }
+                        ActionRow(systemName: "square.and.arrow.up", title: "JSONをエクスポート", subtitle: "期間を指定して位置と写真の情報、許可している場合は睡眠を書き出します", action: actions.onExport) { RowChevron() }
                         GroupDivider()
                         ActionRow(systemName: "square.and.arrow.down", title: "JSONをインポート", subtitle: "書き出したファイルから記録を読み込みます", action: actions.onImport) { RowChevron() }
                     }
@@ -105,6 +127,49 @@ struct SettingsView: View {
             }
         }
         .background(RemoStyle.background.ignoresSafeArea())
+    }
+
+    private var locationAccessSubtitle: String {
+        switch state.locationAccess {
+        case .always: "常に許可されています。アプリを閉じている間も記録できます"
+        case .whileInUse: "「常に許可」になっていません。アプリが終了された後や端末の再起動後は、Remoを開くまで記録が止まります"
+        case .approximate: "「正確な位置情報」がオフです。滞在や移動を正しく記録するにはオンにしてください"
+        case .none: "位置情報が許可されていません。記録するには許可が必要です"
+        }
+    }
+
+    private var locationAccessLabel: String {
+        switch state.locationAccess {
+        case .always: "許可済み"
+        case .whileInUse: "常に許可する"
+        case .approximate: "正確にする"
+        case .none: "許可する"
+        }
+    }
+
+    private var sleepSubtitle: String {
+        switch state.sleepAccess {
+        case .granted: "ヘルスケアの睡眠をタイムラインに表示しています"
+        case .noData: "睡眠を読み取れません。ヘルスケアに睡眠の記録がないか、Remoへの共有がオフになっています"
+        case .notRequested, .unavailable: "ヘルスケアの睡眠をタイムラインに表示します。バックアップはしません"
+        }
+    }
+
+    private var sleepLabel: String {
+        switch state.sleepAccess {
+        case .granted: "許可済み"
+        case .noData: "確認する"
+        case .notRequested, .unavailable: "許可する"
+        }
+    }
+}
+
+private struct TrailingLabel: View {
+    let text: String
+    let emphasized: Bool
+
+    var body: some View {
+        Text(text).font(RemoFont.labelLarge).foregroundStyle(emphasized ? RemoStyle.green : RemoStyle.inkTertiary)
     }
 }
 

@@ -4,6 +4,8 @@ import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,6 +29,7 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Bedtime
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
@@ -89,7 +92,8 @@ private sealed interface SheetItem {
     val id: String
     val startedAt: Long
 
-    data class Activity(val activity: TimelineActivity) : SheetItem {
+    /** [sleep] is the sleep spent at this stay. */
+    data class Activity(val activity: TimelineActivity, val sleep: List<SleepSession> = emptyList()) : SheetItem {
         override val id get() = activity.id
         override val startedAt get() = activity.startedAt
     }
@@ -98,13 +102,22 @@ private sealed interface SheetItem {
         override val id get() = "photos:${entries.first().id}"
         override val startedAt get() = entries.first().startedAt
     }
+
+    data class Sleep(val session: SleepSession) : SheetItem {
+        override val id get() = "sleep:${session.startedAt}"
+        override val startedAt get() = session.startedAt
+    }
 }
 
-private fun buildSheetItems(timeline: TimelineRenderSnapshot): List<SheetItem> {
+private fun buildSheetItems(timeline: TimelineRenderSnapshot, sleep: List<SleepSession>): List<SheetItem> {
     val assignedPhotoIds = timeline.activities.flatMap { it.photos }.map { it.id }.toSet()
     val loosePhotos = timeline.displayLogs.filter { it.source == EventSource.PHOTO && it.id !in assignedPhotoIds }
-    val ordered = (timeline.activities.map { SheetItem.Activity(it) } + loosePhotos.map { SheetItem.Photos(listOf(it)) })
-        .sortedWith(compareBy<SheetItem> { it.startedAt }.thenBy { if (it is SheetItem.Activity) 0 else 1 })
+    // Sleep is shown inside the stay it was spent at; a night without a recorded stay gets a row of its own.
+    val stays = timeline.activities.filter { it.kind == TimelineActivityKind.STAY }
+    fun overlapMs(stay: TimelineActivity, session: SleepSession) = minOf(stay.endedAt, session.endedAt) - maxOf(stay.startedAt, session.startedAt)
+    val sleepByStay = sleep.groupBy { session -> stays.maxByOrNull { overlapMs(it, session) }?.takeIf { overlapMs(it, session) > 0L }?.id }
+    val ordered = (timeline.activities.map { SheetItem.Activity(it, sleepByStay[it.id].orEmpty()) } + loosePhotos.map { SheetItem.Photos(listOf(it)) } + sleepByStay[null].orEmpty().map { SheetItem.Sleep(it) })
+        .sortedWith(compareBy<SheetItem> { it.startedAt }.thenBy { if (it is SheetItem.Photos) 1 else 0 })
     val result = mutableListOf<SheetItem>()
     for (item in ordered) {
         val previous = result.lastOrNull()
@@ -117,17 +130,18 @@ private fun buildSheetItems(timeline: TimelineRenderSnapshot): List<SheetItem> {
     return result
 }
 
-private data class DaySummary(val distanceMeters: Double, val stayCount: Int, val photoCount: Int, val videoCount: Int) {
-    val isEmpty: Boolean get() = distanceMeters <= 0.0 && stayCount == 0 && photoCount == 0 && videoCount == 0
+private data class DaySummary(val distanceMeters: Double, val stayCount: Int, val photoCount: Int, val videoCount: Int, val sleepMs: Long) {
+    val isEmpty: Boolean get() = distanceMeters <= 0.0 && stayCount == 0 && photoCount == 0 && videoCount == 0 && sleepMs <= 0L
 }
 
-private fun daySummary(timeline: TimelineRenderSnapshot): DaySummary {
+private fun daySummary(timeline: TimelineRenderSnapshot, sleep: List<SleepSession>): DaySummary {
     val media = timeline.displayLogs.filter { it.source == EventSource.PHOTO }
     return DaySummary(
         distanceMeters = timeline.activities.filter { it.kind == TimelineActivityKind.MOVEMENT }.sumOf { it.distanceMeters?.takeIf(Double::isFinite) ?: 0.0 },
         stayCount = timeline.activities.count { it.kind == TimelineActivityKind.STAY },
         photoCount = media.filter { it.mediaType != MediaType.VIDEO }.sumOf { it.photoCount },
         videoCount = media.filter { it.mediaType == MediaType.VIDEO }.sumOf { it.photoCount },
+        sleepMs = sleep.sumOf(SleepSession::durationMs),
     )
 }
 
@@ -137,6 +151,7 @@ internal fun TimelineSheetContent(
     timeline: TimelineRenderSnapshot,
     loaded: Boolean,
     photos: List<LibraryPhoto>,
+    sleep: List<SleepSession>,
     autoCapture: Boolean,
     selectedActivityId: String?,
     listState: LazyListState,
@@ -151,8 +166,8 @@ internal fun TimelineSheetContent(
     var showPicker by remember { mutableStateOf(false) }
     var placeLabels by remember(selectedDate) { mutableStateOf<Map<String, StayPlaceLabel>>(emptyMap()) }
     var placesExpanded by rememberSaveable { mutableStateOf(false) }
-    val items = remember(timeline) { buildSheetItems(timeline) }
-    val summary = remember(timeline) { daySummary(timeline) }
+    val items = remember(timeline, sleep) { buildSheetItems(timeline, sleep) }
+    val summary = remember(timeline, sleep) { daySummary(timeline, sleep) }
     fun onLabel(id: String, label: StayPlaceLabel) { placeLabels = placeLabels + (id to label) }
 
     LazyColumn(modifier.fillMaxWidth(), state = listState, contentPadding = PaddingValues(bottom = bottomPadding)) {
@@ -179,8 +194,9 @@ internal fun TimelineSheetContent(
                 }
                 itemsIndexed(items, key = { _, item -> item.id }) { index, item ->
                     when (item) {
-                        is SheetItem.Activity -> ActivityRow(
+                        is SheetItem.Activity -> if (item.activity.kind == TimelineActivityKind.STAY) StayRow(
                             activity = item.activity,
+                            sleep = item.sleep,
                             label = placeLabels[item.id],
                             isFirst = index == 0,
                             isLast = index == items.lastIndex,
@@ -190,8 +206,19 @@ internal fun TimelineSheetContent(
                             onClick = { onFocus(item.activity) },
                             onSelectPhotos = onSelectPhotos,
                             onOpenHistory = { item.activity.coordinate?.let { onOpenHistory(PlaceHistoryTarget(it, placeLabels[item.id])) } },
+                        ) else MovementRow(
+                            activity = item.activity,
+                            // The stay before it already shows when the movement began.
+                            showTime = (items.getOrNull(index - 1) as? SheetItem.Activity)?.activity?.endedAt != item.activity.startedAt,
+                            isFirst = index == 0,
+                            isLast = index == items.lastIndex,
+                            selected = selectedActivityId == item.id,
+                            photos = photos,
+                            onClick = { onFocus(item.activity) },
+                            onSelectPhotos = onSelectPhotos,
                         )
                         is SheetItem.Photos -> PhotoGroupRow(item.entries, index == 0, index == items.lastIndex, photos) { onSelectPhotos(item.entries) }
+                        is SheetItem.Sleep -> SleepRow(item.session, index == 0, index == items.lastIndex)
                     }
                 }
             }
@@ -245,7 +272,8 @@ private fun DayHeader(selectedDate: String, onDateChange: (String) -> Unit, onOp
 @Composable
 private fun DaySummaryRow(summary: DaySummary, loaded: Boolean) {
     Row(
-        Modifier.fillMaxWidth().height(46.dp).padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 12.dp),
+        // Distance, stays, photos and sleep together are wider than most phones.
+        Modifier.fillMaxWidth().height(46.dp).horizontalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 12.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -258,6 +286,7 @@ private fun DaySummaryRow(summary: DaySummary, loaded: Boolean) {
                 if (summary.photoCount + summary.videoCount > 0) {
                     SummaryChip(Icons.Outlined.PhotoCamera, AppColors.amber, "${summary.photoCount + summary.videoCount}")
                 }
+                if (summary.sleepMs > 0L) SummaryChip(Icons.Outlined.Bedtime, AppColors.indigo, "睡眠 ${activityDurationLabel(summary.sleepMs)}")
             }
         }
     }
@@ -280,6 +309,14 @@ internal fun SummaryChip(icon: ImageVector, tint: Color, text: String) {
 private val TimeColumnWidth = 44.dp
 private val RailX = TimeColumnWidth + 8.dp + 16.dp
 private val RowCenterY = 24.dp
+private val MovementRowCenterY = 18.dp
+
+private fun Modifier.timelineRail(isFirst: Boolean, isLast: Boolean, centerY: Dp): Modifier = drawBehind {
+    val x = RailX.toPx()
+    val top = if (isFirst) centerY.toPx() else 0f
+    val bottom = if (isLast) centerY.toPx() else size.height
+    if (bottom > top) drawLine(AppColors.outline, Offset(x, top), Offset(x, bottom), strokeWidth = 2.dp.toPx())
+}
 
 @Composable
 private fun TimelineRowFrame(
@@ -294,12 +331,7 @@ private fun TimelineRowFrame(
         Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp)
-            .drawBehind {
-                val x = RailX.toPx()
-                val top = if (isFirst) RowCenterY.toPx() else 0f
-                val bottom = if (isLast) RowCenterY.toPx() else size.height
-                if (bottom > top) drawLine(AppColors.outline, Offset(x, top), Offset(x, bottom), strokeWidth = 2.dp.toPx())
-            },
+            .timelineRail(isFirst, isLast, RowCenterY),
     ) {
         Column(Modifier.width(TimeColumnWidth).padding(top = 16.dp), horizontalAlignment = Alignment.End) {
             Text(formatTime(startedAt), style = MaterialTheme.typography.labelMedium.tabular, color = AppColors.ink, maxLines = 1)
@@ -338,8 +370,9 @@ internal fun RowSubtitle(text: String) {
 }
 
 @Composable
-private fun ActivityRow(
+private fun StayRow(
     activity: TimelineActivity,
+    sleep: List<SleepSession>,
     label: StayPlaceLabel?,
     isFirst: Boolean,
     isLast: Boolean,
@@ -350,39 +383,102 @@ private fun ActivityRow(
     onSelectPhotos: (List<LogEntry>) -> Unit,
     onOpenHistory: () -> Unit,
 ) {
-    val isStay = activity.kind == TimelineActivityKind.STAY
     @Suppress("NAME_SHADOWING")
-    val label = activity.coordinate?.takeIf { isStay }?.let(label::named) ?: label
+    val label = activity.coordinate?.let(label::named) ?: label
     TimelineRowFrame(
         startedAt = activity.startedAt,
         endedAt = activity.endedAt,
         isFirst = isFirst,
         isLast = isLast,
-        badge = {
-            if (isStay) IconBadge(Icons.Outlined.Place, AppColors.green, AppColors.greenContainer)
-            else IconBadge(Icons.Outlined.Route, AppColors.teal, AppColors.tealContainer)
-        },
+        badge = { IconBadge(Icons.Outlined.Place, AppColors.green, AppColors.greenContainer) },
     ) {
-        RowCard(selected, if (isStay) AppColors.greenContainer else AppColors.tealContainer, onClick) {
-            if (isStay) {
-                RowTitle(label?.primary ?: "滞在", activityDurationLabel(activity.durationMs))
-                label?.address?.takeIf { it != label.primary }?.let { RowSubtitle(it) }
-            } else {
-                RowTitle(if (activity.isMostlyUntracked) "記録なし" else "移動", activityDurationLabel(activity.durationMs))
-                RowSubtitle(when {
-                    activity.isMostlyUntracked -> "直線距離 ${formatDistance(activity.distanceMeters)}"
-                    activity.untrackedMs > 0L -> "${formatDistance(activity.distanceMeters)}・うち記録なし ${activityDurationLabel(activity.untrackedMs)}"
-                    else -> formatDistance(activity.distanceMeters)
-                })
-            }
+        RowCard(selected, AppColors.greenContainer, onClick) {
+            RowTitle(label?.primary ?: "滞在", activityDurationLabel(activity.durationMs))
+            label?.address?.takeIf { it != label.primary }?.let { RowSubtitle(it) }
+            sleep.forEach { SleepLine(it) }
             if (activity.photos.isNotEmpty()) PhotoStrip(activity.photos, photos) { onSelectPhotos(activity.photos) }
-            if (isStay && selected) {
+            if (selected) {
                 TextButton(onClick = onOpenHistory, contentPadding = PaddingValues(horizontal = 12.dp), modifier = Modifier.padding(top = 6.dp).offset(x = (-12).dp)) {
                     Icon(Icons.Outlined.History, null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("この場所の訪問履歴")
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun SleepLine(session: SleepSession) {
+    Row(
+        Modifier.padding(top = 8.dp).background(AppColors.indigoContainer, MaterialTheme.shapes.small).padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Outlined.Bedtime, null, tint = AppColors.indigo, modifier = Modifier.size(16.dp))
+        Text(
+            "睡眠 ${activityDurationLabel(session.durationMs)}",
+            style = MaterialTheme.typography.labelLarge.tabular,
+            color = AppColors.ink,
+            maxLines = 1,
+            modifier = Modifier.padding(start = 6.dp),
+        )
+        Text(
+            "${formatTime(session.startedAt)}–${formatTime(session.endedAt)}",
+            style = MaterialTheme.typography.bodySmall.tabular,
+            color = AppColors.inkSecondary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(start = 8.dp),
+        )
+    }
+}
+
+/** A movement is a slim connector between two stays, so the places of the day stand out. */
+@Composable
+private fun MovementRow(
+    activity: TimelineActivity,
+    showTime: Boolean,
+    isFirst: Boolean,
+    isLast: Boolean,
+    selected: Boolean,
+    photos: List<LibraryPhoto>,
+    onClick: () -> Unit,
+    onSelectPhotos: (List<LogEntry>) -> Unit,
+) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp).timelineRail(isFirst, isLast, MovementRowCenterY)) {
+        Box(Modifier.width(TimeColumnWidth).padding(top = 10.dp), contentAlignment = Alignment.TopEnd) {
+            if (showTime) Text(formatTime(activity.startedAt), style = MaterialTheme.typography.labelSmall.tabular, color = AppColors.inkTertiary, maxLines = 1)
+        }
+        Spacer(Modifier.width(8.dp))
+        Box(Modifier.width(32.dp).padding(top = 8.dp), contentAlignment = Alignment.Center) {
+            IconBadge(Icons.Outlined.Route, AppColors.teal, AppColors.tealContainer, size = 20.dp, iconSize = 12.dp)
+        }
+        Spacer(Modifier.width(8.dp))
+        Column(
+            Modifier
+                .weight(1f)
+                .padding(vertical = 2.dp)
+                .clip(MaterialTheme.shapes.medium)
+                .background(if (selected) AppColors.tealContainer else Color.Transparent)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(if (activity.isMostlyUntracked) "記録なし" else "移動", style = MaterialTheme.typography.labelLarge, color = AppColors.inkSecondary)
+                Text(
+                    listOfNotNull(
+                        activityDurationLabel(activity.durationMs),
+                        if (activity.isMostlyUntracked) "直線距離 ${formatDistance(activity.distanceMeters)}" else formatDistance(activity.distanceMeters),
+                        "うち記録なし ${activityDurationLabel(activity.untrackedMs)}".takeIf { activity.untrackedMs > 0L && !activity.isMostlyUntracked },
+                    ).joinToString("・"),
+                    style = MaterialTheme.typography.bodySmall.tabular,
+                    color = AppColors.inkSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(start = 8.dp),
+                )
+            }
+            if (activity.photos.isNotEmpty()) PhotoStrip(activity.photos, photos) { onSelectPhotos(activity.photos) }
         }
     }
 }
@@ -400,6 +496,21 @@ private fun PhotoGroupRow(entries: List<LogEntry>, isFirst: Boolean, isLast: Boo
             RowTitle(mediaSummary(entries), null)
             if (entries.none { hasUsableCoordinates(it.latitude, it.longitude) }) RowSubtitle("位置情報なし")
             PhotoStrip(entries, photos, onClick)
+        }
+    }
+}
+
+@Composable
+private fun SleepRow(session: SleepSession, isFirst: Boolean, isLast: Boolean) {
+    TimelineRowFrame(
+        startedAt = session.startedAt,
+        endedAt = session.endedAt,
+        isFirst = isFirst,
+        isLast = isLast,
+        badge = { IconBadge(Icons.Outlined.Bedtime, AppColors.indigo, AppColors.indigoContainer) },
+    ) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)) {
+            RowTitle("睡眠", activityDurationLabel(session.durationMs))
         }
     }
 }

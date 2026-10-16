@@ -33,6 +33,8 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSHealthShareUsageDescription</key>
+	<string>ヘルスケアの睡眠を読み取り、起床した日のタイムラインに表示します。睡眠のデータは保存もバックアップもしません。</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>アプリを閉じている間も現在地を記録し、1日の移動と滞在を地図のタイムラインにまとめるために使用します。</string>
 	<key>NSLocationWhenInUseUsageDescription</key>

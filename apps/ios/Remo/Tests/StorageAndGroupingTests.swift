@@ -215,6 +215,53 @@ final class StorageAndGroupingTests: XCTestCase {
         XCTAssertEqual((document["summary"] as? [String: Int])?["photoCount"], 1)
         // The file reads back through the importer.
         XCTAssertEqual(try TimelineImport.decode(data: Data(contentsOf: url)).map(\.id).sorted(), ["a", "p"])
+        XCTAssertNil(document["sleep"])
+    }
+
+    func testExportListsSleepOnlyWhenItWasRead() throws {
+        let database = LogDatabase(url: nil, defaults: defaults())
+        database.upsert([entry("a")])
+        let start = Calendar.current.startOfDay(for: entry("a").startedAt)
+        let night = SleepSession(startedAt: start.addingTimeInterval(-3_600), endedAt: start.addingTimeInterval(6 * 3_600))
+        let url = try TimelineExportWriter.write(database: database, from: start, to: Calendar.current.date(byAdding: .day, value: 1, to: start)!, sleep: [night])
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let document = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let sleep = try XCTUnwrap(document["sleep"] as? [[String: String]])
+        XCTAssertEqual(sleep.map { $0["startedAt"].flatMap(ISO8601DateFormatter().date) }, [night.startedAt])
+        XCTAssertEqual(sleep.map { $0["endedAt"].flatMap(ISO8601DateFormatter().date) }, [night.endedAt])
+        // Importers ignore it.
+        XCTAssertEqual(try TimelineImport.decode(data: Data(contentsOf: url)).map(\.id), ["a"])
+    }
+
+    // MARK: Sleep
+
+    private func sleep(_ fromHour: Double, _ toHour: Double) -> SleepSession {
+        SleepSession(startedAt: Date(timeIntervalSince1970: fromHour * 3_600), endedAt: Date(timeIntervalSince1970: toHour * 3_600))
+    }
+    private var sleepDay: Range<Date> { Date(timeIntervalSince1970: 24 * 3_600)..<Date(timeIntervalSince1970: 48 * 3_600) }
+
+    func testNightCountsForTheDayItEndsOn() {
+        XCTAssertEqual(sleepSessionsEnding(in: sleepDay, asleep: [sleep(47, 54), sleep(23, 30)]), [sleep(23, 30)])
+    }
+
+    func testSleepStagesOfOneNightBecomeOneSession() {
+        // Core, deep and REM stretches with the times awake left out, and a nap in the afternoon.
+        let stages = [sleep(23, 25), sleep(25.2, 27), sleep(27, 28.5), sleep(28.75, 30), sleep(37, 38)]
+        XCTAssertEqual(sleepSessionsEnding(in: sleepDay, asleep: stages), [sleep(23, 30), sleep(37, 38)])
+    }
+
+    func testOverlappingSleepFromSeveralAppsBecomesOne() {
+        XCTAssertEqual(sleepSessionsEnding(in: sleepDay, asleep: [sleep(23, 29), sleep(24, 30)]), [sleep(23, 30)])
+    }
+
+    func testTimeInBedStandsInOnlyForAnUnmeasuredNight() {
+        XCTAssertEqual(sleepSessionsEnding(in: sleepDay, asleep: [sleep(23.5, 29.5)], inBed: [sleep(23, 30)]), [sleep(23.5, 29.5)])
+        XCTAssertEqual(sleepSessionsEnding(in: sleepDay, asleep: [], inBed: [sleep(23, 30)]), [sleep(23, 30)])
+    }
+
+    func testEmptySleepIsIgnored() {
+        XCTAssertEqual(sleepSessionsEnding(in: sleepDay, asleep: [sleep(30, 30)], inBed: [sleep(31, 31)]), [])
     }
 
     // MARK: Photo grouping

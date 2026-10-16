@@ -35,6 +35,8 @@ struct TimelineHomeView: View {
     /// The day `logs` belong to; it trails `date` while a day is being read.
     let logsDate: Date?
     let assets: [PHAsset]
+    /// Sleep that ended on `date`, read from HealthKit.
+    let sleep: [SleepSession]
     let isCapturing: Bool
     let canLocate: Bool
     let onEditPhoto: (LogEntry) -> Void
@@ -219,7 +221,7 @@ struct TimelineHomeView: View {
                     AllPlacesSummaryRow(places: places, stays: periodStays, progress: stayIndex.progress)
                 } else {
                     DayHeader(date: $date)
-                    DaySummaryRow(summary: DaySummary(snapshot: snapshot), loaded: loaded)
+                    DaySummaryRow(summary: DaySummary(snapshot: snapshot, sleep: sleep), loaded: loaded)
                 }
             }
             .background(RemoStyle.surface)
@@ -244,6 +246,7 @@ struct TimelineHomeView: View {
                 snapshot: snapshot,
                 loaded: loaded,
                 assets: assets,
+                sleep: sleep,
                 isCapturing: isCapturing,
                 labels: placeResolver.labels,
                 selectedActivityID: focus?.activityID,
@@ -337,14 +340,16 @@ private struct DaySummary {
     let distance: Double
     let stayCount: Int
     let mediaCount: Int
+    let sleep: TimeInterval
 
-    init(snapshot: TimelineRenderSnapshot) {
+    init(snapshot: TimelineRenderSnapshot, sleep: [SleepSession]) {
         distance = snapshot.activities.filter { $0.kind == .movement }.reduce(0) { $0 + (($1.distance?.isFinite ?? false) ? $1.distance! : 0) }
         stayCount = snapshot.activities.filter { $0.kind == .stay }.count
         mediaCount = snapshot.displayLogs.filter { $0.source == .photo }.reduce(0) { $0 + $1.photoCount }
+        self.sleep = sleep.reduce(0) { $0 + $1.duration }
     }
 
-    var isEmpty: Bool { distance <= 0 && stayCount == 0 && mediaCount == 0 }
+    var isEmpty: Bool { distance <= 0 && stayCount == 0 && mediaCount == 0 && sleep <= 0 }
 }
 
 private struct DaySummaryRow: View {
@@ -358,9 +363,11 @@ private struct DaySummaryRow: View {
             } else if summary.isEmpty {
                 Text("記録はありません").font(RemoFont.bodyMedium).foregroundStyle(RemoStyle.inkTertiary)
             } else {
-                if summary.distance >= 1 { SummaryChip(systemName: "point.topleft.down.to.point.bottomright.curvepath", tint: RemoStyle.teal, text: formatDistance(summary.distance)) }
-                if summary.stayCount > 0 { SummaryChip(systemName: RemoGlyphName.place, tint: RemoStyle.green, text: "滞在 \(summary.stayCount)") }
-                if summary.mediaCount > 0 { SummaryChip(systemName: "camera", tint: RemoStyle.amber, text: "\(summary.mediaCount)") }
+                // All four chips are wider than a phone: the words and some of the spacing go before anything is cut off.
+                ViewThatFits(in: .horizontal) {
+                    chips(compact: false)
+                    chips(compact: true)
+                }
             }
             Spacer(minLength: 0)
         }
@@ -369,19 +376,29 @@ private struct DaySummaryRow: View {
         .padding(.top, 2)
         .padding(.bottom, 12)
     }
+
+    private func chips(compact: Bool) -> some View {
+        HStack(spacing: compact ? 6 : 8) {
+            if summary.distance >= 1 { SummaryChip(systemName: "point.topleft.down.to.point.bottomright.curvepath", tint: RemoStyle.teal, text: formatDistance(summary.distance), compact: compact) }
+            if summary.stayCount > 0 { SummaryChip(systemName: RemoGlyphName.place, tint: RemoStyle.green, text: compact ? "\(summary.stayCount)" : "滞在 \(summary.stayCount)", compact: compact) }
+            if summary.mediaCount > 0 { SummaryChip(systemName: "camera", tint: RemoStyle.amber, text: "\(summary.mediaCount)", compact: compact) }
+            if summary.sleep > 0 { SummaryChip(systemName: "moon", tint: RemoStyle.indigo, text: compact ? activityDurationLabel(summary.sleep) : "睡眠 \(activityDurationLabel(summary.sleep))", compact: compact) }
+        }
+    }
 }
 
 private struct SummaryChip: View {
     let systemName: String
     let tint: Color
     let text: String
+    var compact = false
 
     var body: some View {
         HStack(spacing: 6) {
             RemoGlyph(name: systemName, size: 16).foregroundStyle(tint)
-            Text(text).font(RemoFont.labelLarge.monospacedDigit()).foregroundStyle(RemoStyle.ink)
+            Text(text).font(RemoFont.labelLarge.monospacedDigit()).foregroundStyle(RemoStyle.ink).lineLimit(1).minimumScaleFactor(0.8)
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, compact ? 7 : 10)
         .frame(height: 32)
         .background(RemoStyle.surfaceMuted, in: RoundedRectangle(cornerRadius: RemoRadius.small, style: .continuous))
     }
@@ -390,30 +407,50 @@ private struct SummaryChip: View {
 // MARK: - List
 
 private enum SheetItem: Identifiable {
-    case activity(TimelineActivity)
+    /// `sleep` is the sleep spent at this stay.
+    case activity(TimelineActivity, sleep: [SleepSession])
     case photos([LogEntry])
+    case sleep(SleepSession)
 
     var id: String {
         switch self {
-        case let .activity(activity): activity.id
+        case let .activity(activity, _): activity.id
         case let .photos(entries): "photos:\(entries.first?.id ?? "")"
+        case let .sleep(session): "sleep:\(session.startedAt.timeIntervalSince1970)"
         }
     }
 
     var startedAt: Date {
         switch self {
-        case let .activity(activity): activity.startedAt
+        case let .activity(activity, _): activity.startedAt
         case let .photos(entries): entries.first?.startedAt ?? .distantPast
+        case let .sleep(session): session.startedAt
         }
     }
 }
 
-private func buildSheetItems(_ snapshot: TimelineRenderSnapshot) -> [SheetItem] {
+private func buildSheetItems(_ snapshot: TimelineRenderSnapshot, sleep: [SleepSession]) -> [SheetItem] {
     let assigned = Set(snapshot.activities.flatMap { $0.photos.map(\.id) })
     let loose = snapshot.displayLogs.filter { $0.source == .photo && !assigned.contains($0.id) }
-    let ordered = (snapshot.activities.map(SheetItem.activity) + loose.map { SheetItem.photos([$0]) }).sorted { first, second in
+    // Sleep is shown inside the stay it was spent at; a night without a recorded stay gets a row of its own.
+    let stays = snapshot.activities.filter { $0.kind == .stay }
+    func overlap(_ stay: TimelineActivity, _ session: SleepSession) -> TimeInterval {
+        min(stay.endedAt, session.endedAt).timeIntervalSince(max(stay.startedAt, session.startedAt))
+    }
+    var sleepByStay: [String: [SleepSession]] = [:]
+    var looseSleep: [SleepSession] = []
+    for session in sleep {
+        if let stay = stays.max(by: { overlap($0, session) < overlap($1, session) }), overlap(stay, session) > 0 {
+            sleepByStay[stay.id, default: []].append(session)
+        } else {
+            looseSleep.append(session)
+        }
+    }
+    let items = snapshot.activities.map { SheetItem.activity($0, sleep: sleepByStay[$0.id] ?? []) } + loose.map { SheetItem.photos([$0]) } + looseSleep.map(SheetItem.sleep)
+    let ordered = items.sorted { first, second in
         if first.startedAt != second.startedAt { return first.startedAt < second.startedAt }
-        if case .activity = first { return true }
+        if case .photos = first { return false }
+        if case .photos = second { return true }
         return false
     }
     var result: [SheetItem] = []
@@ -433,6 +470,7 @@ private struct TimelineSheetList: View {
     let snapshot: TimelineRenderSnapshot
     let loaded: Bool
     let assets: [PHAsset]
+    let sleep: [SleepSession]
     let isCapturing: Bool
     let labels: [String: StayPlaceLabel]
     let selectedActivityID: String?
@@ -444,7 +482,7 @@ private struct TimelineSheetList: View {
     let onOpenHistory: (PlaceHistoryTarget) -> Void
 
     var body: some View {
-        let items = buildSheetItems(snapshot)
+        let items = buildSheetItems(snapshot, sleep: sleep)
         ScrollViewReader { reader in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
@@ -465,12 +503,14 @@ private struct TimelineSheetList: View {
                         ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                             let isFirst = index == 0, isLast = index == items.count - 1
                             switch item {
-                            case let .activity(activity):
-                                ActivityRow(activity: activity, label: labels[activity.id], isFirst: isFirst, isLast: isLast, selected: selectedActivityID == activity.id, assets: assets, onClick: { onFocus(activity) }, onSelectPhotos: onSelectPhotos) {
+                            case let .activity(activity, sleep):
+                                ActivityRow(activity: activity, sleep: sleep, label: labels[activity.id], isFirst: isFirst, isLast: isLast, selected: selectedActivityID == activity.id, assets: assets, onClick: { onFocus(activity) }, onSelectPhotos: onSelectPhotos) {
                                     if let coordinate = activity.coordinate { onOpenHistory(PlaceHistoryTarget(coordinate: coordinate, label: labels[activity.id])) }
                                 }
                             case let .photos(entries):
                                 PhotoGroupRow(entries: entries, isFirst: isFirst, isLast: isLast, assets: assets) { onSelectPhotos(entries) }
+                            case let .sleep(session):
+                                SleepRow(session: session, isFirst: isFirst, isLast: isLast)
                             }
                         }
                     }
@@ -578,6 +618,7 @@ private struct RowSubtitle: View {
 
 private struct ActivityRow: View {
     let activity: TimelineActivity
+    let sleep: [SleepSession]
     let label: StayPlaceLabel?
     let isFirst: Bool
     let isLast: Bool
@@ -606,6 +647,7 @@ private struct ActivityRow: View {
                             ? "\(formatDistance(activity.distance))・うち記録なし \(activityDurationLabel(activity.untracked))"
                             : formatDistance(activity.distance))
                 }
+                ForEach(sleep, id: \.startedAt) { SleepLine(session: $0) }
                 if !activity.photos.isEmpty {
                     PhotoStrip(entries: activity.photos, assets: assets) { onSelectPhotos(activity.photos) }
                 }
@@ -618,6 +660,38 @@ private struct ActivityRow: View {
                     .padding(.leading, -12)
                 }
             }
+        }
+    }
+}
+
+private struct SleepLine: View {
+    let session: SleepSession
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Image(systemName: "moon").font(.system(size: 13, weight: .medium)).foregroundStyle(RemoStyle.indigo).frame(width: 16, height: 16)
+            Text("睡眠 \(activityDurationLabel(session.duration))").font(RemoFont.labelLarge.monospacedDigit()).foregroundStyle(RemoStyle.ink).lineLimit(1).padding(.leading, 6)
+            Text("\(formatTime(session.startedAt))–\(formatTime(session.endedAt))").font(RemoFont.bodySmall.monospacedDigit()).foregroundStyle(RemoStyle.inkSecondary).lineLimit(1).padding(.leading, 8)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(RemoStyle.indigoContainer, in: RoundedRectangle(cornerRadius: RemoRadius.small, style: .continuous))
+        .padding(.top, 8)
+    }
+}
+
+private struct SleepRow: View {
+    let session: SleepSession
+    let isFirst: Bool
+    let isLast: Bool
+
+    var body: some View {
+        TimelineRowFrame(startedAt: session.startedAt, endedAt: session.endedAt, isFirst: isFirst, isLast: isLast) {
+            IconBadge(systemName: "moon", tint: RemoStyle.indigo, container: RemoStyle.indigoContainer)
+        } content: {
+            RowTitle(title: "睡眠", trailing: activityDurationLabel(session.duration))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
         }
     }
 }

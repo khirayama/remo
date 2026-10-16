@@ -28,6 +28,8 @@ enum RemoStyle {
     static let tealContainer = Color(light: 0xD9F0EB, dark: 0x173F39)
     static let amber = Color(light: 0x9E6A2C, dark: 0xE3B578)
     static let amberContainer = Color(light: 0xF5EADB, dark: 0x47361E)
+    static let indigo = Color(light: 0x4A5A9E, dark: 0xAAB6F0)
+    static let indigoContainer = Color(light: 0xE3E7F6, dark: 0x2A3157)
 
     static let danger = Color(light: 0xB3261E, dark: 0xF2B8B5)
     static let dangerContainer = Color(light: 0xFBEAE8, dark: 0x5C2420)

@@ -29,6 +29,7 @@
 		9D46FC1D0CA2A0EB40A8D28A /* PhotoBackup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7447BA26DB0BEC174EC4AC81 /* PhotoBackup.swift */; };
 		9E0CC5065096FFA7A175C287 /* PhotoTimelineIndexer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D7B8B9D833798869D6BF0A3 /* PhotoTimelineIndexer.swift */; };
 		9F2E3CB23C1256B795084B8C /* RemoTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72A238215CBC3FB04D5F1F36 /* RemoTests.swift */; };
+		AC666C91E8403D6F63D2C9D2 /* SleepData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D36E3087FFBC45B47D8E2DA /* SleepData.swift */; };
 		B314840B065A63189BB3EC47 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 8ABE5B696289DD3B2CD14F89 /* PrivacyInfo.xcprivacy */; };
 		C796F582A739541FDA393A6D /* AutomaticCaptureService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0EB274E591F77C2A4E92BF /* AutomaticCaptureService.swift */; };
 		CF8EC528F50C972943886C27 /* PhotoScreens.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE6431D841094514737DF213 /* PhotoScreens.swift */; };
@@ -68,6 +69,7 @@
 		7B0DE0E24B5301DB38844247 /* RemoStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoStyle.swift; sourceTree = "<group>"; };
 		7D7B8B9D833798869D6BF0A3 /* PhotoTimelineIndexer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoTimelineIndexer.swift; sourceTree = "<group>"; };
 		8ABE5B696289DD3B2CD14F89 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		8D36E3087FFBC45B47D8E2DA /* SleepData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SleepData.swift; sourceTree = "<group>"; };
 		93DCB19259E9E1069684A50F /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		9A58D0F7539A0BED4A1E66A5 /* StayIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StayIndex.swift; sourceTree = "<group>"; };
 		9CD455CA6C492A9E72D52493 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -125,6 +127,7 @@
 				0AC71AD93AC3A4C045F085F5 /* RemoApp.swift */,
 				7B0DE0E24B5301DB38844247 /* RemoStyle.swift */,
 				6395515EF79B2B2EC69BBDCE /* SettingsView.swift */,
+				8D36E3087FFBC45B47D8E2DA /* SleepData.swift */,
 				C58146595CC78D13667B0FAE /* SQLite.swift */,
 				9A58D0F7539A0BED4A1E66A5 /* StayIndex.swift */,
 				6299E7FF8C85C147567EF58F /* TimelineAggregation.swift */,
@@ -288,6 +291,7 @@
 				6978175DC653E639F293AD7C /* RemoStyle.swift in Sources */,
 				49F950DEA3F4A71A14065DE2 /* SQLite.swift in Sources */,
 				21B24F43E8020112292CB6FD /* SettingsView.swift in Sources */,
+				AC666C91E8403D6F63D2C9D2 /* SleepData.swift in Sources */,
 				9C9F1F59DD2EAE725C7B632E /* StayIndex.swift in Sources */,
 				4830974FC4E07DC81E501094 /* TimelineAggregation.swift in Sources */,
 				8B98DAD28404458885978315 /* TimelineHomeView.swift in Sources */,
@@ -368,6 +372,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Remo/Remo.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				INFOPLIST_FILE = Remo/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -485,6 +490,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Remo/Remo.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				INFOPLIST_FILE = Remo/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (

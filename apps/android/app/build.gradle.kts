@@ -98,6 +98,7 @@ dependencies {
     implementation(libs.play.services.maps)
     implementation(libs.play.services.location)
     implementation(libs.androidx.work.runtime)
+    implementation(libs.androidx.health.connect)
     testImplementation(libs.junit)
     // android.jar only has org.json stubs; the golden test parses the shared fixture.
     testImplementation("org.json:json:20250517")
