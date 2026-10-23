@@ -67,5 +67,8 @@ export default defineConfig(({ mode }) => {
   if (mode === "production" && !env.VITE_MAP_TILE_URL) {
     console.warn("\n[remo] VITE_MAP_TILE_URL is not set: the map uses OpenStreetMap's own tile servers, which are for light use only. Set a tile provider (and VITE_MAP_TILE_ATTRIBUTION) for production.\n");
   }
-  return { plugins: [react(), cloudflare(), securityHeaders(tileUrl, apiBaseUrl)] };
+  return {
+    server: { host: "localhost", port: 5173, strictPort: true },
+    plugins: [react(), cloudflare(), securityHeaders(tileUrl, apiBaseUrl)],
+  };
 });

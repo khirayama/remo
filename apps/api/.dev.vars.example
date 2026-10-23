@@ -1,5 +1,5 @@
 APP_ENV=development
-BETTER_AUTH_SECRET=local-dev-remo-secret-change-me
+BETTER_AUTH_SECRET=local-development-only-remo-secret
 APP_PUBLIC_URL=http://localhost:8787
 RESEND_API_KEY=
 MAIL_FROM=

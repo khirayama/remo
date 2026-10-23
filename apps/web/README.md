@@ -5,10 +5,13 @@ React + Vite + Leafletで、位置情報（移動中10秒／静止時5分）と�
 ## Setup
 
 ```bash
-npm install
+nvm use # リポジトリルートの .nvmrc（Node.js 24.22.1）を使用
+npm ci
 cp .env.example .env
 npm run dev
 ```
+
+リポジトリルートの `just setup` でもセットアップできます。`npm run check` で型検査とテストを実行します。開発サーバーは `localhost:5173` を使用し、ポート使用中はエラーで停止します。
 
 `VITE_API_BASE_URL`をRemo APIのURLへ合わせてください（ローカルは `http://localhost:8787`）。本番ビルドは空にし、Web自身のWorker（`worker/index.ts`）が `/api/*` をService Bindingで `remo-api` へ中継します。同一オリジンになるため、SafariやFirefoxでもセッションCookieがブロックされません。
 

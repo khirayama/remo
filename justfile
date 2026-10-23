@@ -4,9 +4,14 @@ set shell := ["zsh", "-cu"]
 default:
     @just --list
 
-setup:
-    cd apps/api && npm install
-    cd apps/web && npm install
+setup: setup-env
+    cd apps/api && npm ci
+    cd apps/web && npm ci
+
+# Keep each developer's existing settings and secrets.
+setup-env:
+    test -e apps/api/.dev.vars || cp apps/api/.dev.vars.example apps/api/.dev.vars
+    test -e apps/web/.env || cp apps/web/.env.example apps/web/.env
 
 android:
     cd apps/android && just build && just run
@@ -80,11 +85,17 @@ timeline-report file *window:
 ios-check:
     cd apps/ios && just test
 
+check: api-check web-check
+
+audit:
+    cd apps/api && npm audit
+    cd apps/web && npm audit
+
 api-check:
-    cd apps/api && npm run typecheck && npm test
+    cd apps/api && npm run check && npm run build
 
 web-check:
-    cd apps/web && npm run typecheck && npm test && npm run build && VITE_API_BASE_URL= npm run build:production
+    cd apps/web && npm run check && npm run build && VITE_API_BASE_URL= npm run build:production
 
 android-check:
     cd apps/android && just lint && just test && just build

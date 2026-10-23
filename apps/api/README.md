@@ -7,11 +7,14 @@ APIは時刻・緯度経度・写真枚数・取得元と、写真位置の補�
 ## Setup
 
 ```bash
-npm install
+nvm use # リポジトリルートの .nvmrc（Node.js 24.22.1）を使用
+npm ci
 cp .dev.vars.example .dev.vars
 npm run db:migrate:local
 npm run dev
 ```
+
+リポジトリルートの `just setup` でもセットアップできます。`npm run check` は型検査とテスト、`npm run build` は本番 Worker のビルドのみを実行します（デプロイ・リモート DB の変更は行いません）。
 
 ## Endpoints
 

@@ -33,11 +33,17 @@ Remoは、設定した間隔の位置情報と写真・動画を、日付ごと�
 
 ## ローカル起動
 
+Node.js 24.22.1（`.nvmrc`）と npm 11 または 12、`just` を使用します。nvm を使う場合は最初に `nvm install && nvm use` を実行してください。
+
 ```bash
 just setup
 just api       # http://localhost:8787
 just web       # http://localhost:5173
 ```
+
+`just setup` はロックファイルどおりに依存関係をインストールし、API の `.dev.vars` と Web の `.env` をサンプルから作成します。既存の設定ファイルは上書きしません。Web の開発サーバーは `localhost:5173` で起動し、ポート使用中は停止するため、別ポートへ変わって認証の許可オリジンと食い違うのを防ぎます。
+
+`just check` で API・Web の型検査、テスト、ビルド（API はデプロイなし、Web は開発・本番の両方）、`just audit` で開発用も含む npm 依存関係の脆弱性監査を実行できます。Android は `just android-check`、iOS は `just ios-check` を使用します。GitHub Actions では PR・main への push・週次で API・Web・Android を検証し、Dependabot が npm・Gradle・Actions の更新を提案します。
 
 ローカル確認用のタイムラインデータは [`fixtures/timeline/`](fixtures/timeline/) にあります。Web の「設定 → JSONをインポート」から `*.sample.json` をインポートして使用できます。エクスポートは開始日・終了日を指定でき、写真は画像本体ではなく撮影日時・位置・枚数のメタデータとして含まれます。
 
