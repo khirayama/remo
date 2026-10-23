@@ -31,6 +31,8 @@ Jetpack Compose製のタイムラインアプリです。認証トークンはAn
 
 ## 検証
 
+JDK 21 と Android SDK 36 を使用します。Gradle Wrapper は、現在の Android Gradle Plugin 8.13.2 と互換性がある[セキュリティ修正版 8.14.6](https://docs.gradle.org/8.14.6/release-notes.html)に固定し、配布 ZIP の SHA-256 も検証します。Gradle 9.6 以降は AGP 8.x が使用する内部 API が削除されているため、AGP の移行と合わせて更新してください。
+
 通常のビルド・単体テスト:
 
 ```bash
