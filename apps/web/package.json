@@ -30,7 +30,7 @@
     "@types/react-dom": "^19.2.2",
     "@vitejs/plugin-react": "^5.0.4",
     "fake-indexeddb": "^6.2.5",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.2",
     "vite": "7.3.7",
     "vitest": "4.1.12",
     "wrangler": "4.152.0"
