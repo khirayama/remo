@@ -75,7 +75,7 @@ jobs:
             apps/android/**/*.gradle.kts
             apps/android/gradle/libs.versions.toml
             apps/android/gradle/wrapper/gradle-wrapper.properties
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
         with:
           packages: "platforms;android-36 build-tools;36.0.0"
       - name: Lint, unit tests and debug build
