@@ -18,8 +18,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@better-auth/drizzle-adapter": "^1.7.2",
-    "better-auth": "^1.7.2",
+    "@better-auth/drizzle-adapter": "^1.7.15",
+    "better-auth": "^1.7.15",
     "drizzle-orm": "^0.45.2",
     "hono": "^4.13.12"
   },
@@ -28,6 +28,6 @@
     "@types/node": "^24.13.6",
     "typescript": "^5.9.3",
     "vitest": "4.1.12",
-    "wrangler": "4.152.0"
+    "wrangler": "^4.156.1"
   }
 }
