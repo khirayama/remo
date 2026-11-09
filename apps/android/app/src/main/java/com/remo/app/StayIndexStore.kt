@@ -112,6 +112,8 @@ internal fun rememberStayIndex(context: Context, store: LogStore): StayIndexStat
                     ?: StayIndexStorage.load(context, timeZone).also { holder.cache = it }
                 val today = dayKey(System.currentTimeMillis())
                 val dirty = store.dirtyDays()
+                // Places are left out of the cache; the views match them when shown.
+                val corrections = store.corrections()
                 // The first pass covers every recorded day; an interrupted pass
                 // continues with the days it has not reached.
                 val days = if (cache.complete) dirty.map(DirtyDay::day)
@@ -127,6 +129,7 @@ internal fun rememberStayIndex(context: Context, store: LogStore): StayIndexStat
                             unsaved += 1
                         },
                         onProgress = { done, total -> withContext(Dispatchers.Main) { state = state.copy(progress = StayIndexProgress(done, total)) } },
+                        corrections = corrections,
                     )
                     if (!cache.complete) cache.complete = true
                     if (result.changed || unsaved > 0) StayIndexStorage.save(context, cache)
@@ -137,7 +140,7 @@ internal fun rememberStayIndex(context: Context, store: LogStore): StayIndexStat
                 }
                 // Today (and any record dated later) is detected on every update.
                 val openDays = (listOf(today) + dirty.map(DirtyDay::day).filter { it > today }).distinct()
-                allStays(cache, openDays.flatMap { day -> detectDayStays(store.entriesOfDay(day)) })
+                allStays(cache, openDays.flatMap { day -> detectDayStays(store.entriesOfDay(day), corrections) })
             }
             state = StayIndexState(stays)
         }

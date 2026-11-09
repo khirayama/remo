@@ -21,7 +21,7 @@ internal fun StayCluster.summary() = StaySummary(id, coordinate.latitude, coordi
 
 // Bump whenever stay detection or the cache layout changes so every cached
 // day is recomputed.
-const val STAY_INDEX_VERSION = 4
+const val STAY_INDEX_VERSION = 5
 
 /**
  * Derived, device-local cache of each past day's stays. It is never synced or
@@ -40,8 +40,14 @@ class StayIndexCache(
 fun StayIndexCache?.usableFor(timeZone: String): StayIndexCache =
     this?.takeIf { it.version == STAY_INDEX_VERSION && it.timeZone == timeZone } ?: StayIndexCache(timeZone = timeZone)
 
-/** The stays of one day's records. */
-fun detectDayStays(entries: List<LogEntry>): List<StaySummary> = buildStayClusters(entries).map { it.summary() }
+/**
+ * The stays of one day's records with the corrections laid over them. Named
+ * places are left out: the cache holds the stays as detected, and the views
+ * match them to the places when they are shown, so naming a place never
+ * invalidates the cache.
+ */
+fun detectDayStays(entries: List<LogEntry>, corrections: List<TimelineCorrection> = emptyList()): List<StaySummary> =
+    buildStayClusters(entries, TimelineAdjustments(corrections = corrections)).map { it.summary() }
 
 data class StayIndexRefresh(val processed: List<String>, val changed: Boolean)
 
@@ -58,6 +64,7 @@ suspend fun refreshStayIndex(
     loadDay: suspend (String) -> List<LogEntry>,
     onDay: suspend (day: String) -> Unit = {},
     onProgress: suspend (done: Int, total: Int) -> Unit = { _, _ -> },
+    corrections: List<TimelineCorrection> = emptyList(),
 ): StayIndexRefresh {
     var changed = false
     cache.days.keys.filter { it >= today }.forEach {
@@ -68,7 +75,7 @@ suspend fun refreshStayIndex(
     val processed = mutableListOf<String>()
     stale.forEachIndexed { index, day ->
         currentCoroutineContext().ensureActive()
-        val stays = detectDayStays(loadDay(day))
+        val stays = detectDayStays(loadDay(day), corrections)
         if (stays.isEmpty()) cache.days.remove(day) else cache.days[day] = stays
         processed += day
         changed = true
@@ -82,9 +89,14 @@ suspend fun refreshStayIndex(
 fun allStays(cache: StayIndexCache, openStays: List<StaySummary>): List<StaySummary> =
     (cache.days.values.flatten() + openStays).sortedBy(StaySummary::startedAt)
 
-/** A place built from every stay within [STAY_PLACE_RADIUS_METERS] across all days. */
+/**
+ * A place built from every stay within [STAY_PLACE_RADIUS_METERS] across all
+ * days, or every stay at one named place.
+ */
 data class AllTimeStayPlace(
     val id: String,
+    /** The named place, when the stays matched one. */
+    val placeId: String? = null,
     val coordinate: LatLng,
     /** Newest first. */
     val visits: List<StaySummary>,
@@ -97,7 +109,7 @@ data class AllTimeStayPlace(
 // drift from the cell it was filed under and still be found from a neighbor.
 private const val PLACE_GRID_DEGREES = 0.01
 
-private class PlaceBuilder(val id: String, var latitude: Double, var longitude: Double) {
+private class PlaceBuilder(val id: String, var latitude: Double, var longitude: Double, val placeId: String? = null) {
     val latitudes = mutableListOf<Double>()
     val longitudes = mutableListOf<Double>()
     val visits = mutableListOf<StaySummary>()
@@ -121,12 +133,23 @@ private class PlaceBuilder(val id: String, var latitude: Double, var longitude: 
  * Group every stay into places the same way the day timeline groups one day
  * (buildStayPlacesFromClusters): each stay joins the nearest place within
  * [STAY_PLACE_RADIUS_METERS], and a place sits at the median of its visits.
+ * Stays at one named place are one place at the place's own coordinate.
  */
-fun buildAllTimeStayPlaces(stays: List<StaySummary>): List<AllTimeStayPlace> {
+fun buildAllTimeStayPlaces(stays: List<StaySummary>, namedPlaces: List<NamedPlace> = emptyList()): List<AllTimeStayPlace> {
     val places = mutableListOf<PlaceBuilder>()
+    val named = mutableMapOf<String, PlaceBuilder>()
     val grid = mutableMapOf<Pair<Int, Int>, MutableList<PlaceBuilder>>()
     fun cell(latitude: Double, longitude: Double) = floor(latitude / PLACE_GRID_DEGREES).toInt() to floor(longitude / PLACE_GRID_DEGREES).toInt()
     stays.sortedBy(StaySummary::startedAt).forEach { stay ->
+        // A stay at a named place belongs to it, at the place's own coordinate.
+        val match = matchPlace(namedPlaces, stay.coordinate)
+        if (match != null) {
+            val place = named.getOrPut(match.place.id) {
+                PlaceBuilder("named:${match.place.id}", match.place.latitude, match.place.longitude, match.place.id).also(places::add)
+            }
+            place.visits += stay
+            return@forEach
+        }
         val (row, column) = cell(stay.latitude, stay.longitude)
         var nearest: PlaceBuilder? = null
         var nearestDistance = Double.POSITIVE_INFINITY
@@ -151,6 +174,7 @@ fun buildAllTimeStayPlaces(stays: List<StaySummary>): List<AllTimeStayPlace> {
     return places.map { place ->
         AllTimeStayPlace(
             id = place.id,
+            placeId = place.placeId,
             coordinate = LatLng(place.latitude, place.longitude),
             visits = place.visits.reversed(),
             dayCount = place.visits.map { dayKey(it.startedAt) }.toSet().size,
@@ -165,11 +189,13 @@ fun buildAllTimeStayPlaces(stays: List<StaySummary>): List<AllTimeStayPlace> {
 }
 
 /** The same result as buildStayVisitHistory, read from already detected stays. */
-fun stayVisitHistoryFromStays(stays: List<StaySummary>, target: LatLng): StayVisitHistory =
-    historyOf(
-        stays.filter { distanceMeters(it.coordinate, target) <= STAY_PLACE_RADIUS_METERS }
+fun stayVisitHistoryFromStays(stays: List<StaySummary>, target: LatLng, places: List<NamedPlace> = emptyList()): StayVisitHistory {
+    val isVisit = visitFilter(target, places)
+    return historyOf(
+        stays.filter { isVisit(it.coordinate) }
             .sortedByDescending(StaySummary::startedAt),
     )
+}
 
 /** Summary counts for visits that are already newest first. */
 fun historyOf(visits: List<StaySummary>) = StayVisitHistory(

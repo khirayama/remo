@@ -9,8 +9,18 @@ import kotlin.math.abs
 
 private const val TIMELINE_SCHEMA_VERSION = 1
 
-/** Decode a Remo timeline export from any client. Invalid records are skipped. */
-fun decodeTimelineImport(payload: String, importedAt: Long = System.currentTimeMillis()): List<LogEntry> {
+/** Everything a Remo JSON document carries. */
+data class TimelineArchive(
+    val entries: List<LogEntry>,
+    val places: List<NamedPlace> = emptyList(),
+    val corrections: List<TimelineCorrection> = emptyList(),
+)
+
+/**
+ * Decode a Remo timeline export from any client, including its named places
+ * and corrections. Invalid records are skipped.
+ */
+fun decodeTimelineArchive(payload: String, importedAt: Long = System.currentTimeMillis()): TimelineArchive {
     val document = runCatching { JSONObject(payload) }
         .getOrElse { throw IllegalArgumentException("RemoのJSONファイルではありません") }
     if (document.optInt("schemaVersion", -1) != TIMELINE_SCHEMA_VERSION) {
@@ -26,8 +36,18 @@ fun decodeTimelineImport(payload: String, importedAt: Long = System.currentTimeM
     if (imported.isEmpty() && events.length() > 0) {
         throw IllegalArgumentException("読み込めるタイムライン記録がありません")
     }
-    return imported.sortedByDescending(LogEntry::startedAt)
+    val places = document.optJSONArray("places")
+    val corrections = document.optJSONArray("corrections")
+    return TimelineArchive(
+        entries = imported.sortedByDescending(LogEntry::startedAt),
+        places = if (places == null) emptyList() else (0 until places.length()).mapNotNull { decodeTimelinePlace(places.optJSONObject(it), importedAt) },
+        corrections = if (corrections == null) emptyList() else (0 until corrections.length()).mapNotNull { decodeTimelineCorrection(corrections.optJSONObject(it)) },
+    )
 }
+
+/** Decode the records of a Remo timeline export from any client. Invalid records are skipped. */
+fun decodeTimelineImport(payload: String, importedAt: Long = System.currentTimeMillis()): List<LogEntry> =
+    decodeTimelineArchive(payload, importedAt).entries
 
 private fun decodeTimelineEvent(value: JSONObject?, importedAt: Long): LogEntry? {
     if (value == null) return null
@@ -90,6 +110,54 @@ private fun parseIsoTimestamp(value: String): Long? {
         val position = ParsePosition(0)
         formatter.parse(text, position)?.takeIf { position.index == text.length }?.time
     }
+}
+
+private fun decodeTimelinePlace(value: JSONObject?, importedAt: Long): NamedPlace? {
+    if (value == null) return null
+    val id = value.optString("id").trim().takeIf { it.isNotEmpty() } ?: return null
+    val latitude = number(value, "latitude")?.toDouble() ?: return null
+    val longitude = number(value, "longitude")?.toDouble() ?: return null
+    if (!hasUsableCoordinates(latitude, longitude)) return null
+    val radius = number(value, "radiusMeters")?.toDouble()?.takeIf(Double::isFinite)?.coerceIn(MIN_PLACE_RADIUS_METERS, MAX_PLACE_RADIUS_METERS)
+    val anchors = value.optJSONArray("anchors")?.let { array ->
+        (0 until array.length()).mapNotNull { index ->
+            val anchor = array.optJSONObject(index) ?: return@mapNotNull null
+            val anchorLatitude = number(anchor, "latitude")?.toDouble() ?: return@mapNotNull null
+            val anchorLongitude = number(anchor, "longitude")?.toDouble() ?: return@mapNotNull null
+            if (!hasUsableCoordinates(anchorLatitude, anchorLongitude)) return@mapNotNull null
+            val anchorRadius = number(anchor, "radiusMeters")?.toDouble()?.takeIf(Double::isFinite) ?: DEFAULT_PLACE_RADIUS_METERS
+            PlaceAnchor(anchorLatitude, anchorLongitude, anchorRadius.coerceIn(MIN_PLACE_RADIUS_METERS, MAX_PLACE_RADIUS_METERS))
+        }
+    }.orEmpty().take(MAX_PLACE_ANCHORS)
+    return NamedPlace(
+        id = id,
+        name = value.optString("name"),
+        latitude = latitude,
+        longitude = longitude,
+        updatedAt = parseTimelineTimestamp(value.opt("updatedAt")) ?: importedAt,
+        deleted = value.optBoolean("deleted", false),
+        radiusMeters = radius,
+        anchors = anchors,
+        mergedInto = value.optString("mergedInto").takeIf(String::isNotBlank),
+    )
+}
+
+private fun decodeTimelineCorrection(value: JSONObject?): TimelineCorrection? {
+    if (value == null) return null
+    val id = value.optString("id").trim().takeIf { it.isNotEmpty() } ?: return null
+    val kind = timelineCorrectionKind(value.optString("kind")) ?: return null
+    val startedAt = parseTimelineTimestamp(value.opt("startedAt")) ?: return null
+    val parsedEnd = parseTimelineTimestamp(value.opt("endedAt")) ?: return null
+    if (value.optBoolean("deleted", false)) return null
+    val endedAt = parsedEnd.coerceIn(startedAt, startedAt + MAX_CORRECTION_SPAN_MS)
+    return TimelineCorrection(
+        id = id,
+        kind = kind,
+        startedAt = startedAt,
+        endedAt = endedAt,
+        createdAt = parseTimelineTimestamp(value.opt("createdAt")) ?: startedAt,
+        source = correctionSource(value.optString("source")),
+    )
 }
 
 private fun number(value: JSONObject, name: String): Number? = value.opt(name).let { it as? Number }

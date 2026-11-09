@@ -46,12 +46,18 @@ data class StayCluster(
     val endedAt: Long,
     val durationMs: Long,
     val entries: List<CorrectedLocation>,
+    /** The named place the stay matched, when places were given. */
+    val placeId: String? = null,
+    /** Whether a correction made or reshaped this stay. */
+    val corrected: Boolean = false,
 )
 
 data class StayPlace(
     val id: String,
     val coordinate: LatLng,
     val visits: List<StayCluster>,
+    /** The named place the stays matched, when they matched one. */
+    val placeId: String? = null,
 ) {
     val visitCount: Int get() = visits.size
     val totalDurationMs: Long get() = visits.sumOf(StayCluster::durationMs)
@@ -74,6 +80,10 @@ data class TimelineActivity(
     val entries: List<CorrectedLocation> = emptyList(),
     /** Time inside a movement during which nothing was recorded. */
     val untrackedMs: Long = 0L,
+    /** The named place the stay matched, when places were given. */
+    val placeId: String? = null,
+    /** Whether a correction made or reshaped this stay. */
+    val corrected: Boolean = false,
 ) {
     /** Whether a movement is a hole in the record rather than a recorded trip. */
     val isMostlyUntracked: Boolean get() = untrackedMs > 0L && untrackedMs * 2 >= durationMs
@@ -93,6 +103,71 @@ data class PhotoLocationSuggestion(
     val distanceFromOriginalMeters: Double?,
     val previousId: String?,
     val nextId: String?,
+)
+
+/** One point of a named place: stays within its radius belong to the place. */
+data class PlaceAnchor(
+    val latitude: Double,
+    val longitude: Double,
+    val radiusMeters: Double,
+)
+
+enum class TimelineCorrectionKind(val wireValue: String) {
+    EXCLUDE("exclude"),
+    JOIN_STAY("join_stay"),
+    NOT_STAY("not_stay"),
+}
+
+fun timelineCorrectionKind(value: String?): TimelineCorrectionKind? =
+    TimelineCorrectionKind.entries.firstOrNull { it.wireValue == value }
+
+enum class CorrectionSource(val wireValue: String) {
+    APP("app"),
+    MCP("mcp"),
+}
+
+fun correctionSource(value: String?): CorrectionSource = when (value) {
+    CorrectionSource.MCP.wireValue -> CorrectionSource.MCP
+    else -> CorrectionSource.APP
+}
+
+/**
+ * A correction the user (or an AI tool on their behalf) laid over the records.
+ * It never changes a record. Times are milliseconds, both ends included:
+ * [TimelineCorrectionKind.EXCLUDE] ignores the location samples in the range,
+ * [TimelineCorrectionKind.JOIN_STAY] makes the range one stay,
+ * [TimelineCorrectionKind.NOT_STAY] turns the stays in it into movement.
+ * Corrections are applied oldest first ([createdAt]), so a newer one wins where
+ * they overlap. Only [deleted] ever changes after a correction is created.
+ */
+data class TimelineCorrection(
+    val id: String,
+    val kind: TimelineCorrectionKind,
+    val startedAt: Long,
+    val endedAt: Long,
+    val createdAt: Long,
+    val source: CorrectionSource = CorrectionSource.APP,
+    val deleted: Boolean = false,
+)
+
+/** What the user laid over the records of a day. */
+data class TimelineAdjustments(
+    val corrections: List<TimelineCorrection> = emptyList(),
+    /** Stays at a named place take the coordinate of the anchor they matched. */
+    val places: List<NamedPlace> = emptyList(),
+)
+
+/** A run of fixes that left the route and came back, offered to be excluded. */
+data class OutlierCandidate(
+    /** Milliseconds, both ends included: an `exclude` correction for this range removes the run. */
+    val startedAt: Long,
+    val endedAt: Long,
+    val eventIds: List<String>,
+    /** The fix of the run farthest from the route. */
+    val latitude: Double,
+    val longitude: Double,
+    /** How far that fix lies from the nearer of the fixes around the run. */
+    val distanceMeters: Double,
 )
 
 private const val MAX_CORRECTION_GAP_MS = 15 * 60 * 1000L
@@ -185,6 +260,22 @@ private const val MAX_STAY_EDGE_TRIM_MS = 3 * 60 * 1000L
 const val UNTRACKED_GAP_MS = 10 * 60 * 1000L
 // Revisit history only analyzes days that came near the place.
 private const val STAY_HISTORY_SEARCH_RADIUS_METERS = 1000.0
+
+const val DEFAULT_PLACE_RADIUS_METERS = STAY_PLACE_RADIUS_METERS
+const val MIN_PLACE_RADIUS_METERS = 25.0
+const val MAX_PLACE_RADIUS_METERS = 500.0
+const val MAX_PLACE_ANCHORS = 20
+/** The longest range one correction can cover. */
+const val MAX_CORRECTION_SPAN_MS = 24 * 60 * 60 * 1000L
+
+// The automatic rules smooth spikes of one or two fixes. A longer run of fixes
+// that jumps far away and straight back, faster than any trip, is left on the
+// route; it is offered to the user (and AI tools) to exclude.
+private const val OUTLIER_MAX_RUN = 5
+private const val OUTLIER_MIN_DISTANCE_METERS = 300.0
+private const val OUTLIER_MIN_SPEED_MPS = 30.0
+private const val OUTLIER_MAX_NEIGHBOR_GAP_MS = 5 * 60 * 1000L
+private const val OUTLIER_MAX_RETURN_SHARE = 0.5
 
 private fun distanceMeters(from: LogEntry, to: LogEntry): Double {
     val fromCoordinate = coordinatePair(from.latitude, from.longitude) ?: return Double.POSITIVE_INFINITY
@@ -859,31 +950,226 @@ private fun smoothedWalks(positions: List<CorrectedLocation>, stays: List<StayCl
     }
 }
 
-fun analyzeTimeline(logs: List<LogEntry>): TimelineAnalysis {
+// ---- Corrections and named places ----------------------------------------------
+
+/** Live corrections, oldest first: a newer correction is applied later and wins. */
+private fun activeCorrections(corrections: List<TimelineCorrection>): List<TimelineCorrection> =
+    corrections.filter { !it.deleted && it.endedAt >= it.startedAt }
+        .sortedWith(compareBy<TimelineCorrection> { it.createdAt }.thenBy { it.id })
+
+/** The records without the location samples an `exclude` correction covers. Photos are kept. */
+fun withoutExcludedSamples(logs: List<LogEntry>, corrections: List<TimelineCorrection>): List<LogEntry> {
+    val excludes = corrections.filter { it.kind == TimelineCorrectionKind.EXCLUDE && !it.deleted }
+    if (excludes.isEmpty()) return logs
+    return logs.filter { entry ->
+        if (entry.source != EventSource.LOCATION) return@filter true
+        excludes.none { entry.startedAt in it.startedAt..it.endedAt }
+    }
+}
+
+private fun stayFromPositions(members: List<CorrectedLocation>): StayCluster {
+    val startedAt = members.first().entry.startedAt
+    val endedAt = members.last().entry.startedAt
+    return StayCluster(
+        id = "",
+        coordinate = stayCenter(members),
+        startedAt = startedAt,
+        endedAt = endedAt,
+        durationMs = (endedAt - startedAt).coerceAtLeast(0L),
+        entries = members,
+        corrected = true,
+    )
+}
+
+/**
+ * Applies `join_stay` and `not_stay` to the detected stays, oldest correction
+ * first. A join takes in every stay it overlaps and covers their union with its
+ * own range, so it keeps working when detection later moves a stay's edges; the
+ * positions in that span become one stay. `not_stay` drops the stays that lie at
+ * least half inside its range, which leaves their positions to the movement
+ * around them. Ids are given again in time order.
+ */
+private fun applyStayCorrections(
+    stays: List<StayCluster>,
+    positions: List<CorrectedLocation>,
+    corrections: List<TimelineCorrection>,
+): List<StayCluster> {
+    var result = stays
+    for (correction in corrections) {
+        when (correction.kind) {
+            TimelineCorrectionKind.NOT_STAY -> result = result.filter { stay ->
+                val start = stay.startedAt
+                val end = stay.endedAt
+                val overlap = minOf(end, correction.endedAt) - maxOf(start, correction.startedAt)
+                if (end <= start) {
+                    !(start in correction.startedAt..correction.endedAt)
+                } else {
+                    overlap * 2 < end - start
+                }
+            }
+            TimelineCorrectionKind.JOIN_STAY -> {
+                var spanStart = correction.startedAt
+                var spanEnd = correction.endedAt
+                val kept = mutableListOf<StayCluster>()
+                result.forEach { stay ->
+                    if (stay.startedAt <= correction.endedAt && stay.endedAt >= correction.startedAt) {
+                        spanStart = minOf(spanStart, stay.startedAt)
+                        spanEnd = maxOf(spanEnd, stay.endedAt)
+                    } else {
+                        kept += stay
+                    }
+                }
+                val members = positions.filter { it.entry.startedAt in spanStart..spanEnd }
+                if (members.isEmpty()) continue
+                result = kept + stayFromPositions(members)
+            }
+            TimelineCorrectionKind.EXCLUDE -> Unit
+        }
+    }
+    if (result === stays) return stays
+    return result.sortedBy(StayCluster::startedAt).mapIndexed { index, stay ->
+        stay.copy(id = "stay:${stay.startedAt}:$index")
+    }
+}
+
+/** Every anchor of a place, its own coordinate first. */
+fun placeAnchors(place: NamedPlace): List<PlaceAnchor> = buildList {
+    add(PlaceAnchor(place.latitude, place.longitude, place.radiusMeters ?: DEFAULT_PLACE_RADIUS_METERS))
+    addAll(place.anchors)
+}
+
+data class PlaceMatch(val place: NamedPlace, val anchor: PlaceAnchor, val distanceMeters: Double)
+
+/**
+ * The named place at [point]: of the anchors whose radius reaches the point,
+ * the nearest one. Deleted places never match.
+ */
+fun matchPlace(places: Collection<NamedPlace>?, point: LatLng): PlaceMatch? {
+    var best: PlaceMatch? = null
+    places.orEmpty().forEach { place ->
+        if (place.deleted) return@forEach
+        placeAnchors(place).forEach { anchor ->
+            val distance = distanceMeters(LatLng(anchor.latitude, anchor.longitude), point)
+            val current = best
+            if (distance <= anchor.radiusMeters && (current == null || distance < current.distanceMeters)) {
+                best = PlaceMatch(place, anchor, distance)
+            }
+        }
+    }
+    return best
+}
+
+/** Stays at a named place are drawn at the anchor they matched. */
+private fun snapStaysToPlaces(stays: List<StayCluster>, places: List<NamedPlace>): List<StayCluster> {
+    if (places.isEmpty()) return stays
+    return stays.map { stay ->
+        val match = matchPlace(places, stay.coordinate) ?: return@map stay
+        stay.copy(
+            coordinate = LatLng(match.anchor.latitude, match.anchor.longitude),
+            placeId = match.place.id,
+        )
+    }
+}
+
+/**
+ * Runs of one to five location fixes outside any stay that leave the route by
+ * at least 300m and come back, faster than 30m/s both ways, while the fixes
+ * just before and after the run lie within half that distance of each other.
+ */
+fun findOutlierCandidates(analysis: TimelineAnalysis): List<OutlierCandidate> {
+    val locations = analysis.correctedLocations
+    val inStay = analysis.stayClusters.flatMapTo(HashSet()) { stay -> stay.entries.map { it.entry.id } }
+    val times = locations.map { it.entry.startedAt }
+    val candidates = mutableListOf<OutlierCandidate>()
+    var before = 0
+    while (before < locations.size - 2) {
+        var next = before + 1
+        for (length in 1..OUTLIER_MAX_RUN) {
+            val after = before + length + 1
+            if (after >= locations.size) break
+            val run = locations.subList(before + 1, after)
+            if (run.all { it.entry.id in inStay }) continue
+            val outMs = times[before + 1] - times[before]
+            val backMs = times[after] - times[after - 1]
+            if (outMs <= 0L || backMs <= 0L || outMs > OUTLIER_MAX_NEIGHBOR_GAP_MS || backMs > OUTLIER_MAX_NEIGHBOR_GAP_MS) continue
+            val from = locations[before]
+            val to = locations[after]
+            var farthest = run.first()
+            var farthestDistance = -1.0
+            var nearest = Double.POSITIVE_INFINITY
+            run.forEach { location ->
+                val distance = minOf(distanceMeters(from.coordinate, location.coordinate), distanceMeters(location.coordinate, to.coordinate))
+                nearest = minOf(nearest, distance)
+                if (distance > farthestDistance) {
+                    farthest = location
+                    farthestDistance = distance
+                }
+            }
+            if (nearest < OUTLIER_MIN_DISTANCE_METERS) continue
+            if (distanceMeters(from.coordinate, run.first().coordinate) / (outMs / 1000.0) < OUTLIER_MIN_SPEED_MPS) continue
+            if (distanceMeters(run.last().coordinate, to.coordinate) / (backMs / 1000.0) < OUTLIER_MIN_SPEED_MPS) continue
+            if (distanceMeters(from.coordinate, to.coordinate) > nearest * OUTLIER_MAX_RETURN_SHARE) continue
+            candidates += OutlierCandidate(
+                startedAt = times[before + 1],
+                endedAt = times[after - 1],
+                eventIds = run.map { it.entry.id },
+                latitude = farthest.latitude,
+                longitude = farthest.longitude,
+                distanceMeters = farthestDistance,
+            )
+            next = after
+            break
+        }
+        before = next
+    }
+    return candidates
+}
+
+/**
+ * Which stays are visits to the place at [target]: when [target] is at a named
+ * place, the stays at that place (from any of its anchors); otherwise the
+ * stays within [STAY_PLACE_RADIUS_METERS].
+ */
+fun visitFilter(target: LatLng, places: List<NamedPlace>?): (LatLng) -> Boolean {
+    val place = matchPlace(places, target)?.place
+    if (place != null) return { stay -> matchPlace(places, stay)?.place?.id == place.id }
+    return { stay -> matchPlace(places, stay) == null && distanceMeters(stay, target) <= STAY_PLACE_RADIUS_METERS }
+}
+
+fun analyzeTimeline(logs: List<LogEntry>, adjustments: TimelineAdjustments = TimelineAdjustments()): TimelineAnalysis {
     // Stay detection intentionally uses quality-filtered, corrected locations;
     // raw coordinate records are never used for stay detection. Smoothing only
     // changes how the walks between the stays are drawn.
-    val positions = correctedPositionLogs(logs)
-    val stayClusters = correctedStayClusters(positions)
+    val corrections = activeCorrections(adjustments.corrections)
+    val positions = correctedPositionLogs(withoutExcludedSamples(logs, corrections))
+    val stayClusters = snapStaysToPlaces(applyStayCorrections(correctedStayClusters(positions), positions, corrections), adjustments.places)
+    val correctedPositions = smoothedWalks(positions, stayClusters)
     return TimelineAnalysis(
-        correctedPositions = smoothedWalks(positions, stayClusters),
-        correctedLocations = smoothedWalks(correctedLocationLogs(logs), stayClusters),
+        correctedPositions = correctedPositions,
+        correctedLocations = correctedPositions.filter { it.entry.source == EventSource.LOCATION },
         stayClusters = stayClusters,
     )
 }
 
-fun buildStayClusters(logs: List<LogEntry>): List<StayCluster> = analyzeTimeline(logs).stayClusters
+fun buildStayClusters(logs: List<LogEntry>, adjustments: TimelineAdjustments = TimelineAdjustments()): List<StayCluster> =
+    analyzeTimeline(logs, adjustments).stayClusters
 
 /** Group separate stay intervals into recurring places for display. */
-fun buildStayPlaces(logs: List<LogEntry>): List<StayPlace> {
-    return buildStayPlacesFromClusters(analyzeTimeline(logs).stayClusters)
-}
+fun buildStayPlaces(logs: List<LogEntry>, adjustments: TimelineAdjustments = TimelineAdjustments()): List<StayPlace> =
+    buildStayPlacesFromClusters(analyzeTimeline(logs, adjustments).stayClusters)
 
 fun buildStayPlacesFromClusters(stays: List<StayCluster>): List<StayPlace> {
     val places = mutableListOf<StayPlace>()
     stays.forEach { stay ->
         val nearest = places.mapIndexed { index, place ->
-            index to distanceMeters(place.coordinate, stay.coordinate)
+            val placeId = place.visits.firstOrNull()?.placeId
+            // Stays at one named place are one place, however far apart its anchors are.
+            val distance = if (stay.placeId != null || placeId != null) {
+                if (placeId == stay.placeId) 0.0 else Double.POSITIVE_INFINITY
+            } else {
+                distanceMeters(place.coordinate, stay.coordinate)
+            }
+            index to distance
         }.minByOrNull { it.second }
         if (nearest != null && nearest.second <= STAY_PLACE_RADIUS_METERS) {
             val index = nearest.first
@@ -897,7 +1183,7 @@ fun buildStayPlacesFromClusters(stays: List<StayCluster>): List<StayPlace> {
                 visits = visits,
             )
         } else {
-            places += StayPlace("stay-place:${stay.id}", stay.coordinate, listOf(stay))
+            places += StayPlace("stay-place:${stay.id}", stay.coordinate, listOf(stay), placeId = stay.placeId)
         }
     }
     return places.sortedWith(
@@ -917,7 +1203,8 @@ data class StayVisitHistory(
  * Collect revisits to the place at [target]. Stays are detected per day,
  * exactly like the day timeline, so every visit matches what that day shows.
  */
-fun buildStayVisitHistory(logs: List<LogEntry>, target: LatLng): StayVisitHistory {
+fun buildStayVisitHistory(logs: List<LogEntry>, target: LatLng, adjustments: TimelineAdjustments = TimelineAdjustments()): StayVisitHistory {
+    val isVisit = visitFilter(target, adjustments.places)
     val visits = logs.groupBy { dayKey(it.startedAt) }.values
         .filter { entries ->
             entries.any { entry ->
@@ -925,8 +1212,10 @@ fun buildStayVisitHistory(logs: List<LogEntry>, target: LatLng): StayVisitHistor
                 distanceMeters(LatLng(coordinate.first, coordinate.second), target) <= STAY_HISTORY_SEARCH_RADIUS_METERS
             }
         }
-        .flatMap(::buildStayClusters)
-        .filter { distanceMeters(it.coordinate, target) <= STAY_PLACE_RADIUS_METERS }
+        .flatMap { entries ->
+            analyzeTimeline(entries, TimelineAdjustments(corrections = adjustments.corrections)).stayClusters
+        }
+        .filter { isVisit(it.coordinate) }
         .sortedByDescending(StayCluster::startedAt)
     return historyOf(visits.map { it.summary() })
 }
@@ -998,6 +1287,8 @@ fun buildTimelineActivities(logs: List<LogEntry>, analysis: TimelineAnalysis): L
                 coordinate = stay.coordinate,
                 entries = stay.entries,
                 path = listOf(stay.coordinate),
+                placeId = stay.placeId,
+                corrected = stay.corrected,
             )
         }
     }

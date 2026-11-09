@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,8 +29,11 @@ import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.outlined.Bedtime
+import androidx.compose.material.icons.outlined.Block
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
@@ -39,10 +43,12 @@ import androidx.compose.material.icons.outlined.EventBusy
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.Place
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.Route
+import androidx.compose.material.icons.outlined.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedTextField
@@ -154,6 +160,7 @@ internal fun TimelineSheetContent(
     sleep: List<SleepSession>,
     autoCapture: Boolean,
     selectedActivityId: String?,
+    corrections: List<TimelineCorrection>,
     listState: LazyListState,
     bottomPadding: Dp,
     modifier: Modifier = Modifier,
@@ -161,6 +168,10 @@ internal fun TimelineSheetContent(
     onFocus: (TimelineActivity) -> Unit,
     onSelectPhotos: (List<LogEntry>) -> Unit,
     onOpenHistory: (PlaceHistoryTarget) -> Unit,
+    onJoinStay: (startedAt: Long, endedAt: Long) -> Unit,
+    onNotStay: (startedAt: Long, endedAt: Long) -> Unit,
+    onExcludeOutliers: (List<OutlierCandidate>) -> Unit,
+    onUndoCorrection: (TimelineCorrection) -> Unit,
 ) {
     val context = LocalContext.current
     var showPicker by remember { mutableStateOf(false) }
@@ -169,6 +180,15 @@ internal fun TimelineSheetContent(
     val items = remember(timeline, sleep) { buildSheetItems(timeline, sleep) }
     val summary = remember(timeline, sleep) { daySummary(timeline, sleep) }
     fun onLabel(id: String, label: StayPlaceLabel) { placeLabels = placeLabels + (id to label) }
+    val previousStays = remember(timeline.activities) {
+        val stays = timeline.activities.filter { it.kind == TimelineActivityKind.STAY }
+        stays.mapIndexed { index, stay -> stay.id to stays.getOrNull(index - 1) }.toMap()
+    }
+    val dayCorrections = remember(selectedDate, corrections) {
+        val dayStart = parseDate(selectedDate).timeInMillis
+        val dayEnd = parseDate(shiftDay(selectedDate, 1)).timeInMillis
+        corrections.filter { !it.deleted && it.endedAt >= dayStart && it.startedAt < dayEnd }
+    }
 
     LazyColumn(modifier.fillMaxWidth(), state = listState, contentPadding = PaddingValues(bottom = bottomPadding)) {
         item(key = "header") {
@@ -176,6 +196,11 @@ internal fun TimelineSheetContent(
         }
         item(key = "summary") {
             DaySummaryRow(summary, loaded)
+        }
+        if (loaded && timeline.outliers.isNotEmpty()) {
+            item(key = "outliers") {
+                OutlierCandidatesRow(timeline.outliers) { onExcludeOutliers(timeline.outliers) }
+            }
         }
         when {
             !loaded -> item(key = "loading") {
@@ -202,10 +227,13 @@ internal fun TimelineSheetContent(
                             isLast = index == items.lastIndex,
                             selected = selectedActivityId == item.id,
                             photos = photos,
+                            previousStay = previousStays[item.id],
                             onLabel = { onLabel(item.id, it) },
                             onClick = { onFocus(item.activity) },
                             onSelectPhotos = onSelectPhotos,
                             onOpenHistory = { item.activity.coordinate?.let { onOpenHistory(PlaceHistoryTarget(it, placeLabels[item.id])) } },
+                            onJoinStay = onJoinStay,
+                            onNotStay = onNotStay,
                         ) else MovementRow(
                             activity = item.activity,
                             // The stay before it already shows when the movement began.
@@ -225,6 +253,9 @@ internal fun TimelineSheetContent(
         }
         if (loaded && timeline.stayPlaces.isNotEmpty()) {
             stayPlacesSection(timeline.stayPlaces, placeLabels, placesExpanded, { placesExpanded = !placesExpanded }, ::onLabel, onOpenHistory)
+        }
+        if (loaded && dayCorrections.isNotEmpty()) {
+            correctionsSection(dayCorrections, onUndoCorrection)
         }
     }
     if (showPicker) {
@@ -378,10 +409,13 @@ private fun StayRow(
     isLast: Boolean,
     selected: Boolean,
     photos: List<LibraryPhoto>,
+    previousStay: TimelineActivity?,
     onLabel: (StayPlaceLabel) -> Unit,
     onClick: () -> Unit,
     onSelectPhotos: (List<LogEntry>) -> Unit,
     onOpenHistory: () -> Unit,
+    onJoinStay: (startedAt: Long, endedAt: Long) -> Unit,
+    onNotStay: (startedAt: Long, endedAt: Long) -> Unit,
 ) {
     @Suppress("NAME_SHADOWING")
     val label = activity.coordinate?.let(label::named) ?: label
@@ -398,11 +432,95 @@ private fun StayRow(
             sleep.forEach { SleepLine(it) }
             if (activity.photos.isNotEmpty()) PhotoStrip(activity.photos, photos) { onSelectPhotos(activity.photos) }
             if (selected) {
-                TextButton(onClick = onOpenHistory, contentPadding = PaddingValues(horizontal = 12.dp), modifier = Modifier.padding(top = 6.dp).offset(x = (-12).dp)) {
-                    Icon(Icons.Outlined.History, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("この場所の訪問履歴")
+                Row(Modifier.padding(top = 6.dp).offset(x = (-12).dp)) {
+                    TextButton(onClick = onOpenHistory, contentPadding = PaddingValues(horizontal = 12.dp)) {
+                        Icon(Icons.Outlined.History, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("この場所の訪問履歴")
+                    }
                 }
+                Row(Modifier.offset(x = (-12).dp)) {
+                    TextButton(
+                        onClick = { previousStay?.let { onJoinStay(it.startedAt, activity.endedAt) } },
+                        enabled = previousStay != null,
+                        contentPadding = PaddingValues(horizontal = 12.dp),
+                    ) {
+                        Icon(Icons.Outlined.Link, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("前の滞在とつなげる")
+                    }
+                    TextButton(onClick = { onNotStay(activity.startedAt, activity.endedAt) }, contentPadding = PaddingValues(horizontal = 12.dp)) {
+                        Icon(Icons.Outlined.Block, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("滞在ではない")
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Runs of fixes that left the route, offered to be excluded as one correction each. */
+@Composable
+private fun OutlierCandidatesRow(outliers: List<OutlierCandidate>, onExclude: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, top = 2.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Outlined.Warning, null, tint = AppColors.amber, modifier = Modifier.size(18.dp))
+        Text(
+            "飛んだ測位 ${outliers.size}か所",
+            style = MaterialTheme.typography.bodyMedium,
+            color = AppColors.ink,
+            modifier = Modifier.weight(1f).padding(start = 8.dp),
+        )
+        TextButton(onClick = onExclude) { Text("除外する") }
+    }
+}
+
+private fun TimelineCorrection.label(): String = when (kind) {
+    TimelineCorrectionKind.EXCLUDE -> "測位を除外"
+    TimelineCorrectionKind.JOIN_STAY -> "滞在をつなげる"
+    TimelineCorrectionKind.NOT_STAY -> "滞在ではない"
+}
+
+private fun LazyListScope.correctionsSection(corrections: List<TimelineCorrection>, onUndo: (TimelineCorrection) -> Unit) {
+    item(key = "corrections-header") {
+        Column(Modifier.padding(top = 12.dp)) {
+            HorizontalDivider(Modifier.padding(horizontal = 20.dp), color = AppColors.outline)
+            Text(
+                "この日の補正",
+                style = MaterialTheme.typography.titleSmall,
+                color = AppColors.ink,
+                modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 4.dp),
+            )
+        }
+    }
+    items(corrections, key = { "correction:${it.id}" }) { correction ->
+        Row(
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, top = 2.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(correction.label(), style = MaterialTheme.typography.bodyLarge, color = AppColors.ink)
+                    if (correction.source == CorrectionSource.MCP) {
+                        Text(
+                            "AI",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = AppColors.onGreenContainer,
+                            modifier = Modifier.padding(start = 6.dp)
+                                .background(AppColors.greenContainer, MaterialTheme.shapes.small)
+                                .padding(horizontal = 6.dp, vertical = 2.dp),
+                        )
+                    }
+                }
+                RowSubtitle("${formatTime(correction.startedAt)}–${formatTime(correction.endedAt)}")
+            }
+            TextButton(onClick = { onUndo(correction) }) {
+                Icon(Icons.AutoMirrored.Outlined.Undo, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("取り消す")
             }
         }
     }
@@ -564,7 +682,7 @@ private fun LazyListScope.stayPlacesSection(
             ) {
                 Column(Modifier.weight(1f)) {
                     Text("滞在した場所", style = MaterialTheme.typography.titleSmall, color = AppColors.ink)
-                    Text("${places.size}か所 · 100m以内の滞在は同じ場所にまとめています", style = MaterialTheme.typography.bodySmall, color = AppColors.inkSecondary)
+                    Text("${places.size}か所 · 同じ場所の滞在をまとめています", style = MaterialTheme.typography.bodySmall, color = AppColors.inkSecondary)
                 }
                 Icon(if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, null, tint = AppColors.inkSecondary)
             }
@@ -632,11 +750,30 @@ internal data class PlaceHistoryTarget(val coordinate: LatLng, val label: StayPl
 /** All-time visits to one place, grouped by day. Tapping a day opens it. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun PlaceHistorySheet(history: StayVisitHistory?, target: PlaceHistoryTarget, onDismiss: () -> Unit, onRename: (current: NamedPlace?, name: String) -> Unit, onOpenDay: (String) -> Unit) {
+internal fun PlaceHistorySheet(
+    history: StayVisitHistory?,
+    target: PlaceHistoryTarget,
+    allPlaces: List<AllTimeStayPlace>?,
+    onDismiss: () -> Unit,
+    onRename: (current: NamedPlace?, name: String) -> Unit,
+    onUpdatePlace: (NamedPlace) -> Unit,
+    onMergePlaces: (target: NamedPlace, other: NamedPlace) -> Unit,
+    onOpenDay: (String) -> Unit,
+) {
     val days = remember(history) { history?.visits.orEmpty().groupBy { dayKey(it.startedAt) }.toList() }
     val named = NamedPlaces.at(target.coordinate)
     var naming by remember { mutableStateOf(false) }
+    var merging by remember { mutableStateOf(false) }
     if (naming) PlaceNameDialog(named, onDismiss = { naming = false }) { name -> naming = false; onRename(named, name) }
+    if (merging && named != null) {
+        MergePlacesDialog(
+            target = named,
+            allPlaces = allPlaces,
+            onDismiss = { merging = false },
+            onAddAnchor = { anchor -> merging = false; onUpdatePlace(named.copy(anchors = (named.anchors + anchor).take(MAX_PLACE_ANCHORS), updatedAt = System.currentTimeMillis())) },
+            onMergeNamed = { other -> merging = false; onMergePlaces(named, other) },
+        )
+    }
     val maxListHeight = with(LocalDensity.current) { (LocalWindowInfo.current.containerSize.height * 0.6f).toDp() }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -648,7 +785,8 @@ internal fun PlaceHistorySheet(history: StayVisitHistory?, target: PlaceHistoryT
             Column(Modifier.weight(1f)) {
                 Text(named?.name ?: "訪問履歴", style = MaterialTheme.typography.headlineSmall, color = AppColors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
-                    "${(if (named != null) target.label?.address ?: target.label?.placeName else target.label?.primary) ?: formatCoordinates(target.coordinate.latitude, target.coordinate.longitude)} · 100m以内の滞在",
+                    "${(if (named != null) target.label?.address ?: target.label?.placeName else target.label?.primary) ?: formatCoordinates(target.coordinate.latitude, target.coordinate.longitude)}"
+                        + if (named != null) " · 基準点${placeAnchors(named).size}か所" else " · 100m以内の滞在",
                     style = MaterialTheme.typography.bodySmall,
                     color = AppColors.inkSecondary,
                     maxLines = 1,
@@ -670,18 +808,25 @@ internal fun PlaceHistorySheet(history: StayVisitHistory?, target: PlaceHistoryT
             SummaryChip(Icons.Outlined.CalendarMonth, AppColors.teal, "${loaded.dayCount}日")
             SummaryChip(Icons.Outlined.History, AppColors.amber, "合計${activityDurationLabel(loaded.totalDurationMs)}")
         }
-        loaded.visits.lastOrNull()?.let { first ->
-            Text(
-                "${formatDate(dayKey(first.startedAt))}から記録",
-                style = MaterialTheme.typography.labelMedium,
-                color = AppColors.inkTertiary,
-                modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 4.dp),
-            )
-        }
         LazyColumn(
             Modifier.fillMaxWidth().heightIn(max = maxListHeight),
             contentPadding = PaddingValues(bottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding() + 16.dp),
         ) {
+            if (named != null) {
+                item(key = "place-settings") {
+                    PlaceSettings(named, onUpdate = onUpdatePlace, onMerge = { merging = true })
+                }
+            }
+            loaded.visits.lastOrNull()?.let { first ->
+                item(key = "place-start") {
+                    Text(
+                        "${formatDate(dayKey(first.startedAt))}から記録",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = AppColors.inkTertiary,
+                        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 4.dp),
+                    )
+                }
+            }
             items(days, key = { it.first }) { (day, visits) ->
                 Row(
                     Modifier.fillMaxWidth().clickable(onClickLabel = "この日を表示") { onOpenDay(day) }.padding(start = 20.dp, end = 16.dp, top = 10.dp, bottom = 10.dp),
@@ -698,6 +843,134 @@ internal fun PlaceHistorySheet(history: StayVisitHistory?, target: PlaceHistoryT
             }
         }
     }
+}
+
+/** The radius of a named place and the anchors added to it. */
+@Composable
+private fun PlaceSettings(place: NamedPlace, onUpdate: (NamedPlace) -> Unit, onMerge: () -> Unit) {
+    val radius = place.radiusMeters ?: DEFAULT_PLACE_RADIUS_METERS
+    val anchors = placeAnchors(place)
+    Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("半径", style = MaterialTheme.typography.labelLarge, color = AppColors.inkSecondary, modifier = Modifier.weight(1f))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf(50.0, 100.0, 200.0, 300.0).forEach { option ->
+                    val selected = kotlin.math.abs(radius - option) < 0.5
+                    Text(
+                        "${option.toInt()}m",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (selected) AppColors.onGreenContainer else AppColors.inkSecondary,
+                        modifier = Modifier.clip(CircleShape)
+                            .background(if (selected) AppColors.greenContainer else AppColors.surfaceMuted)
+                            .clickable(onClickLabel = "半径${option.toInt()}メートル") { onUpdate(place.copy(radiusMeters = option, updatedAt = System.currentTimeMillis())) }
+                            .padding(horizontal = 10.dp, vertical = 5.dp),
+                    )
+                }
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("基準点 ${anchors.size}か所", style = MaterialTheme.typography.labelLarge, color = AppColors.inkSecondary, modifier = Modifier.weight(1f))
+            TextButton(onClick = onMerge) { Text("近くの場所をまとめる") }
+        }
+        anchors.drop(1).forEach { anchor ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "${formatCoordinates(anchor.latitude, anchor.longitude)} · ${anchor.radiusMeters.toInt()}m",
+                    style = MaterialTheme.typography.bodySmall.tabular,
+                    color = AppColors.inkSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = {
+                    onUpdate(place.copy(anchors = place.anchors - anchor, updatedAt = System.currentTimeMillis()))
+                }) { Text("外す") }
+            }
+        }
+    }
+}
+
+private data class MergeCandidate(
+    val key: String,
+    val label: String,
+    val detail: String,
+    val distanceMeters: Double,
+    val coordinate: LatLng,
+    val namedPlace: NamedPlace?,
+)
+
+/** Places within a kilometer of [target], nearest first, ready to be merged into it. */
+@Composable
+private fun MergePlacesDialog(
+    target: NamedPlace,
+    allPlaces: List<AllTimeStayPlace>?,
+    onDismiss: () -> Unit,
+    onAddAnchor: (PlaceAnchor) -> Unit,
+    onMergeNamed: (NamedPlace) -> Unit,
+) {
+    val targetAnchors = placeAnchors(target)
+    val candidates = remember(target, allPlaces, NamedPlaces.places) {
+        val unnamed = allPlaces.orEmpty().filter { it.placeId == null }.map { place ->
+            val distance = targetAnchors.minOf { distanceMeters(LatLng(it.latitude, it.longitude), place.coordinate) }
+            MergeCandidate(
+                key = "stay:${place.id}",
+                label = formatCoordinates(place.coordinate.latitude, place.coordinate.longitude),
+                detail = "${place.visits.size}回 · ${formatDistance(distance)}",
+                distanceMeters = distance,
+                coordinate = place.coordinate,
+                namedPlace = null,
+            )
+        }
+        val named = NamedPlaces.places.filter { !it.deleted && it.id != target.id }.map { place ->
+            val anchors = placeAnchors(place)
+            val distance = targetAnchors.minOf { from ->
+                anchors.minOf { to -> distanceMeters(LatLng(from.latitude, from.longitude), LatLng(to.latitude, to.longitude)) }
+            }
+            MergeCandidate(
+                key = "named:${place.id}",
+                label = place.name,
+                detail = "名前付きの場所 · ${formatDistance(distance)}",
+                distanceMeters = distance,
+                coordinate = LatLng(place.latitude, place.longitude),
+                namedPlace = place,
+            )
+        }
+        (unnamed + named).filter { it.distanceMeters <= 1000.0 }.sortedBy(MergeCandidate::distanceMeters)
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("近くの場所をまとめる", style = MaterialTheme.typography.dialogTitle) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    "1km以内の場所を近い順に表示します。まとめると、その場所の基準点に追加されます。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = AppColors.inkSecondary,
+                )
+                if (candidates.isEmpty()) {
+                    Text("1km以内にまとめられる場所はありません", style = MaterialTheme.typography.bodyMedium, color = AppColors.inkTertiary)
+                }
+                candidates.forEach { candidate ->
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clip(MaterialTheme.shapes.small)
+                            .clickable(onClickLabel = "まとめる") {
+                                candidate.namedPlace?.let(onMergeNamed) ?: onAddAnchor(PlaceAnchor(candidate.coordinate.latitude, candidate.coordinate.longitude, DEFAULT_PLACE_RADIUS_METERS))
+                            }
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconBadge(Icons.Outlined.Place, AppColors.green, AppColors.greenContainer, size = 36.dp, iconSize = 18.dp)
+                        Column(Modifier.weight(1f).padding(start = 10.dp)) {
+                            Text(candidate.label, style = MaterialTheme.typography.bodyLarge, color = AppColors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(candidate.detail, style = MaterialTheme.typography.bodySmall.tabular, color = AppColors.inkSecondary)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("閉じる") } },
+    )
 }
 
 /** Names a place, renames it, or removes its name (an empty name). */

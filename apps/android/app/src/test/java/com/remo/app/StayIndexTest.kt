@@ -120,4 +120,57 @@ class StayIndexTest {
         assertEquals(direct.dayCount, fromIndex.dayCount)
         assertEquals(direct.totalDurationMs, fromIndex.totalDurationMs)
     }
+
+    @Test fun dayStaysFollowJoinAndNotStayCorrections() = runBlocking {
+        val logs = samples("home", at("2026-09-01T12:00:00Z"), 3, 10 * minute) +
+            samples("work", at("2026-09-01T13:00:00Z"), 3, 10 * minute, latitude = 35.69, longitude = 139.78)
+        assertEquals(2, detectDayStays(logs).size)
+
+        val join = TimelineCorrection(
+            id = "c-join",
+            kind = TimelineCorrectionKind.JOIN_STAY,
+            startedAt = at("2026-09-01T12:00:00Z"),
+            endedAt = at("2026-09-01T13:20:00Z"),
+            createdAt = 1L,
+        )
+        val joined = detectDayStays(logs, listOf(join))
+        assertEquals(1, joined.size)
+        assertEquals(at("2026-09-01T12:00:00Z"), joined.single().startedAt)
+        assertEquals(at("2026-09-01T13:20:00Z"), joined.single().endedAt)
+
+        val notStay = join.copy(id = "c-not-stay", kind = TimelineCorrectionKind.NOT_STAY, startedAt = at("2026-09-01T12:00:00Z"), endedAt = at("2026-09-01T12:20:00Z"))
+        assertEquals(1, detectDayStays(logs, listOf(notStay)).size)
+    }
+
+    @Test fun staysAtOneNamedPlaceAreGroupedEvenAcrossItsAnchors() = runBlocking {
+        val place = NamedPlace(
+            id = "p-home-work",
+            name = "Home and work",
+            latitude = 35.6812,
+            longitude = 139.7671,
+            radiusMeters = 100.0,
+            anchors = listOf(PlaceAnchor(35.69, 139.78, 100.0)),
+        )
+        val places = buildAllTimeStayPlaces(staysOf(history()), listOf(place))
+
+        assertEquals(1, places.size)
+        assertEquals("p-home-work", places.single().placeId)
+        assertEquals(35.6812, places.single().coordinate.latitude, 1e-9)
+        assertEquals(139.7671, places.single().coordinate.longitude, 1e-9)
+        assertEquals(4, places.single().visits.size)
+        assertEquals(4, places.single().dayCount)
+    }
+
+    @Test fun visitHistoryAtANamedPlaceIncludesEveryAnchor() = runBlocking {
+        val place = NamedPlace(
+            id = "p-home-work",
+            name = "Home and work",
+            latitude = 35.6812,
+            longitude = 139.7671,
+            anchors = listOf(PlaceAnchor(35.69, 139.78, 100.0)),
+        )
+        val history = stayVisitHistoryFromStays(staysOf(history()), LatLng(35.69, 139.78), listOf(place))
+        assertEquals(4, history.visits.size)
+        assertEquals(4, history.dayCount)
+    }
 }

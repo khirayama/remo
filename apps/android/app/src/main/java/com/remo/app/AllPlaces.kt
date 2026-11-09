@@ -297,7 +297,7 @@ internal fun AllPlacesSheetContent(
             item(key = "label") {
                 Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     SectionLabel("訪問回数の多い順", Modifier.weight(1f))
-                    Text("100m以内は同じ場所", style = MaterialTheme.typography.labelMedium, color = AppColors.inkTertiary)
+                    Text("名前付きの場所は基準点ごとにまとめています", style = MaterialTheme.typography.labelMedium, color = AppColors.inkTertiary)
                 }
             }
             items(places, key = { it.id }) { place ->

@@ -30,12 +30,8 @@ data class StayPlaceLabel(
 object NamedPlaces {
     var places: List<NamedPlace> by androidx.compose.runtime.mutableStateOf(emptyList())
 
-    /** The named place at [coordinate], if there is one within the stay-place radius. */
-    fun at(coordinate: LatLng): NamedPlace? = places.asSequence()
-        .filterNot(NamedPlace::deleted)
-        .map { it to distanceMeters(LatLng(it.latitude, it.longitude), coordinate) }
-        .filter { it.second <= STAY_PLACE_RADIUS_METERS }
-        .minByOrNull { it.second }?.first
+    /** The named place at [coordinate], from any of its anchors. */
+    fun at(coordinate: LatLng): NamedPlace? = matchPlace(places, coordinate)?.place
 }
 
 /** The label to show for a place: the user's name for it when there is one, over the geocoder's. */

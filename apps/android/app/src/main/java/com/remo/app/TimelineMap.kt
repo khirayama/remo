@@ -835,6 +835,21 @@ private fun photoMarkerIcon(context: Context, thumbnail: Bitmap?, photoCount: In
             glyph.draw(canvas)
         }
     }
+    if (thumbnail != null && isVideo) {
+        // A poster frame looks like a photo marker; a small play glyph keeps a
+        // video (local or backed up) readable as video.
+        val badgeX = center - radius * 0.6f
+        val badgeY = center + radius * 0.6f
+        val badgeRadius = 6 * density
+        canvas.drawCircle(badgeX, badgeY, badgeRadius, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = android.graphics.Color.argb(150, 0, 0, 0) })
+        val play = Path().apply {
+            moveTo(badgeX - 1.6f * density, badgeY - 2.6f * density)
+            lineTo(badgeX - 1.6f * density, badgeY + 2.6f * density)
+            lineTo(badgeX + 2.8f * density, badgeY)
+            close()
+        }
+        canvas.drawPath(play, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = android.graphics.Color.WHITE })
+    }
     if (photoCount > 1) {
         val label = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = android.graphics.Color.WHITE; textSize = 10 * density; textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD }
         val text = if (photoCount > 99) "99+" else photoCount.toString()

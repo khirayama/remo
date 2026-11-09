@@ -100,6 +100,12 @@ data class NamedPlace(
     val longitude: Double,
     val updatedAt: Long = System.currentTimeMillis(),
     val deleted: Boolean = false,
+    /** The radius of the first anchor; [DEFAULT_PLACE_RADIUS_METERS] when absent. */
+    val radiusMeters: Double? = null,
+    /** Further points merged into the place, after the first anchor. */
+    val anchors: List<PlaceAnchor> = emptyList(),
+    /** Set on a place removed by a merge: the id of the place it was merged into. */
+    val mergedInto: String? = null,
 )
 
 /** A deletion waiting to be sent, with the hints that tell the server where the record is stored. */
@@ -125,7 +131,7 @@ data class RangeSummary(val locationCount: Int, val photoCount: Int)
  */
 class LogStore internal constructor(context: Context, databaseName: String = "rem_logs.db", legacyStorageName: String = STORAGE_NAME) {
     private val preferences = context.getSharedPreferences(legacyStorageName, Context.MODE_PRIVATE)
-    private val helper = object : SQLiteOpenHelper(context, databaseName, null, 4) {
+    private val helper = object : SQLiteOpenHelper(context, databaseName, null, 5) {
         override fun onCreate(db: SQLiteDatabase) {
             createTables(db)
         }
@@ -133,6 +139,9 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
             if (oldVersion < 2) db.execSQL("ALTER TABLE deleted ADD COLUMN synced INTEGER NOT NULL DEFAULT 0")
             if (oldVersion < 3) db.execSQL("CREATE TABLE pending_upserts (id TEXT PRIMARY KEY NOT NULL, updated_at INTEGER NOT NULL)")
             if (oldVersion < 4) migrateToTypedColumns(db)
+            // migrateToTypedColumns creates the current tables; only version 4
+            // needs the new place columns and the corrections table added.
+            if (oldVersion == 4) migrateCorrections(db)
         }
     }.apply { setWriteAheadLoggingEnabled(true) }
     private val mutex = Mutex()
@@ -284,7 +293,7 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
 
     suspend fun clearAll() = access { db ->
         transaction(db) {
-            listOf("entries", "deleted", "dirty_days", "places").forEach { db.delete(it, null, null) }
+            listOf("entries", "deleted", "dirty_days", "places", "corrections").forEach { db.delete(it, null, null) }
         }
         preferences.edit { remove(ENTRIES_KEY); remove(PENDING_DELETES_KEY) }
         Snapshot.withMutableSnapshot { revision += 1; generation += 1; hasPendingChanges = false }
@@ -406,7 +415,7 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
     // ---- Places -----------------------------------------------------------------
 
     suspend fun places(): List<NamedPlace> = access { db ->
-        db.rawQuery("SELECT id, name, latitude, longitude, updated_at, deleted FROM places", null).use(::readPlaces)
+        db.rawQuery("SELECT id, name, latitude, longitude, updated_at, deleted, radius_meters, anchors, merged_into FROM places", null).use(::readPlaces)
     }
 
     suspend fun putPlace(place: NamedPlace) = access { db ->
@@ -415,7 +424,7 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
     }
 
     suspend fun dirtyPlaces(): List<NamedPlace> = access { db ->
-        db.rawQuery("SELECT id, name, latitude, longitude, updated_at, deleted FROM places WHERE synced_epoch < ?", arrayOf(epoch.toString())).use(::readPlaces)
+        db.rawQuery("SELECT id, name, latitude, longitude, updated_at, deleted, radius_meters, anchors, merged_into FROM places WHERE synced_epoch < ?", arrayOf(epoch.toString())).use(::readPlaces)
     }
 
     suspend fun markPlacesSynced(sent: List<NamedPlace>) = access { db ->
@@ -440,6 +449,97 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
         changed
     }
 
+    /** Takes imported places: a place this device has is replaced only by a newer one. */
+    suspend fun importPlaces(places: List<NamedPlace>): Int = access { db ->
+        var changed = 0
+        transaction(db) {
+            places.forEach { imported ->
+                val local = db.rawQuery("SELECT updated_at FROM places WHERE id = ?", arrayOf(imported.id)).use { if (it.moveToFirst()) it.getLong(0) else null }
+                if (local != null && local >= imported.updatedAt) return@forEach
+                writePlace(db, imported, syncedEpoch = 0)
+                changed += 1
+            }
+        }
+        if (changed > 0) published(db)
+        changed
+    }
+
+    // ---- Corrections ------------------------------------------------------------
+
+    suspend fun corrections(): List<TimelineCorrection> = access { db ->
+        db.rawQuery("SELECT id, kind, started_at, ended_at, created_at, source, deleted FROM corrections ORDER BY created_at, id", null).use(::readCorrections)
+    }
+
+    /** Stores a correction created, or marked deleted, on this device. */
+    suspend fun putCorrection(correction: TimelineCorrection) = access { db ->
+        transaction(db) {
+            writeCorrection(db, correction, syncedEpoch = 0)
+            markDaysInRange(db, correction.startedAt, correction.endedAt)
+        }
+        published(db)
+    }
+
+    /** Corrections that have not been uploaded in the current epoch. */
+    suspend fun dirtyCorrections(limit: Int): List<TimelineCorrection> = access { db ->
+        db.rawQuery(
+            "SELECT id, kind, started_at, ended_at, created_at, source, deleted FROM corrections WHERE synced_epoch < ? LIMIT ?",
+            arrayOf(epoch.toString(), limit.toString()),
+        ).use(::readCorrections)
+    }
+
+    suspend fun markCorrectionsSynced(sent: List<TimelineCorrection>) = access { db ->
+        transaction(db) {
+            // A correction deleted while the request was in flight is not the one
+            // the server acknowledged, so it stays queued.
+            sent.forEach { db.execSQL("UPDATE corrections SET synced_epoch = ? WHERE id = ? AND created_at = ? AND deleted = ?", arrayOf<Any>(epoch, it.id, it.createdAt, if (it.deleted) 1 else 0)) }
+        }
+        refreshPending(db)
+    }
+
+    /**
+     * Applies what a download returned: a correction this device does not have
+     * is added; one the server has deleted is deleted here too. Returns whether
+     * anything changed.
+     */
+    suspend fun applyRemoteCorrections(corrections: List<TimelineCorrection>): Boolean = access { db ->
+        var changed = false
+        transaction(db) {
+            corrections.forEach { remote ->
+                val local = db.rawQuery(
+                    "SELECT id, kind, started_at, ended_at, created_at, source, deleted FROM corrections WHERE id = ?",
+                    arrayOf(remote.id),
+                ).use(::readCorrections).firstOrNull()
+                if (local == null) {
+                    writeCorrection(db, remote.copy(deleted = remote.deleted), syncedEpoch = epoch)
+                    markDaysInRange(db, remote.startedAt, remote.endedAt)
+                    changed = true
+                } else if (remote.deleted && !local.deleted) {
+                    db.execSQL("UPDATE corrections SET deleted = 1, synced_epoch = ? WHERE id = ?", arrayOf<Any>(epoch, remote.id))
+                    markDaysInRange(db, local.startedAt, local.endedAt)
+                    changed = true
+                }
+            }
+        }
+        if (changed) published(db)
+        changed
+    }
+
+    /** Adds imported corrections this device does not have yet. */
+    suspend fun importCorrections(corrections: List<TimelineCorrection>): Int = access { db ->
+        var changed = 0
+        transaction(db) {
+            corrections.forEach { imported ->
+                val exists = db.rawQuery("SELECT 1 FROM corrections WHERE id = ?", arrayOf(imported.id)).use { it.moveToFirst() }
+                if (exists) return@forEach
+                writeCorrection(db, imported, syncedEpoch = 0)
+                markDaysInRange(db, imported.startedAt, imported.endedAt)
+                changed += 1
+            }
+        }
+        if (changed > 0) published(db)
+        changed
+    }
+
     // ---- Internals --------------------------------------------------------------
 
     private fun published(db: SQLiteDatabase) {
@@ -454,7 +554,7 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
 
     private fun pendingIn(db: SQLiteDatabase): Boolean =
         db.rawQuery(
-            "SELECT EXISTS (SELECT 1 FROM entries WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM deleted WHERE synced = 0) OR EXISTS (SELECT 1 FROM places WHERE synced_epoch < ?1)",
+            "SELECT EXISTS (SELECT 1 FROM entries WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM deleted WHERE synced = 0) OR EXISTS (SELECT 1 FROM places WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM corrections WHERE synced_epoch < ?1)",
             arrayOf(epoch.toString()),
         ).use { it.moveToFirst() && it.getInt(0) != 0 }
 
@@ -478,6 +578,18 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
         db.insertWithOnConflict("dirty_days", null, ContentValues().apply { put("day", dayKey(time)); put("token", System.nanoTime()) }, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
+    /** A correction touches every local day its range covers. */
+    private fun markDaysInRange(db: SQLiteDatabase, startedAt: Long, endedAt: Long) {
+        var day = dayKey(minOf(startedAt, endedAt))
+        val last = dayKey(maxOf(startedAt, endedAt))
+        var guard = 0
+        while (day <= last && guard < 400) {
+            db.insertWithOnConflict("dirty_days", null, ContentValues().apply { put("day", day); put("token", System.nanoTime()) }, SQLiteDatabase.CONFLICT_REPLACE)
+            day = dayKey((parseDate(day).clone() as java.util.Calendar).apply { add(java.util.Calendar.DAY_OF_MONTH, 1) }.timeInMillis)
+            guard += 1
+        }
+    }
+
     private fun writeEntry(db: SQLiteDatabase, entry: LogEntry, syncedEpoch: Long) {
         entryOf(db, entry.id)?.takeIf { it.startedAt != entry.startedAt }?.let { markDay(db, it.startedAt) }
         markDay(db, entry.startedAt)
@@ -489,12 +601,63 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
         db.insertWithOnConflict("places", null, ContentValues().apply {
             put("id", place.id); put("name", place.name); put("latitude", place.latitude); put("longitude", place.longitude)
             put("updated_at", place.updatedAt); put("deleted", if (place.deleted) 1 else 0); put("synced_epoch", syncedEpoch)
+            put("radius_meters", place.radiusMeters)
+            put("anchors", if (place.anchors.isEmpty()) null else JSONArray().apply {
+                place.anchors.forEach { anchor ->
+                    put(JSONObject().put("latitude", anchor.latitude).put("longitude", anchor.longitude).put("radiusMeters", anchor.radiusMeters))
+                }
+            }.toString())
+            put("merged_into", place.mergedInto)
         }, SQLiteDatabase.CONFLICT_REPLACE).also { check(it != -1L) { "場所の名前を保存できませんでした" } }
     }
 
     private fun readPlaces(cursor: Cursor): List<NamedPlace> = buildList {
         while (cursor.moveToNext()) {
-            add(NamedPlace(cursor.getString(0), cursor.getString(1), cursor.getDouble(2), cursor.getDouble(3), cursor.getLong(4), cursor.getInt(5) != 0))
+            add(NamedPlace(
+                id = cursor.getString(0),
+                name = cursor.getString(1),
+                latitude = cursor.getDouble(2),
+                longitude = cursor.getDouble(3),
+                updatedAt = cursor.getLong(4),
+                deleted = cursor.getInt(5) != 0,
+                radiusMeters = if (cursor.isNull(6)) null else cursor.getDouble(6),
+                anchors = if (cursor.isNull(7)) emptyList() else decodeAnchors(cursor.getString(7)),
+                mergedInto = if (cursor.isNull(8)) null else cursor.getString(8),
+            ))
+        }
+    }
+
+    private fun decodeAnchors(value: String): List<PlaceAnchor> = runCatching {
+        val array = JSONArray(value)
+        (0 until array.length()).mapNotNull { index ->
+            val item = array.optJSONObject(index) ?: return@mapNotNull null
+            val latitude = item.optDouble("latitude").takeIf(Double::isFinite) ?: return@mapNotNull null
+            val longitude = item.optDouble("longitude").takeIf(Double::isFinite) ?: return@mapNotNull null
+            PlaceAnchor(latitude, longitude, item.optDouble("radiusMeters", DEFAULT_PLACE_RADIUS_METERS))
+        }
+    }.getOrElse { emptyList() }
+
+    private fun writeCorrection(db: SQLiteDatabase, correction: TimelineCorrection, syncedEpoch: Long) {
+        db.insertWithOnConflict("corrections", null, ContentValues().apply {
+            put("id", correction.id); put("kind", correction.kind.wireValue)
+            put("started_at", correction.startedAt); put("ended_at", correction.endedAt)
+            put("created_at", correction.createdAt); put("source", correction.source.wireValue)
+            put("deleted", if (correction.deleted) 1 else 0); put("synced_epoch", syncedEpoch)
+        }, SQLiteDatabase.CONFLICT_REPLACE).also { check(it != -1L) { "補正を保存できませんでした" } }
+    }
+
+    private fun readCorrections(cursor: Cursor): List<TimelineCorrection> = buildList {
+        while (cursor.moveToNext()) {
+            val kind = timelineCorrectionKind(cursor.getString(1)) ?: continue
+            add(TimelineCorrection(
+                id = cursor.getString(0),
+                kind = kind,
+                startedAt = cursor.getLong(2),
+                endedAt = cursor.getLong(3),
+                createdAt = cursor.getLong(4),
+                source = correctionSource(cursor.getString(5)),
+                deleted = cursor.getInt(6) != 0,
+            ))
         }
     }
 
@@ -563,8 +726,28 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
             db.execSQL("CREATE INDEX entries_photo ON entries(started_at) WHERE source = 'photo'")
             db.execSQL("CREATE TABLE deleted (id TEXT PRIMARY KEY NOT NULL, synced INTEGER NOT NULL DEFAULT 0, deleted_at INTEGER, started_at INTEGER, source TEXT)")
             db.execSQL("CREATE TABLE dirty_days (day TEXT PRIMARY KEY NOT NULL, token INTEGER NOT NULL)")
-            db.execSQL("CREATE TABLE places (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, synced_epoch INTEGER NOT NULL DEFAULT 0)")
+            db.execSQL("CREATE TABLE places (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, synced_epoch INTEGER NOT NULL DEFAULT 0, radius_meters REAL, anchors TEXT, merged_into TEXT)")
             db.execSQL("CREATE TABLE metadata (name TEXT PRIMARY KEY NOT NULL, value TEXT)")
+            createCorrectionsTable(db)
+        }
+
+        private fun createCorrectionsTable(db: SQLiteDatabase) {
+            db.execSQL(
+                """CREATE TABLE corrections (
+                    id TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, started_at INTEGER NOT NULL,
+                    ended_at INTEGER NOT NULL, created_at INTEGER NOT NULL, source TEXT NOT NULL,
+                    deleted INTEGER NOT NULL DEFAULT 0, synced_epoch INTEGER NOT NULL DEFAULT 0)""",
+            )
+            db.execSQL("CREATE INDEX corrections_sync ON corrections(synced_epoch)")
+            db.execSQL("CREATE INDEX corrections_time ON corrections(started_at, ended_at)")
+        }
+
+        /** Version 4 stored only a place's name and coordinate. */
+        private fun migrateCorrections(db: SQLiteDatabase) {
+            db.execSQL("ALTER TABLE places ADD COLUMN radius_meters REAL")
+            db.execSQL("ALTER TABLE places ADD COLUMN anchors TEXT")
+            db.execSQL("ALTER TABLE places ADD COLUMN merged_into TEXT")
+            createCorrectionsTable(db)
         }
 
         /**
