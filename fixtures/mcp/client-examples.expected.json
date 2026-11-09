@@ -1,0 +1,29 @@
+{
+  "examples": [
+    {
+      "name": "Claude Code",
+      "location": "ターミナル",
+      "snippet": "claude mcp add --transport http remo https://remo.example.test/api/mcp --header \"Authorization: Bearer rm_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_abc\""
+    },
+    {
+      "name": "Codex",
+      "location": "~/.codex/config.toml",
+      "snippet": "[mcp_servers.remo]\nurl = \"https://remo.example.test/api/mcp\"\nhttp_headers = { \"Authorization\" = \"Bearer rm_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_abc\" }"
+    },
+    {
+      "name": "Cursor",
+      "location": "~/.cursor/mcp.json",
+      "snippet": "{\n  \"mcpServers\": {\n    \"remo\": {\n      \"url\": \"https://remo.example.test/api/mcp\",\n      \"headers\": {\n        \"Authorization\": \"Bearer rm_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_abc\"\n      }\n    }\n  }\n}"
+    },
+    {
+      "name": "VS Code",
+      "location": "MCP: Open User Configuration",
+      "snippet": "{\n  \"servers\": {\n    \"remo\": {\n      \"type\": \"http\",\n      \"url\": \"https://remo.example.test/api/mcp\",\n      \"headers\": {\n        \"Authorization\": \"Bearer rm_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_abc\"\n      }\n    }\n  }\n}"
+    },
+    {
+      "name": "Gemini CLI",
+      "location": "ターミナル",
+      "snippet": "gemini mcp add --scope user --transport http --header \"Authorization: Bearer rm_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_Ab1-_abc\" remo https://remo.example.test/api/mcp"
+    }
+  ]
+}

@@ -5,6 +5,8 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-18",
   "compatibility_flags": ["nodejs_compat"],
+  // The MCP tools run the web app's timeline algorithm (src/types/timeline-map.d.ts).
+  "alias": { "@remo/timeline-map": "../web/src/timeline-map.ts" },
   "observability": { "enabled": true },
   "d1_databases": [
     {
