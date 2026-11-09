@@ -41,25 +41,49 @@ final class PhotoTimelineIndexer: ObservableObject {
         status = assets.isEmpty ? "写真・動画がありません" : "写真・動画をタイムラインに追加中…"
         defer { isIndexing = false }
 
-        let previous = Self.assignments ?? index.assignments()
+        let previous = index.assignedPhotos()
+        let previousAssignments = previous.mapValues { $0.eventID }
         let sessionGrouping = index.sessionGrouping
+        let libraryIDs = Set(assets.map(\.localIdentifier))
+
+        // A photo deleted from the library keeps its record (and cloud
+        // preview) when its preview was already uploaded. This is decided
+        // before grouping so the record is not stale in this same scan. Only a
+        // full, non-empty library view is trusted to show real deletions.
+        let archive = updateArchivedPhotos(
+            previous: previous,
+            libraryIDs: libraryIDs,
+            archived: index.archivedPhotos(),
+            trustDeletions: authorization == .authorized && !assets.isEmpty && sessionGrouping,
+        )
+        if !archive.restored.isEmpty { index.removeArchived(assetIDs: Array(archive.restored.keys)) }
+        index.archive(archive.added)
+
         var photos: [GroupablePhoto] = []
-        photos.reserveCapacity(assets.count)
+        photos.reserveCapacity(assets.count + archive.archived.count)
         for asset in assets {
             if Task.isCancelled { return PhotoImportResult(entries: []) }
-            photos.append(Self.groupable(asset, previousEventID: previous[asset.localIdentifier]))
+            let id = asset.localIdentifier
+            // An asset restored from Recently Deleted keeps the record it had
+            // while it was archived.
+            photos.append(Self.groupable(asset, previousEventID: previous[id]?.eventID ?? archive.restored[id]))
             progress += 1
             if progress.isMultiple(of: 500) {
                 status = "写真をタイムラインに追加中… (\(progress))/\(total)"
                 await Task.yield()
             }
         }
+        // Archived photos group exactly like library photos, so their record
+        // keeps the same id, start time, location and count.
+        for photo in archive.archived.values {
+            photos.append(GroupablePhoto(id: photo.id, takenAt: photo.takenAt, mediaType: photo.mediaType, coordinate: photo.coordinate, previousEventID: photo.eventID))
+        }
 
         let groups = groupLibraryPhotos(photos, existingEventIDs: existingEventIDs, legacyEventID: sessionGrouping ? nil : { photo in
             legacyPhotoEventID(takenAt: photo.takenAt, coordinate: photo.coordinate, mediaType: photo.mediaType)
         })
         var assigned: [String: String] = [:]
-        for group in groups { for id in group.photoIDs { assigned[id] = group.eventID } }
+        for group in groups { for id in group.photoIDs where libraryIDs.contains(id) { assigned[id] = group.eventID } }
         let now = Date()
         let entries = groups.map { group in
             LogEntry(id: group.eventID, startedAt: group.startedAt, latitude: group.latitude, longitude: group.longitude, originalLatitude: group.latitude, originalLongitude: group.longitude, locationSource: hasUsableCoordinates(group.latitude, group.longitude) ? .exif : nil, mediaType: group.mediaType, photoCount: group.count, source: .photo, updatedAt: now)
@@ -70,15 +94,15 @@ final class PhotoTimelineIndexer: ObservableObject {
         // Only full library access shows every photo.
         let current = Set(groups.map(\.eventID))
         let legacy = sessionGrouping ? Set<String>() : Set(photos.map { legacyPhotoEventID(takenAt: $0.takenAt, coordinate: $0.coordinate, mediaType: $0.mediaType) })
-        let stale = authorization == .authorized && !assets.isEmpty ? Set(previous.values).union(legacy).subtracting(current) : []
+        let stale = authorization == .authorized && !assets.isEmpty ? Set(previousAssignments.values).union(legacy).subtracting(current) : []
 
         // Records that lost a photo since the last scan. As with stale records,
         // only full library access shows every photo.
         let shrunk = authorization == .authorized && !assets.isEmpty
-            ? Set(previous.filter { assigned[$0.key] != $0.value }.values)
+            ? Set(previousAssignments.filter { assigned[$0.key] != $0.value }.values)
             : []
-        if assigned != previous || !sessionGrouping {
-            index.replaceAssignments(assigned, changedEvents: shrunk)
+        if assigned != previousAssignments || !sessionGrouping || !index.hasAssetMetadata {
+            index.replaceAssignments(assigned, photos: photos.filter { libraryIDs.contains($0.id) }, changedEvents: shrunk)
             Self.generation += 1
         }
         Self.assignments = assigned

@@ -18,6 +18,47 @@ struct GroupablePhoto {
     let previousEventID: String?
 }
 
+/// What one scan changed in the archived photos: the rows to keep (photos
+/// still missing from the library plus the ones that just left it), the
+/// assets that came back, and the rows to insert.
+struct PhotoArchiveUpdate {
+    let archived: [String: ArchivedPhoto]
+    /// Asset id to the record id it had while archived; a restored photo keeps it.
+    let restored: [String: String]
+    let added: [ArchivedPhoto]
+}
+
+/// Works out which photos left the library but can stay in their record.
+/// Only a full library view is trusted to show deletions (`trustDeletions`),
+/// and only a photo whose preview was already uploaded has a digest worth
+/// keeping. An asset without one stays missing: its record shrinks or becomes
+/// stale exactly as before. A photo found in the library again wins over its
+/// archived row. The result is computed before grouping, so the record of a
+/// just-deleted photo is not treated as stale.
+func updateArchivedPhotos(previous: [String: IndexedPhoto], libraryIDs: Set<String>, archived: [String: ArchivedPhoto], trustDeletions: Bool) -> PhotoArchiveUpdate {
+    var kept = archived.filter { !libraryIDs.contains($0.key) }
+    var restored: [String: String] = [:]
+    for (id, photo) in archived where libraryIDs.contains(id) { restored[id] = photo.eventID }
+    var added: [ArchivedPhoto] = []
+    if trustDeletions {
+        for (id, photo) in previous where !libraryIDs.contains(id) {
+            guard !photo.digest.isEmpty, let takenAt = photo.takenAt else { continue }
+            let row = ArchivedPhoto(
+                id: id,
+                eventID: photo.eventID,
+                takenAt: takenAt,
+                latitude: photo.latitude,
+                longitude: photo.longitude,
+                mediaType: photo.mediaType ?? .photo,
+                digest: photo.digest,
+            )
+            if kept[id] == nil { added.append(row) }
+            kept[id] = row
+        }
+    }
+    return PhotoArchiveUpdate(archived: kept, restored: restored, added: added)
+}
+
 struct PhotoGroupAssignment {
     let eventID: String
     let photoIDs: [String]

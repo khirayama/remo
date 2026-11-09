@@ -93,6 +93,14 @@ private struct RemotePhotoTile: View {
                 .background(RemoStyle.amberContainer)
             }
             .clipShape(RoundedRectangle(cornerRadius: RemoRadius.small))
+            // A remote tile has no local PHAsset to tell it from a photo, so
+            // the record's kind carries the play badge instead.
+            .overlay(alignment: .bottomLeading) {
+                if entry.mediaType == .video {
+                    Image(systemName: "play.circle").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
+                        .padding(4)
+                }
+            }
             .task(id: digest) { image = await PhotoBackup.remoteImage(eventID: entry.id, digest: digest) }
     }
 }

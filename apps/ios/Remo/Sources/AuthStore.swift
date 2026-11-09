@@ -126,6 +126,23 @@ final class AuthStore: ObservableObject {
         return nil
     }
 
+    /// A request to the API with the signed-in session. A rejected session
+    /// (401) throws `APIRequestError.unauthorized`; the caller ends it.
+    func sessionRequest(_ path: String, method: String = "GET", json: [String: Any]? = nil) async throws -> (Data, HTTPURLResponse) {
+        guard let token else { throw APIRequestError.unauthorized }
+        var request = URLRequest(url: endpointURL(path))
+        request.httpMethod = method
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let json {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: json)
+        }
+        let (data, response) = try await AppConfig.session.data(for: request)
+        let http = try httpResponse(response)
+        if http.statusCode == 401 { throw APIRequestError.unauthorized }
+        return (data, http)
+    }
+
     private func restoreSession() async {
         guard let token else {
             Self.clearStoredUserID()
@@ -237,6 +254,10 @@ private extension String {
 
 private struct APIResponse<T: Decodable>: Decodable {
     let data: T
+}
+
+enum APIRequestError: Error {
+    case unauthorized
 }
 
 private enum AuthError: LocalizedError {

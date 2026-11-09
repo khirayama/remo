@@ -268,6 +268,33 @@ final class StorageAndGroupingTests: XCTestCase {
         XCTAssertEqual(sleepSessionsEnding(in: sleepDay, asleep: [], inBed: [sleep(23, 30)]), [sleep(23, 30)])
     }
 
+    func testSleepBackupReadsEverythingWithoutACursorAndAWeekBackWithOne() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let first = SleepBackup.backupRange(cursor: nil, now: now)
+        XCTAssertEqual(first.lowerBound, SleepBackup.earliest)
+        XCTAssertEqual(first.upperBound, now.addingTimeInterval(86_400))
+        let next = SleepBackup.backupRange(cursor: 1_699_000_000_000, now: now)
+        XCTAssertEqual(next.lowerBound, Date(timeIntervalSince1970: 1_699_000_000 - 7 * 86_400))
+        XCTAssertEqual(next.upperBound, now.addingTimeInterval(86_400))
+    }
+
+    func testSleepBackupPayloadIsStableByStartTime() {
+        let session = SleepSession(startedAt: Date(timeIntervalSince1970: 1_700_000_000.5), endedAt: Date(timeIntervalSince1970: 1_700_028_800))
+        let payload = SleepBackup.payload(session)
+        XCTAssertEqual(payload["id"] as? String, "sleep:1700000000500")
+        XCTAssertEqual(payload["startedAt"] as? Int64, 1_700_000_000_500)
+        XCTAssertEqual(payload["endedAt"] as? Int64, 1_700_028_800_000)
+        XCTAssertEqual(payload["updatedAt"] as? Int64, 1_700_028_800_000)
+    }
+
+    func testSleepBackupCursorFollowsTheLatestEndOrNow() {
+        let now = Date(timeIntervalSince1970: 1_700_100_000)
+        let early = SleepSession(startedAt: Date(timeIntervalSince1970: 1_700_000_000), endedAt: Date(timeIntervalSince1970: 1_700_010_000))
+        let late = SleepSession(startedAt: Date(timeIntervalSince1970: 1_700_050_000), endedAt: Date(timeIntervalSince1970: 1_700_060_000))
+        XCTAssertEqual(SleepBackup.nextCursor(sent: [late, early], now: now), 1_700_060_000_000)
+        XCTAssertEqual(SleepBackup.nextCursor(sent: [], now: now), 1_700_100_000_000)
+    }
+
     func testEmptySleepIsIgnored() {
         XCTAssertEqual(sleepSessionsEnding(in: sleepDay, asleep: [sleep(30, 30)], inBed: [sleep(31, 31)]), [])
     }

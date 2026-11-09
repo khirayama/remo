@@ -96,7 +96,12 @@ final class LogStore: ObservableObject {
         }
     }
 
-    func delete(_ entry: LogEntry) { database.delete([entry.id]) }
+    func delete(_ entry: LogEntry) {
+        database.delete([entry.id])
+        // The record is gone for good: its archived photos must not bring it
+        // back on the next scan.
+        if entry.source == .photo { PhotoIndexDatabase.shared.removeArchived(eventIDs: [entry.id]) }
+    }
 
     func deleteAll(_ ids: Set<String>) { database.delete(Array(ids)) }
 
@@ -114,13 +119,9 @@ final class NamedPlaces: ObservableObject {
         if loaded != places { places = loaded }
     }
 
-    /// The named place at `coordinate`, if there is one within the stay-place radius.
+    /// The named place at `coordinate`: the nearest anchor whose radius reaches it.
     func place(at coordinate: CLLocationCoordinate2D) -> NamedPlace? {
-        places.lazy
-            .filter { !$0.deleted }
-            .map { ($0, distanceMeters(CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude), coordinate)) }
-            .filter { $0.1 <= stayPlaceRadiusMeters }
-            .min { $0.1 < $1.1 }?.0
+        matchPlace(places, coordinate)?.place
     }
 
     /// The label to show for a place: the user's name for it when there is one, over the geocoder's.
@@ -258,6 +259,7 @@ private struct TrackerHomeView: View {
     @EnvironmentObject private var auth: AuthStore
     @ObservedObject private var store = LogStore.shared
     @ObservedObject private var namedPlaces = NamedPlaces.shared
+    @ObservedObject private var corrections = TimelineCorrections.shared
     @StateObject private var automaticCapture = AutomaticCaptureService.shared
     @StateObject private var photoLibrary = PhotoLibraryStore()
     @StateObject private var photoIndexer = PhotoTimelineIndexer()
@@ -275,6 +277,7 @@ private struct TrackerHomeView: View {
     @State private var status: String?
     @State private var confirmingDeleteAll = false
     @State private var confirmingAccountDeletion = false
+    @State private var showingApiTokens = false
     @State private var accountDeletionPassword = ""
     @State private var showingExport = false
     @State private var exportRequested = false
@@ -314,6 +317,10 @@ private struct TrackerHomeView: View {
                 onEditPhoto: { selectedLog = $0 },
                 onOpenSettings: { withAnimation(.easeOut(duration: 0.25)) { showingSettings = true } },
                 onRenamePlace: renamePlace,
+                corrections: corrections.corrections,
+                onAddCorrection: addCorrection,
+                onRemoveCorrection: removeCorrection,
+                onSavePlaces: savePlaces,
                 stayIndex: stayIndex,
             )
             if showingSettings {
@@ -360,6 +367,7 @@ private struct TrackerHomeView: View {
         .onReceive(store.$revision) { _ in
             stayIndex.schedule(database: store.database)
             namedPlaces.reload(from: store.database)
+            corrections.reload(from: store.database)
         }
         .onChange(of: store.writeFailed) { _, failed in
             guard failed else { return }
@@ -394,6 +402,14 @@ private struct TrackerHomeView: View {
             ExportRangeSheet(startDate: $exportStartDate, endDate: $exportEndDate, count: exportCounts) { exportRequested = true }
         }
         .sheet(item: $exportFile) { file in ShareSheet(items: [file.url]) }
+        .sheet(isPresented: $showingApiTokens) {
+            ApiTokenSheet {
+                syncStatus = sessionExpiredStatus
+                status = "ログインの有効期限が切れました。設定からもう一度ログインしてください"
+                auth.expireSession()
+            }
+            .environmentObject(auth)
+        }
         .fileImporter(isPresented: $showingImportPicker, allowedContentTypes: [.json], allowsMultipleSelection: false) { result in
             Task { await importLogs(result) }
         }
@@ -481,6 +497,7 @@ private struct TrackerHomeView: View {
             onOpenAuth: { showingAuth = true },
             onSignOut: { Task { await auth.signOut() } },
             onDeleteAccount: { accountDeletionPassword = ""; confirmingAccountDeletion = true },
+            onApiTokens: { showingApiTokens = true },
         )
     }
 
@@ -546,10 +563,28 @@ private struct TrackerHomeView: View {
             name: name,
             latitude: current?.latitude ?? coordinate.latitude,
             longitude: current?.longitude ?? coordinate.longitude,
+            radiusMeters: current?.radiusMeters,
+            anchors: current?.anchors,
+            mergedInto: current?.mergedInto,
             // Whole milliseconds, like the backup keeps them.
             updatedAt: Date(timeIntervalSince1970: (Date().timeIntervalSince1970 * 1000).rounded() / 1000),
             deleted: name.isEmpty,
         ))
+        Task { await sync(force: true) }
+    }
+
+    private func savePlaces(_ places: [NamedPlace]) {
+        for place in places { store.database.putPlace(place) }
+        Task { await sync(force: true) }
+    }
+
+    private func addCorrection(_ kind: TimelineCorrectionKind, _ startedAt: Date, _ endedAt: Date) {
+        store.database.putCorrection(TimelineCorrection(kind: kind, startedAt: startedAt, endedAt: endedAt))
+        Task { await sync(force: true) }
+    }
+
+    private func removeCorrection(_ correction: TimelineCorrection) {
+        store.database.deleteCorrection(id: correction.id)
         Task { await sync(force: true) }
     }
 
@@ -632,13 +667,15 @@ private struct TrackerHomeView: View {
         let hasSecurityScope = url.startAccessingSecurityScopedResource()
         defer { if hasSecurityScope { url.stopAccessingSecurityScopedResource() } }
         do {
-            let imported = try await Task.detached(priority: .userInitiated) { try TimelineImport.decode(data: Data(contentsOf: url)) }.value
-            store.importAll(imported)
-            if let latest = imported.max(by: { $0.startedAt < $1.startedAt }) {
+            let imported = try await Task.detached(priority: .userInitiated) { try TimelineImport.decodeDocument(data: Data(contentsOf: url)) }.value
+            store.importAll(imported.entries)
+            store.database.importPlaces(imported.places)
+            store.database.importCorrections(imported.corrections)
+            if let latest = imported.entries.max(by: { $0.startedAt < $1.startedAt }) {
                 selectedDate = Calendar.current.startOfDay(for: latest.startedAt)
             }
             await sync(force: true)
-            status = "\(imported.count)件の記録を読み込みました"
+            status = "\(imported.entries.count)件の記録を読み込みました"
         } catch {
             status = (error as? TimelineImportError)?.localizedDescription ?? "インポートに失敗しました"
         }
@@ -791,8 +828,57 @@ enum TimelineExportWriter {
             try put(",\n  \"sleep\": ")
             try handle.write(contentsOf: try encoder.encode(sleep))
         }
+        // Corrections and names laid over the records in this range.
+        try put(",\n  \"places\": ")
+        try handle.write(contentsOf: try encoder.encode(database.places().filter { !$0.deleted }.map(ExportPlace.init)))
+        try put(",\n  \"corrections\": ")
+        try handle.write(contentsOf: try encoder.encode(database.corrections(from: from, to: to).filter { !$0.deleted }.map(ExportCorrection.init)))
         try put("\n}\n")
         return url
+    }
+}
+
+private struct ExportPlace: Encodable {
+    let id: String
+    let name: String
+    let latitude: Double
+    let longitude: Double
+    let radiusMeters: Double?
+    let anchors: [PlaceAnchor]?
+    let mergedInto: String?
+    let updatedAt: Int64
+    let deleted: Bool
+
+    init(_ place: NamedPlace) {
+        id = place.id
+        name = place.name
+        latitude = place.latitude
+        longitude = place.longitude
+        radiusMeters = place.radiusMeters
+        anchors = place.anchors
+        mergedInto = place.mergedInto
+        updatedAt = Int64((place.updatedAt.timeIntervalSince1970 * 1000).rounded())
+        deleted = place.deleted
+    }
+}
+
+private struct ExportCorrection: Encodable {
+    let id: String
+    let kind: String
+    let startedAt: Int64
+    let endedAt: Int64
+    let createdAt: Int64
+    let source: String
+    let deleted: Bool
+
+    init(_ correction: TimelineCorrection) {
+        id = correction.id
+        kind = correction.kind.rawValue
+        startedAt = Int64((correction.startedAt.timeIntervalSince1970 * 1000).rounded())
+        endedAt = Int64((correction.endedAt.timeIntervalSince1970 * 1000).rounded())
+        createdAt = correction.createdAt
+        source = correction.source.rawValue
+        deleted = correction.deleted
     }
 }
 
@@ -815,6 +901,14 @@ private enum TimelineImportError: LocalizedError {
     }
 }
 
+/// What an exported document holds. Importers that only want records can keep
+/// using `decode(data:)`; the app also takes the places and corrections.
+struct TimelineImportResult {
+    let entries: [LogEntry]
+    let places: [NamedPlace]
+    let corrections: [TimelineCorrection]
+}
+
 enum TimelineImport {
     private static let fractionalISO8601: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -824,6 +918,10 @@ enum TimelineImport {
     private static let ISO8601 = ISO8601DateFormatter()
 
     static func decode(data: Data, importedAt: Date = Date()) throws -> [LogEntry] {
+        try decodeDocument(data: data, importedAt: importedAt).entries
+    }
+
+    static func decodeDocument(data: Data, importedAt: Date = Date()) throws -> TimelineImportResult {
         guard let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw TimelineImportError.invalidDocument
         }
@@ -836,10 +934,12 @@ enum TimelineImport {
 
         let events = rawEvents.compactMap { decodeEvent($0, importedAt: importedAt) }
         if events.isEmpty && !rawEvents.isEmpty { throw TimelineImportError.noReadableEvents }
-        return events.sorted { $0.startedAt > $1.startedAt }
+        let places = (document["places"] as? [[String: Any]] ?? []).compactMap(decodePlace)
+        let corrections = (document["corrections"] as? [[String: Any]] ?? []).compactMap(decodeCorrection)
+        return TimelineImportResult(entries: events.sorted { $0.startedAt > $1.startedAt }, places: places, corrections: corrections)
     }
 
-    private static func decodeEvent(_ raw: [String: Any], importedAt: Date) -> LogEntry? {
+    static func decodeEvent(_ raw: [String: Any], importedAt: Date) -> LogEntry? {
         guard let id = (raw["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !id.isEmpty else { return nil }
         guard let startedAt = date(raw["startedAt"]) else { return nil }
@@ -867,6 +967,45 @@ enum TimelineImport {
             photoCount: photoCount,
             source: source,
             updatedAt: importedAt,
+        )
+    }
+
+    private static func decodePlace(_ raw: [String: Any]) -> NamedPlace? {
+        guard let id = (raw["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty,
+              let coordinate = coordinates(raw["latitude"], raw["longitude"]) else { return nil }
+        let anchors = (raw["anchors"] as? [[String: Any]] ?? []).compactMap { anchor -> PlaceAnchor? in
+            guard let latitude = number(anchor["latitude"])?.doubleValue,
+                  let longitude = number(anchor["longitude"])?.doubleValue,
+                  hasUsableCoordinates(latitude, longitude) else { return nil }
+            let radius = number(anchor["radiusMeters"])?.doubleValue ?? defaultPlaceRadiusMeters
+            return PlaceAnchor(latitude: latitude, longitude: longitude, radiusMeters: normalizedPlaceRadius(radius))
+        }
+        let radius = (number(raw["radiusMeters"])?.doubleValue).map(normalizedPlaceRadius)
+        return NamedPlace(
+            id: String(id.prefix(120)),
+            name: String((raw["name"] as? String ?? "").prefix(80)),
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude,
+            radiusMeters: radius,
+            anchors: anchors.isEmpty && raw["anchors"] == nil ? nil : Array(anchors.prefix(maxPlaceAnchors)),
+            mergedInto: raw["mergedInto"] as? String,
+            updatedAt: date(raw["updatedAt"]) ?? Date(),
+            deleted: raw["deleted"] as? Bool ?? false,
+        )
+    }
+
+    private static func decodeCorrection(_ raw: [String: Any]) -> TimelineCorrection? {
+        guard let id = (raw["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty,
+              let kind = TimelineCorrectionKind(rawValue: raw["kind"] as? String ?? ""),
+              let startedAt = date(raw["startedAt"]), let endedAt = date(raw["endedAt"]), endedAt >= startedAt else { return nil }
+        return TimelineCorrection(
+            id: String(id.prefix(120)),
+            kind: kind,
+            startedAt: startedAt,
+            endedAt: endedAt,
+            createdAt: number(raw["createdAt"]).map { Int64($0.doubleValue.rounded()) } ?? TimelineCorrection.now,
+            source: TimelineCorrectionSource(rawValue: raw["source"] as? String ?? "") ?? .app,
+            deleted: raw["deleted"] as? Bool ?? false,
         )
     }
 
