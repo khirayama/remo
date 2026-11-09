@@ -51,8 +51,8 @@ func sleepMoments(_ sessions: [SleepSession], in day: Range<Date>) -> [SleepMome
         .sorted { $0.time < $1.time }
 }
 
-/// Sleep is read from HealthKit whenever a day is shown or exported.
-/// It is never stored or backed up: HealthKit stays the only copy on the device.
+/// Sleep is read from HealthKit whenever a day is shown or exported; it is never stored in the local database.
+/// While signed in, `SleepBackup` also uploads what was read to the cloud.
 enum SleepData {
     /// HealthKit never tells whether reading was allowed, only whether the question was asked.
     /// A sample that can be read is the one proof that it was.
@@ -74,7 +74,7 @@ enum SleepData {
     static func access() async -> Access {
         guard HKHealthStore.isHealthDataAvailable() else { return .unavailable }
         guard (try? await store.statusForAuthorizationRequest(toShare: [], read: [type])) == .unnecessary else { return .notRequested }
-        return await samples(matching: nil, limit: 1).isEmpty ? .noData : .granted
+        return (await samples(matching: nil, limit: 1) ?? []).isEmpty ? .noData : .granted
     }
 
     static func requestAccess() async {
@@ -83,7 +83,18 @@ enum SleepData {
 
     static func sessions(endingIn day: Range<Date>) async -> [SleepSession] {
         guard HKHealthStore.isHealthDataAvailable() else { return [] }
-        let samples = await samples(matching: HKQuery.predicateForSamples(withStart: day.lowerBound.addingTimeInterval(-lookback), end: day.upperBound))
+        return await readSessions(endingIn: day) ?? []
+    }
+
+    /// Merged sleep that ended within `from`...`through`, oldest first. Used for the backup.
+    /// `nil` when HealthKit could not be read (locked or access revoked), so the backup keeps the range for next time.
+    static func sessions(from: Date, through: Date) async -> [SleepSession]? {
+        guard HKHealthStore.isHealthDataAvailable(), from < through else { return [] }
+        return await readSessions(endingIn: from..<through)
+    }
+
+    private static func readSessions(endingIn day: Range<Date>) async -> [SleepSession]? {
+        guard let samples = await samples(matching: HKQuery.predicateForSamples(withStart: day.lowerBound.addingTimeInterval(-lookback), end: day.upperBound)) else { return nil }
         let asleepValues = Set(HKCategoryValueSleepAnalysis.allAsleepValues.map(\.rawValue))
         func sessions(_ included: (Int) -> Bool) -> [SleepSession] {
             samples.filter { included($0.value) }.map { SleepSession(startedAt: $0.startDate, endedAt: $0.endDate) }
@@ -92,8 +103,8 @@ enum SleepData {
     }
 
     // HealthKit can be locked with the phone or have the access taken away at any time; the timeline then shows no sleep.
-    private static func samples(matching predicate: NSPredicate?, limit: Int? = nil) async -> [HKCategorySample] {
+    private static func samples(matching predicate: NSPredicate?, limit: Int? = nil) async -> [HKCategorySample]? {
         let query = HKSampleQueryDescriptor(predicates: [.categorySample(type: type, predicate: predicate)], sortDescriptors: [SortDescriptor(\.startDate)], limit: limit)
-        return (try? await query.result(for: store)) ?? []
+        return try? await query.result(for: store)
     }
 }
