@@ -22,6 +22,20 @@ internal data class GroupablePhoto(
     val previousEventId: String?,
 )
 
+/**
+ * A photo the library no longer has but the timeline keeps: its preview was
+ * already uploaded, so the record and its cloud thumbnail stay visible after
+ * the asset is deleted from the device.
+ */
+internal data class ArchivedPhoto(
+    val assetId: Long,
+    val eventId: String,
+    val takenAt: Long,
+    val coordinate: Pair<Double, Double>?,
+    val mediaType: MediaType,
+    val digest: String,
+)
+
 internal data class PhotoGroupAssignment(
     val eventId: String,
     val photoIds: List<Long>,
@@ -91,6 +105,50 @@ internal fun groupLibraryPhotos(
             inheritsFrom = candidates.firstOrNull()?.takeIf { it != eventId },
         )
     }
+}
+
+/**
+ * Archived photos take part in grouping like library photos: their previous
+ * record id lets the group keep the same id, start time, location and count,
+ * so losing the asset neither shrinks nor stales the record.
+ */
+internal fun archivedGroupablePhotos(archived: Collection<ArchivedPhoto>): List<GroupablePhoto> =
+    archived.map { GroupablePhoto(it.assetId, it.takenAt, it.mediaType, it.coordinate, it.eventId) }
+
+/**
+ * The archive after a scan. An asset that is back in the library drops its
+ * archived row (the library asset wins), and an asset the library no longer
+ * has is archived only when its preview was uploaded (a non-empty digest) and
+ * deletions are trusted: with partial "selected photos" access a missing photo
+ * may still be in the library, and a logout must not remove records either.
+ * [missing] holds the previous assignments of assets that are gone from the
+ * library; [digests] is keyed by asset id and record id.
+ */
+internal fun nextArchivedPhotos(
+    existing: Collection<ArchivedPhoto>,
+    libraryIds: Set<Long>,
+    missing: Collection<GroupablePhoto>,
+    digests: Map<Pair<Long, String>, String>,
+    deletionsTrusted: Boolean,
+): List<ArchivedPhoto> {
+    val result = LinkedHashMap<Long, ArchivedPhoto>()
+    existing.forEach { row -> if (row.assetId !in libraryIds) result[row.assetId] = row }
+    if (!deletionsTrusted) return result.values.toList()
+    missing.forEach { photo ->
+        val eventId = photo.previousEventId ?: return@forEach
+        // Without its digest the preview cannot be kept or shown: behave as
+        // before and let the record shrink or go stale.
+        val digest = digests[photo.id to eventId] ?: return@forEach
+        result[photo.id] = ArchivedPhoto(photo.id, eventId, photo.takenAt, photo.coordinate, photo.mediaType, digest)
+    }
+    return result.values.toList()
+}
+
+/** Points archived rows at the record the grouping put them in, in case a regrouped session moved them. */
+internal fun reassignArchivedPhotos(archived: Collection<ArchivedPhoto>, groups: Collection<PhotoGroupAssignment>): List<ArchivedPhoto> {
+    val eventByAsset = HashMap<Long, String>()
+    groups.forEach { group -> group.photoIds.forEach { eventByAsset[it] = group.eventId } }
+    return archived.map { row -> eventByAsset[row.assetId]?.takeIf { it != row.eventId }?.let { row.copy(eventId = it) } ?: row }
 }
 
 /** The id the day-based grouping (before session grouping) gave a photo's record. */

@@ -3,6 +3,7 @@ package com.remo.app
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.Instant
 import java.util.TimeZone
@@ -91,5 +92,88 @@ class PhotoGroupingTest {
         val original = groupLibraryPhotos(listOf(photo(1, start))).single().eventId
         val restored = groupLibraryPhotos(listOf(photo(1, start)), existingEventIds = setOf(original)) { legacyPhotoEventId(it.takenAt, it.coordinate, it.mediaType, zone) }
         assertEquals(original, restored.single().eventId)
+    }
+
+    // ---- Archived photos (deleted from the library, preview already backed up)
+
+    @Test fun archivedPhotosKeepTheirRecordIdAndCountAfterTheAssetsDisappear() {
+        val start = at("2026-09-01T00:00:00Z")
+        val id = groupLibraryPhotos(listOf(photo(1, start), photo(2, start + minute))).single().eventId
+        val archived = nextArchivedPhotos(
+            existing = emptyList(),
+            libraryIds = emptySet(),
+            missing = listOf(
+                GroupablePhoto(1, start, MediaType.PHOTO, home, id),
+                GroupablePhoto(2, start + minute, MediaType.PHOTO, home, id),
+            ),
+            digests = mapOf((1L to id) to "d1", (2L to id) to "d2"),
+            deletionsTrusted = true,
+        )
+        val groups = groupLibraryPhotos(archivedGroupablePhotos(archived))
+        assertEquals(id, groups.single().eventId)
+        assertEquals(2, groups.single().count)
+        assertEquals(start, groups.single().startedAt)
+    }
+
+    @Test fun anAssetWithoutUploadedDigestStillMakesItsRecordStale() {
+        val start = at("2026-09-01T00:00:00Z")
+        val id = groupLibraryPhotos(listOf(photo(1, start))).single().eventId
+        // An upload made before digests were kept cannot be kept: no archive row.
+        val archived = nextArchivedPhotos(
+            existing = emptyList(),
+            libraryIds = emptySet(),
+            missing = listOf(GroupablePhoto(1, start, MediaType.PHOTO, home, id)),
+            digests = emptyMap(),
+            deletionsTrusted = true,
+        )
+        assertTrue(archived.isEmpty())
+        val groups = groupLibraryPhotos(archivedGroupablePhotos(archived))
+        assertTrue(groups.none { it.eventId == id })
+    }
+
+    @Test fun aRestoredAssetDropsItsArchivedRowAndKeepsTheRecord() {
+        val start = at("2026-09-01T00:00:00Z")
+        val id = groupLibraryPhotos(listOf(photo(1, start))).single().eventId
+        val archivedPhoto = ArchivedPhoto(1, id, start, home, MediaType.PHOTO, "d1")
+        val archived = nextArchivedPhotos(listOf(archivedPhoto), libraryIds = setOf(1), missing = emptyList(), digests = emptyMap(), deletionsTrusted = true)
+        assertTrue(archived.isEmpty())
+        // The scan gives the restored asset its archived record id back.
+        val groups = groupLibraryPhotos(listOf(photo(1, start, previous = archivedPhoto.eventId)), existingEventIds = setOf(id))
+        assertEquals(id, groups.single().eventId)
+    }
+
+    @Test fun aPartialLibraryViewDoesNotArchiveMissingPhotos() {
+        val start = at("2026-09-01T00:00:00Z")
+        val id = "record"
+        val archived = nextArchivedPhotos(
+            existing = emptyList(),
+            libraryIds = emptySet(),
+            missing = listOf(GroupablePhoto(1, start, MediaType.PHOTO, home, id)),
+            digests = mapOf((1L to id) to "d1"),
+            deletionsTrusted = false,
+        )
+        assertTrue(archived.isEmpty())
+        // The archive already there is never dropped by signing out or by a
+        // partial view: it keeps the record and its cloud preview.
+        val kept = ArchivedPhoto(2, id, start, home, MediaType.PHOTO, "d2")
+        assertEquals(listOf(kept), nextArchivedPhotos(listOf(kept), libraryIds = emptySet(), missing = emptyList(), digests = emptyMap(), deletionsTrusted = false))
+    }
+
+    @Test fun archivedPhotosRegroupWithLibraryPhotosAndFollowTheChosenRecord() {
+        val start = at("2026-09-01T00:00:00Z")
+        val first = ArchivedPhoto(1, "a", start, home, MediaType.PHOTO, "d1")
+        val second = ArchivedPhoto(2, "b", start + minute, home, MediaType.PHOTO, "d2")
+        // Two records at the same place and within the gap merge into one.
+        val groups = groupLibraryPhotos(archivedGroupablePhotos(listOf(first, second)))
+        assertEquals(1, groups.size)
+        val moved = reassignArchivedPhotos(listOf(first, second), groups)
+        assertTrue(moved.all { it.eventId == groups.single().eventId })
+
+        // A library photo of the same session groups with them, keeping the
+        // archived record's id and count.
+        val current = first.eventId
+        val withLibrary = groupLibraryPhotos(archivedGroupablePhotos(listOf(first)) + photo(3, start + 2 * minute, previous = current))
+        assertEquals(current, withLibrary.single().eventId)
+        assertEquals(2, withLibrary.single().count)
     }
 }

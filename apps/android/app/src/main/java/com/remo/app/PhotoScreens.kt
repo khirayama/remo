@@ -149,6 +149,10 @@ private fun PhotoGridTile(entry: LogEntry, libraryPhoto: LibraryPhoto?, digest: 
                     ?: Icon(Icons.Outlined.ImageNotSupported, "写真", tint = AppColors.amber)
             }
         }
+        // A backed-up video shows its poster frame, so mark it as video again.
+        if (entry.mediaType == MediaType.VIDEO) {
+            Icon(Icons.Outlined.PlayCircle, "動画", tint = Color.White, modifier = Modifier.align(Alignment.TopStart).padding(4.dp).size(18.dp))
+        }
         Box(
             Modifier.align(Alignment.BottomStart).fillMaxWidth()
                 .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.5f))), MaterialTheme.shapes.small)

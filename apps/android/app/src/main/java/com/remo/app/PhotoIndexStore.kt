@@ -24,18 +24,22 @@ internal class PhotoIndexStore(context: Context, name: String = DATABASE_NAME) {
     )
 
     private val appContext = context.applicationContext
-    private val helper = object : SQLiteOpenHelper(appContext, name, null, 2) {
+    private val helper = object : SQLiteOpenHelper(appContext, name, null, 3) {
         override fun onCreate(db: SQLiteDatabase) {
             db.execSQL("CREATE TABLE photos (id INTEGER PRIMARY KEY NOT NULL, taken_at INTEGER NOT NULL, media_type TEXT NOT NULL, modified_at INTEGER NOT NULL, size INTEGER NOT NULL, latitude REAL, longitude REAL, event_id TEXT)")
             db.execSQL("CREATE TABLE metadata (name TEXT PRIMARY KEY NOT NULL, value TEXT)")
             db.execSQL("CREATE TABLE uploads (account TEXT NOT NULL, marker TEXT NOT NULL, digest TEXT, PRIMARY KEY (account, marker))")
             db.execSQL("CREATE TABLE manifest_pending (event_id TEXT PRIMARY KEY NOT NULL)")
+            db.execSQL(ARCHIVED_TABLE)
         }
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
             if (oldVersion < 2) {
                 db.execSQL("ALTER TABLE uploads ADD COLUMN digest TEXT")
                 db.execSQL("CREATE TABLE manifest_pending (event_id TEXT PRIMARY KEY NOT NULL)")
             }
+            // Existing installs gain the archive without rescanning: the next
+            // trusted scan fills it from the photos already indexed.
+            if (oldVersion < 3) db.execSQL(ARCHIVED_TABLE)
         }
     }.apply { setWriteAheadLoggingEnabled(true) }
 
@@ -67,7 +71,7 @@ internal class PhotoIndexStore(context: Context, name: String = DATABASE_NAME) {
      * or moved to another record): the backup still holds that photo's
      * preview, so the record's preview list has to be sent again.
      */
-    @Synchronized fun replace(signature: String, rows: Map<Long, Row>, completedGrouping: Boolean, changedEvents: Set<String> = emptySet()) {
+    @Synchronized fun replace(signature: String, rows: Map<Long, Row>, completedGrouping: Boolean, changedEvents: Set<String> = emptySet(), archived: Collection<ArchivedPhoto>? = null) {
         val db = helper.writableDatabase
         db.beginTransactionNonExclusive()
         try {
@@ -83,10 +87,44 @@ internal class PhotoIndexStore(context: Context, name: String = DATABASE_NAME) {
                     row.eventId?.let { put("event_id", it) }
                 })
             }
+            // Null leaves the archive untouched (no complete view of the library).
+            archived?.let { rows ->
+                db.delete("archived", null, null)
+                rows.forEach { row ->
+                    db.insertOrThrow("archived", null, ContentValues().apply {
+                        put("asset_id", row.assetId); put("event_id", row.eventId); put("taken_at", row.takenAt)
+                        row.coordinate?.let { put("latitude", it.first); put("longitude", it.second) }
+                        put("media_type", row.mediaType.wireValue); put("digest", row.digest)
+                    })
+                }
+            }
             putMetadata(db, PERMISSION_KEY, signature)
             if (completedGrouping) putMetadata(db, GROUPING_KEY, GROUPING_VERSION)
             db.setTransactionSuccessful()
         } finally { db.endTransaction() }
+    }
+
+    /** Photos the library no longer has, kept because their preview was backed up. */
+    @Synchronized fun archived(): Map<Long, ArchivedPhoto> =
+        helper.readableDatabase.rawQuery("SELECT asset_id, event_id, taken_at, latitude, longitude, media_type, digest FROM archived", null).use { cursor ->
+            buildMap {
+                while (cursor.moveToNext()) {
+                    val coordinate = if (cursor.isNull(3) || cursor.isNull(4)) null else cursor.getDouble(3) to cursor.getDouble(4)
+                    put(cursor.getLong(0), ArchivedPhoto(
+                        assetId = cursor.getLong(0),
+                        eventId = cursor.getString(1),
+                        takenAt = cursor.getLong(2),
+                        coordinate = coordinate,
+                        mediaType = if (cursor.getString(5) == MediaType.VIDEO.wireValue) MediaType.VIDEO else MediaType.PHOTO,
+                        digest = cursor.getString(6),
+                    ))
+                }
+            }
+        }
+
+    /** Removing the record in Remo must also forget its archive, or the next scan resurrects it. */
+    @Synchronized fun deleteArchived(eventId: String) {
+        helper.writableDatabase.delete("archived", "event_id = ?", arrayOf(eventId))
     }
 
     @Synchronized fun eventId(photoId: Long): String? =
@@ -100,6 +138,7 @@ internal class PhotoIndexStore(context: Context, name: String = DATABASE_NAME) {
         db.delete("metadata", null, null)
         db.delete("uploads", null, null)
         db.delete("manifest_pending", null, null)
+        db.delete("archived", null, null)
     }
 
     // ---- Preview upload markers --------------------------------------------
@@ -112,6 +151,22 @@ internal class PhotoIndexStore(context: Context, name: String = DATABASE_NAME) {
             buildMap { while (cursor.moveToNext()) put(cursor.getString(0), if (cursor.isNull(1)) null else cursor.getString(1)) }
         }
     }
+
+    /**
+     * The uploaded preview digest per asset and record, from any account: an
+     * archived photo stays in the timeline even after the user signs out,
+     * because its preview is still what the record can show.
+     */
+    @Synchronized fun uploadedDigests(): Map<Pair<Long, String>, String> =
+        helper.readableDatabase.rawQuery("SELECT marker, digest FROM uploads WHERE digest IS NOT NULL AND digest != ''", null).use { cursor ->
+            buildMap {
+                while (cursor.moveToNext()) {
+                    val marker = cursor.getString(0)
+                    val assetId = marker.substringBefore(':').toLongOrNull() ?: continue
+                    put(assetId to marker.substringAfterLast(':'), cursor.getString(1))
+                }
+            }
+        }
 
     @Synchronized fun markUploaded(account: String, marker: String, digest: String) {
         helper.writableDatabase.insertWithOnConflict("uploads", null, ContentValues().apply { put("account", account); put("marker", marker); put("digest", digest) }, SQLiteDatabase.CONFLICT_REPLACE)
@@ -171,6 +226,7 @@ internal class PhotoIndexStore(context: Context, name: String = DATABASE_NAME) {
 
     companion object {
         const val DATABASE_NAME = "rem_photo_index.db"
+        private const val ARCHIVED_TABLE = "CREATE TABLE IF NOT EXISTS archived (asset_id INTEGER PRIMARY KEY NOT NULL, event_id TEXT NOT NULL, taken_at INTEGER NOT NULL, latitude REAL, longitude REAL, media_type TEXT NOT NULL, digest TEXT NOT NULL)"
         private const val PERMISSION_KEY = "permission_signature"
         private const val GROUPING_KEY = "grouping"
         private const val GROUPING_VERSION = "session-v2"

@@ -111,6 +111,11 @@ object PhotoLibrary {
             val signature = permissionSignature(context)
             val permissionChanged = cache.first != signature
             val sessionGrouping = store.sessionGrouping()
+            val libraryIds = photos.mapTo(HashSet()) { it.id }
+            // A restored asset takes its archived record id back, so restoring
+            // from Recently Deleted does not recreate the record under a new id.
+            val archivedRows = store.archived()
+            val restoredEventByAsset = archivedRows.filterKeys { it in libraryIds }.mapValues { it.value.eventId }
             val scanned = linkedMapOf<Long, PhotoIndexStore.Row>()
             val groupable = ArrayList<GroupablePhoto>(photos.size)
             photos.forEach { photo ->
@@ -126,13 +131,33 @@ object PhotoLibrary {
                 // Retain a previously readable coordinate and retry on the next scan.
                 val coordinate = if (exif.reliable) exif.coordinate else cached?.coordinate
                 val takenAt = if (!exif.reliable && cached != null) cached.takenAt else photo.takenAt
-                groupable += GroupablePhoto(photo.id, takenAt, photo.mediaType, coordinate, cached?.eventId)
-                scanned[photo.id] = if (exif.reliable) PhotoIndexStore.Row(photo.takenAt, photo.mediaType, photo.modifiedAt, photo.size, coordinate, cached?.eventId)
+                val previousEventId = cached?.eventId ?: restoredEventByAsset[photo.id]
+                groupable += GroupablePhoto(photo.id, takenAt, photo.mediaType, coordinate, previousEventId)
+                scanned[photo.id] = if (exif.reliable) PhotoIndexStore.Row(photo.takenAt, photo.mediaType, photo.modifiedAt, photo.size, coordinate, previousEventId)
                     else cached?.copy(modifiedAt = -1L) ?: PhotoIndexStore.Row(photo.takenAt, photo.mediaType, -1L, photo.size, null, null)
             }
+            // Only a complete library view can tell that a photo is gone. The
+            // archive also needs session grouping done, so a photo is not
+            // archived while its record is still a migrated day record.
+            val libraryComplete = hasFullLibraryAccess(context) && photos.isNotEmpty()
+            val deletionsTrusted = libraryComplete && sessionGrouping
+            val missing = cache.second.mapNotNull { (photoId, row) ->
+                if (photoId in libraryIds) return@mapNotNull null
+                val eventId = row.eventId ?: return@mapNotNull null
+                GroupablePhoto(photoId, row.takenAt, row.mediaType, row.coordinate, eventId)
+            }
+            val archived = nextArchivedPhotos(
+                existing = archivedRows.values,
+                libraryIds = libraryIds,
+                missing = missing,
+                digests = if (deletionsTrusted) store.uploadedDigests() else emptyMap(),
+                deletionsTrusted = deletionsTrusted,
+            )
+            groupable += archivedGroupablePhotos(archived)
             val groups = groupLibraryPhotos(groupable, existingEventIds, legacyEventId = if (sessionGrouping) null else { photo ->
                 legacyPhotoEventId(photo.takenAt, photo.coordinate, photo.mediaType)
             })
+            val archivedNext = reassignArchivedPhotos(archived, groups)
             val assigned = scanned.toMutableMap()
             groups.forEach { group -> group.photoIds.forEach { id -> assigned[id]?.let { assigned[id] = it.copy(eventId = group.eventId) } } }
             // Only complete aggregates are returned: partial counts could otherwise
@@ -145,16 +170,18 @@ object PhotoLibrary {
             val current = groups.mapTo(HashSet()) { it.eventId }
             val previous = cache.second.values.mapNotNullTo(HashSet()) { it.eventId }
             val legacy = if (sessionGrouping) emptySet() else groupable.mapTo(HashSet()) { legacyPhotoEventId(it.takenAt, it.coordinate, it.mediaType) }
-            val stale = if (hasFullLibraryAccess(context) && photos.isNotEmpty()) (previous + legacy) - current else emptySet()
+            val stale = if (libraryComplete) (previous + legacy) - current else emptySet()
 
-            // Records that lost a photo since the last scan. As with stale
-            // records, only a complete view of the library can tell.
-            val shrunk = if (hasFullLibraryAccess(context) && photos.isNotEmpty()) {
-                cache.second.mapNotNullTo(HashSet()) { (photoId, row) -> row.eventId?.takeIf { it != assigned[photoId]?.eventId } }
+            // Records that lost a photo since the last scan. An archived photo
+            // is not lost: its record keeps it through the archive. As with
+            // stale records, only a complete view of the library can tell.
+            val archivedIds = archivedNext.mapTo(HashSet()) { it.assetId }
+            val shrunk = if (libraryComplete) {
+                cache.second.mapNotNullTo(HashSet()) { (photoId, row) -> row.eventId?.takeIf { it != assigned[photoId]?.eventId && photoId !in archivedIds } }
             } else emptySet()
             val next = signature to assigned.toMap()
-            if (cache != next || !sessionGrouping) {
-                store.replace(signature, assigned, completedGrouping = true, changedEvents = shrunk)
+            if (cache != next || !sessionGrouping || archivedNext.toSet() != archivedRows.values.toSet()) {
+                store.replace(signature, assigned, completedGrouping = true, changedEvents = shrunk, archived = archivedNext)
                 indexGeneration += 1
             }
             memoryCache = next
@@ -197,8 +224,13 @@ object PhotoLibrary {
             thumbnailCacheSignature = permission
             thumbnailCache.get(cacheSignature)
         }?.let { return@runCatching it }
-        val bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) context.contentResolver.loadThumbnail(photo.uri, Size(sizePx, sizePx), null)
-        else if (photo.mediaType == MediaType.VIDEO) MediaStore.Video.Thumbnails.getThumbnail(context.contentResolver, photo.id, MediaStore.Video.Thumbnails.MINI_KIND, null)
+        // On Q+ the framework returns a poster frame for video assets too, which
+        // is what the backup uploads. The legacy video thumbnail is a fallback
+        // for providers that do not answer loadThumbnail with one.
+        val bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { context.contentResolver.loadThumbnail(photo.uri, Size(sizePx, sizePx), null) }.getOrNull()
+                ?: (if (photo.mediaType == MediaType.VIDEO) videoThumbnail(context, photo) else null)
+        } else if (photo.mediaType == MediaType.VIDEO) videoThumbnail(context, photo)
         else context.contentResolver.openInputStream(photo.uri)?.use { stream ->
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             context.contentResolver.openInputStream(photo.uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
@@ -207,6 +239,10 @@ object PhotoLibrary {
         bitmap?.let { synchronized(thumbnailCache) { thumbnailCache.put(cacheSignature, it) } }
         bitmap
     }.getOrNull()
+
+    @Suppress("DEPRECATION")
+    private fun videoThumbnail(context: Context, photo: LibraryPhoto): Bitmap? =
+        MediaStore.Video.Thumbnails.getThumbnail(context.contentResolver, photo.id, MediaStore.Video.Thumbnails.MINI_KIND, null)
 
     private fun readExifLocation(context: Context, uri: Uri): ExifResult {
         val sourceUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && hasMediaLocationAccess(context)) runCatching { MediaStore.setRequireOriginal(uri) }.getOrDefault(uri) else uri

@@ -63,11 +63,14 @@ object PhotoBackup {
         val manifests = index.pendingManifests()
         /** Digests of the previews each record waiting for a manifest still has; null once one is unknown. */
         val digests = manifests.associateWithTo(HashMap<String, MutableList<String>?>()) { mutableListOf() }
+        // An archived photo has no local asset to upload, but its backed-up
+        // preview still belongs to the record: it must be in the manifest or
+        // the server would prune it, and it never makes the record incomplete.
+        index.archived().values.forEach { row -> digests[row.eventId]?.add(row.digest) }
         var uploaded = 0
         var unavailable = false
         for (photo in PhotoLibrary.queryAll(context)) {
             if (uploaded >= 200) return@withContext true
-            if (photo.mediaType != MediaType.PHOTO) continue
             val eventId = PhotoLibrary.eventIdFor(context, photo) ?: continue
             if (eventId !in active) continue
             val marker = "${photo.id}:${photo.modifiedAt}:${photo.size}:$eventId"
