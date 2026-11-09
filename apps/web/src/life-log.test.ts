@@ -1,8 +1,8 @@
 import "fake-indexeddb/auto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { synchronizeEvents } from "./life-api";
-import { buildExport, claimRecords, clearEvents, countUnsavedEvents, dateKey, forgetAccount, LifeEvent, loadDayEvents, loadUploadedPhotos, migrateLegacyTimeline, ownershipFor, readImport, rememberUploadedPhoto, replaceRecords, sortNewest, sortOldest, storeImported, summarizeRange } from "./life-log";
-import { applyRemoteChanges, clearDirtyDays, closeDatabaseForTests, countEvents, deleteLocalEvents, listRecordedDays, loadDirtyDays, loadDirtyEvents, loadEvent, loadEventsInRange, loadPendingDeletes, loadStoredPlaces, loadSyncState, markEventsSynced, putLocalEvents, putLocalPlace, updateSyncState } from "./timeline-db";
+import { buildExport, claimRecords, clearEvents, countUnsavedEvents, dateKey, forgetAccount, LifeEvent, loadDayEvents, loadUploadedPhotos, migrateLegacyTimeline, ownershipFor, readImport, readImportExtras, rememberUploadedPhoto, replaceRecords, sortNewest, sortOldest, storeImported, storeImportExtras, summarizeRange } from "./life-log";
+import { applyRemoteChanges, applyRemoteCorrections, clearDirtyDays, closeDatabaseForTests, countEvents, deleteLocalEvents, listRecordedDays, loadCorrections, loadDirtyCorrections, loadDirtyDays, loadDirtyEvents, loadEvent, loadEventsInRange, loadPendingDeletes, loadStoredPlaces, loadSyncState, markEventsSynced, putLocalCorrections, putLocalEvents, putLocalPlace, updateSyncState } from "./timeline-db";
 
 const STORAGE = "device:test";
 
@@ -290,7 +290,8 @@ describe("backup sync", () => {
     await deleteLocalEvents(STORAGE, []);
     const calls = stubApi(({ method, path }) => {
       if (method === "POST") return { data: { accepted: 1 } };
-      if (path.startsWith("/api/v1/places")) return { data: [{ id: "home", name: "Home", latitude: 35, longitude: 139, updatedAt: 5, deleted: false }] };
+      if (path.startsWith("/api/v1/places")) return { data: [{ id: "home", name: "Home", latitude: 35, longitude: 139, radiusMeters: 200, anchors: [{ latitude: 35.001, longitude: 139, radiusMeters: 80 }], updatedAt: 5, deleted: false }] };
+      if (path.startsWith("/api/v1/corrections")) return { data: { corrections: [{ id: "c1", kind: "exclude", startedAt: 1, endedAt: 2, createdAt: 3, source: "mcp", deleted: false }], cursor: 42, hasMore: false } };
       if (path.includes("page=")) return { data: [apiEvent("remote-2", 20)], meta: { deletions: [], cursor: "100|~", nextPage: null, nextCursorToken: null, full: true } };
       return { data: [apiEvent("remote-1", 10)], meta: { deletions: [], cursor: "100|~", nextPage: "100|1|b5", nextCursorToken: null, full: true } };
     });
@@ -303,16 +304,43 @@ describe("backup sync", () => {
       "GET /api/v1/events?v=2",
       "GET /api/v1/events?v=2&page=100%7C1%7Cb5",
       "GET /api/v1/places",
+      "GET /api/v1/corrections?after=0",
     ]);
     expect(calls[0].body.events.map((item: { id: string }) => item.id)).toEqual(["local"]);
     expect(await countEvents(STORAGE)).toBe(3);
-    expect(await loadSyncState(STORAGE)).toMatchObject({ cursors: { "user-1": { updatedAt: 100, id: "~" } }, fullSync: {} });
-    expect((await loadStoredPlaces(STORAGE)).map((place) => place.name)).toEqual(["Home"]);
+    expect(await loadSyncState(STORAGE)).toMatchObject({ cursors: { "user-1": { updatedAt: 100, id: "~" } }, fullSync: {}, correctionCursors: { "user-1": 42 } });
+    expect(await loadStoredPlaces(STORAGE)).toEqual([expect.objectContaining({ name: "Home", radiusMeters: 200, anchors: [{ latitude: 35.001, longitude: 139, radiusMeters: 80 }] })]);
+    expect(await loadCorrections(STORAGE)).toEqual([{ id: "c1", kind: "exclude", startedAt: 1, endedAt: 2, createdAt: 3, source: "mcp", deleted: false }]);
 
     // Nothing changed since: one head check, no download, nothing uploaded again.
     calls.length = 0;
     stubApi(({ path }) => path.endsWith("/head") ? { data: { cursor: "100|~" } } : { data: [] });
     expect((await synchronizeEvents(STORAGE, "user-1")).changed).toBe(false);
+  });
+
+  it("sends the corrections made here and takes deletions from the backup", async () => {
+    await claimRecords(STORAGE, "user-1");
+    const mine = { id: "mine", kind: "join_stay" as const, startedAt: Date.parse("2026-09-01T10:00:00"), endedAt: Date.parse("2026-09-02T09:00:00"), createdAt: 1, source: "app" as const, deleted: false };
+    const theirs = { ...mine, id: "theirs", kind: "not_stay" as const, startedAt: Date.parse("2026-09-05T10:00:00"), endedAt: Date.parse("2026-09-05T11:00:00") };
+    await putLocalCorrections(STORAGE, [mine]);
+    const { epoch } = await loadSyncState(STORAGE);
+    await applyRemoteCorrections(STORAGE, [theirs], epoch);
+    expect((await loadDirtyDays(STORAGE)).map((entry) => entry.day).sort()).toEqual(["2026-09-01", "2026-09-02", "2026-09-05"]);
+    await clearDirtyDays(STORAGE, await loadDirtyDays(STORAGE));
+
+    const calls = stubApi(({ method, path }) => {
+      if (method !== "GET") return { data: { accepted: 1 } };
+      if (path.endsWith("/head")) return { data: { cursor: null } };
+      if (path.startsWith("/api/v1/corrections")) return { data: { corrections: [{ ...theirs, deleted: true }], cursor: 7, hasMore: false } };
+      if (path.startsWith("/api/v1/places")) return { data: [] };
+      return emptyPage(null);
+    });
+    await synchronizeEvents(STORAGE, "user-1");
+    const sent = calls.find((call) => call.method === "PUT" && call.path === "/api/v1/corrections");
+    expect(sent?.body.corrections.map((item: { id: string }) => item.id)).toEqual(["mine"]);
+    expect(await loadDirtyCorrections(STORAGE, epoch)).toEqual([]);
+    expect((await loadCorrections(STORAGE)).map(({ id, deleted }) => ({ id, deleted }))).toEqual([{ id: "mine", deleted: false }, { id: "theirs", deleted: true }]);
+    expect((await loadDirtyDays(STORAGE)).map((entry) => entry.day)).toEqual(["2026-09-05"]);
   });
 
   it("sends deletions with the hints that locate the record and applies remote deletions", async () => {
@@ -389,6 +417,28 @@ describe("timeline export and import", () => {
     expect(await countEvents(STORAGE)).toBe(2);
     // Imported records are new local changes: they are uploaded.
     expect(await countUnsavedEvents(STORAGE)).toBe(2);
+  });
+
+  it("exports and imports the named places and the corrections of the range", async () => {
+    const at = (value: string) => new Date(value).getTime();
+    await putLocalEvents(STORAGE, [event({ id: "location", startedAt: new Date("2026-08-31T09:00:00").toISOString() })]);
+    await putLocalPlace(STORAGE, { id: "home", name: "Home", latitude: 35, longitude: 139, radiusMeters: 200, anchors: [{ latitude: 35.001, longitude: 139, radiusMeters: 80 }], updatedAt: 5, deleted: false });
+    await putLocalPlace(STORAGE, { id: "gone", name: "", latitude: 0, longitude: 0, updatedAt: 5, deleted: true });
+    const inside = { id: "inside", kind: "join_stay" as const, startedAt: at("2026-08-31T08:00:00"), endedAt: at("2026-08-31T10:00:00"), createdAt: 1, source: "app" as const, deleted: false };
+    await putLocalCorrections(STORAGE, [
+      inside,
+      { ...inside, id: "outside", startedAt: at("2026-09-03T08:00:00"), endedAt: at("2026-09-03T09:00:00") },
+      { ...inside, id: "deleted", deleted: true },
+    ]);
+    const blob = await buildExport(STORAGE, { from: "2026-08-31", to: "2026-08-31" });
+    const document = JSON.parse(await blob.text());
+    expect(document.places.map((place: { id: string }) => place.id)).toEqual(["home"]);
+    expect(document.corrections.map((correction: { id: string }) => correction.id)).toEqual(["inside"]);
+
+    await clearEvents(STORAGE);
+    await storeImportExtras(STORAGE, await readImportExtras(blob));
+    expect(await loadStoredPlaces(STORAGE)).toEqual([expect.objectContaining({ id: "home", radiusMeters: 200 })]);
+    expect((await loadCorrections(STORAGE)).map((correction) => correction.id)).toEqual(["inside"]);
   });
 
   it("rejects records without valid dates", async () => {

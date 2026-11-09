@@ -1,5 +1,5 @@
 import { dateKey, LifeEvent } from "./life-log";
-import { buildStayClusters, distanceMeters, StayCluster, StayVisit, StayVisitHistory, STAY_PLACE_RADIUS_METERS } from "./timeline-map";
+import { analyzeTimeline, distanceMeters, matchPlace, NamedPlace, StayCluster, StayVisit, StayVisitHistory, STAY_PLACE_RADIUS_METERS, TimelineCorrection, visitFilter } from "./timeline-map";
 
 /** The part of a stay the all-time views need; cached per day. */
 export type StaySummary = StayVisit;
@@ -49,9 +49,14 @@ function summarize(stays: StayCluster[]): StaySummary[] {
   return stays.map(({ id, latitude, longitude, startedAt, endedAt, durationMs }) => ({ id, latitude, longitude, startedAt, endedAt, durationMs }));
 }
 
-/** The stays of one day's records. */
-export function detectDayStays(dayEvents: LifeEvent[]): StaySummary[] {
-  return summarize(buildStayClusters(dayEvents));
+/**
+ * The stays of one day's records with the corrections laid over them. Named
+ * places are left out: the cache holds the stays as detected, and the views
+ * match them to the places when they are shown, so naming a place never
+ * invalidates the cache.
+ */
+export function detectDayStays(dayEvents: LifeEvent[], corrections: TimelineCorrection[] = []): StaySummary[] {
+  return summarize(analyzeTimeline(dayEvents, { corrections }).stayClusters);
 }
 
 const YIELD_AFTER_MS = 12;
@@ -68,7 +73,7 @@ export async function refreshStayIndex(
   cache: StayIndexCache,
   days: string[],
   loadDay: (day: string) => Promise<LifeEvent[]>,
-  options: { today: string; signal?: AbortSignal; onProgress?: (done: number, total: number) => void },
+  options: { today: string; corrections?: TimelineCorrection[]; signal?: AbortSignal; onProgress?: (done: number, total: number) => void },
 ): Promise<{ processed: string[]; changed: boolean; aborted: boolean }> {
   const stale = [...new Set(days)].filter((day) => day < options.today).sort();
   const processed: string[] = [];
@@ -83,7 +88,7 @@ export async function refreshStayIndex(
   let sliceStartedAt = performance.now();
   for (const [index, day] of stale.entries()) {
     if (options.signal?.aborted) return { processed, changed, aborted: true };
-    const stays = detectDayStays(await loadDay(day));
+    const stays = detectDayStays(await loadDay(day), options.corrections);
     if (stays.length) cache.days[day] = stays;
     else delete cache.days[day];
     processed.push(day);
@@ -103,9 +108,14 @@ export function allStays(cache: StayIndexCache, todayStays: StaySummary[]): Stay
     .sort((first, second) => first.startedAt.localeCompare(second.startedAt));
 }
 
-/** A place built from every stay within [STAY_PLACE_RADIUS_METERS] across all days. */
+/**
+ * A place built from every stay within [STAY_PLACE_RADIUS_METERS] across all
+ * days, or every stay at one named place.
+ */
 export type AllTimeStayPlace = {
   id: string;
+  /** The named place, when the stays matched one. */
+  placeId?: string;
   latitude: number;
   longitude: number;
   /** Newest first. */
@@ -140,12 +150,25 @@ function gridCell(latitude: number, longitude: number) {
  * (buildStayPlaces): each stay joins the nearest place within
  * [STAY_PLACE_RADIUS_METERS], and a place sits at the median of its visits.
  */
-export function buildAllTimeStayPlaces(stays: StaySummary[]): AllTimeStayPlace[] {
-  type Building = { id: string; latitude: number; longitude: number; latitudes: number[]; longitudes: number[]; visits: StaySummary[] };
+export function buildAllTimeStayPlaces(stays: StaySummary[], namedPlaces: readonly NamedPlace[] = []): AllTimeStayPlace[] {
+  type Building = { id: string; placeId?: string; latitude: number; longitude: number; latitudes: number[]; longitudes: number[]; visits: StaySummary[] };
   const places: Building[] = [];
+  const named = new Map<string, Building>();
   const grid = new Map<string, Building[]>();
   const ordered = [...stays].sort((first, second) => first.startedAt.localeCompare(second.startedAt));
   for (const stay of ordered) {
+    // A stay at a named place belongs to it, at the place's own coordinate.
+    const match = matchPlace(namedPlaces, stay);
+    if (match) {
+      let place = named.get(match.place.id);
+      if (!place) {
+        place = { id: `named:${match.place.id}`, placeId: match.place.id, latitude: match.place.latitude, longitude: match.place.longitude, latitudes: [], longitudes: [], visits: [] };
+        named.set(match.place.id, place);
+        places.push(place);
+      }
+      place.visits.push(stay);
+      continue;
+    }
     const [row, column] = gridCell(stay.latitude, stay.longitude);
     let nearest: Building | undefined;
     let nearestDistance = Number.POSITIVE_INFINITY;
@@ -175,8 +198,9 @@ export function buildAllTimeStayPlaces(stays: StaySummary[]): AllTimeStayPlace[]
     if (cell) cell.push(place);
     else grid.set(key, [place]);
   }
-  return places.map(({ id, latitude, longitude, visits }) => ({
+  return places.map(({ id, placeId, latitude, longitude, visits }) => ({
     id,
+    ...(placeId ? { placeId } : {}),
     latitude,
     longitude,
     visits: [...visits].reverse(),
@@ -189,9 +213,9 @@ export function buildAllTimeStayPlaces(stays: StaySummary[]): AllTimeStayPlace[]
 }
 
 /** The same result as buildStayVisitHistory, read from already detected stays. */
-export function stayVisitHistoryFromStays(stays: StaySummary[], target: { latitude: number; longitude: number }): StayVisitHistory {
+export function stayVisitHistoryFromStays(stays: StaySummary[], target: { latitude: number; longitude: number }, places?: readonly NamedPlace[]): StayVisitHistory {
   const visits = stays
-    .filter((stay) => distanceMeters(stay, target) <= STAY_PLACE_RADIUS_METERS)
+    .filter(visitFilter(target, places))
     .sort((first, second) => second.startedAt.localeCompare(first.startedAt));
   return historyOf(visits);
 }

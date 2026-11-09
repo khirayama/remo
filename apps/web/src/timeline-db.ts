@@ -1,16 +1,17 @@
 import { dateKey } from "./day";
-import type { EventSource, LifeEvent, Place, SyncCursor } from "./life-log";
+import type { Correction, EventSource, LifeEvent, Place, SyncCursor } from "./life-log";
 
 // The browser's timeline lives in IndexedDB, one row per record. The app keeps
 // only the day on screen in memory and reads everything else through the
 // indexes here: by time for a day or an export, and by sync state for the
 // records that still have to be uploaded.
 const DATABASE_NAME = "remo-timeline";
-const DATABASE_VERSION = 2;
+const DATABASE_VERSION = 3;
 const EVENTS = "events";
 const PENDING_DELETES = "pendingDeletes";
 const DIRTY_DAYS = "dirtyDays";
 const PLACES = "places";
+const CORRECTIONS = "corrections";
 const PHOTO_UPLOADS = "photoUploads";
 const STATE = "state";
 /** Version 1 only: one queued upload or deletion per record and account. */
@@ -28,6 +29,7 @@ type StoredEvent = { storageId: string; id: string; event: LifeEvent; t: number;
 type StoredDeletion = { storageId: string; id: string; deletedAt: number; startedAt?: number; source?: EventSource };
 type StoredDirtyDay = { storageId: string; day: string; token: number };
 type StoredPlace = { storageId: string; id: string; place: Place; s: number };
+type StoredCorrection = { storageId: string; id: string; correction: Correction; s: number };
 type StoredUpload = { userId: string; eventId: string };
 
 export type PendingDeletion = Omit<StoredDeletion, "storageId">;
@@ -45,9 +47,11 @@ export type SyncState = {
   cursors: Record<string, SyncCursor>;
   /** Where an interrupted full download continues, per account. */
   fullSync: Record<string, string>;
+  /** Correction download cursor per account. */
+  correctionCursors: Record<string, number>;
 };
 
-const emptySyncState = (): SyncState => ({ epoch: 1, cursors: {}, fullSync: {} });
+const emptySyncState = (): SyncState => ({ epoch: 1, cursors: {}, fullSync: {}, correctionCursors: {} });
 const syncStateKey = (storageId: string) => `sync:${storageId}`;
 
 let databasePromise: Promise<IDBDatabase> | undefined;
@@ -143,11 +147,14 @@ function openDatabase(): Promise<IDBDatabase> {
         database.createObjectStore(PHOTO_UPLOADS, { keyPath: ["userId", "eventId"] }).createIndex("userId", "userId");
         database.createObjectStore(STATE);
       }
-      events.createIndex(BY_TIME, ["storageId", "t"]);
-      events.createIndex(BY_SYNC, ["storageId", "s"]);
-      database.createObjectStore(PENDING_DELETES, { keyPath: ["storageId", "id"] });
-      database.createObjectStore(DIRTY_DAYS, { keyPath: ["storageId", "day"] });
-      database.createObjectStore(PLACES, { keyPath: ["storageId", "id"] });
+      if (upgrade.oldVersion < 2) {
+        events.createIndex(BY_TIME, ["storageId", "t"]);
+        events.createIndex(BY_SYNC, ["storageId", "s"]);
+        database.createObjectStore(PENDING_DELETES, { keyPath: ["storageId", "id"] });
+        database.createObjectStore(DIRTY_DAYS, { keyPath: ["storageId", "day"] });
+        database.createObjectStore(PLACES, { keyPath: ["storageId", "id"] });
+      }
+      if (upgrade.oldVersion < 3) database.createObjectStore(CORRECTIONS, { keyPath: ["storageId", "id"] });
       if (upgrade.oldVersion === 1) migrateFromVersion1(database, transaction);
     };
     request.onsuccess = () => {
@@ -195,6 +202,19 @@ function markDay(transaction: IDBTransaction, storageId: string, time: number, t
   if (touched.has(day)) return;
   touched.add(day);
   transaction.objectStore(DIRTY_DAYS).put({ storageId, day, token: Date.now() + Math.random() } satisfies StoredDirtyDay);
+}
+
+/** Every local day a correction covers has to have its stays detected again. */
+function markCorrectionDays(transaction: IDBTransaction, storageId: string, correction: Correction, touched: Set<string>) {
+  const last = dateKey(correction.endedAt);
+  for (let time = correction.startedAt, day = dateKey(time); ; ) {
+    markDay(transaction, storageId, time, touched);
+    if (day >= last) break;
+    const next = new Date(`${day}T00:00:00`);
+    next.setDate(next.getDate() + 1);
+    time = next.getTime();
+    day = dateKey(time);
+  }
 }
 
 // ---- Records -----------------------------------------------------------------
@@ -378,8 +398,8 @@ export async function removePendingDeletes(storageId: string, sent: PendingDelet
 
 /** Removes this device's records and everything queued for them. The sync state is kept. */
 export async function clearStoredEvents(storageId: string): Promise<void> {
-  await transact([EVENTS, DIRTY_DAYS, PENDING_DELETES, PLACES], "readwrite", (transaction) => {
-    [EVENTS, DIRTY_DAYS, PENDING_DELETES, PLACES].forEach((name) => transaction.objectStore(name).delete(everyKeyOf(storageId)));
+  await transact([EVENTS, DIRTY_DAYS, PENDING_DELETES, PLACES, CORRECTIONS], "readwrite", (transaction) => {
+    [EVENTS, DIRTY_DAYS, PENDING_DELETES, PLACES, CORRECTIONS].forEach((name) => transaction.objectStore(name).delete(everyKeyOf(storageId)));
   });
 }
 
@@ -409,7 +429,7 @@ export async function clearDirtyDays(storageId: string, days: DirtyDay[]): Promi
 export async function loadSyncState(storageId: string): Promise<SyncState> {
   return transact([STATE], "readonly", async (transaction) => {
     const stored = await requestResult(transaction.objectStore(STATE).get(syncStateKey(storageId)) as IDBRequest<Partial<SyncState> | undefined>);
-    return { ...emptySyncState(), ...stored };
+    return { ...emptySyncState(), ...stored, correctionCursors: { ...stored?.correctionCursors } };
   });
 }
 
@@ -418,7 +438,7 @@ export async function updateSyncState(storageId: string, change: (state: SyncSta
   return transact([STATE], "readwrite", async (transaction) => {
     const store = transaction.objectStore(STATE);
     const stored = await requestResult(store.get(syncStateKey(storageId)) as IDBRequest<Partial<SyncState> | undefined>);
-    const state: SyncState = { ...emptySyncState(), ...stored };
+    const state: SyncState = { ...emptySyncState(), ...stored, correctionCursors: { ...stored?.correctionCursors } };
     change(state);
     store.put(state, syncStateKey(storageId));
     return state;
@@ -468,6 +488,72 @@ export async function applyRemotePlaces(storageId: string, places: Place[], epoc
       const row = await requestResult(store.get([storageId, place.id]) as IDBRequest<StoredPlace | undefined>);
       if (row && row.place.updatedAt >= place.updatedAt) return;
       store.put({ storageId, id: place.id, place, s: epoch } satisfies StoredPlace);
+      changed = true;
+    }));
+    return changed;
+  });
+}
+
+// ---- Corrections ----------------------------------------------------------------
+
+/** Every correction of this device, deleted ones included, oldest first. */
+export async function loadCorrections(storageId: string): Promise<Correction[]> {
+  return transact([CORRECTIONS], "readonly", async (transaction) => {
+    const rows = await requestResult(transaction.objectStore(CORRECTIONS).getAll(everyKeyOf(storageId)) as IDBRequest<StoredCorrection[]>);
+    return rows.map((row) => row.correction).sort((first, second) => first.createdAt - second.createdAt || first.id.localeCompare(second.id));
+  });
+}
+
+/** Writes corrections created or deleted on this device; they are uploaded on the next backup. */
+export async function putLocalCorrections(storageId: string, corrections: Correction[]): Promise<void> {
+  if (!corrections.length) return;
+  await transact([CORRECTIONS, DIRTY_DAYS], "readwrite", (transaction) => {
+    const store = transaction.objectStore(CORRECTIONS);
+    const touched = new Set<string>();
+    for (const correction of corrections) {
+      store.put({ storageId, id: correction.id, correction, s: 0 } satisfies StoredCorrection);
+      markCorrectionDays(transaction, storageId, correction, touched);
+    }
+  });
+}
+
+export async function loadDirtyCorrections(storageId: string, epoch: number): Promise<Correction[]> {
+  return transact([CORRECTIONS], "readonly", async (transaction) => {
+    const rows = await requestResult(transaction.objectStore(CORRECTIONS).getAll(everyKeyOf(storageId)) as IDBRequest<StoredCorrection[]>);
+    return rows.filter((row) => row.s < epoch).map((row) => row.correction);
+  });
+}
+
+/** Marks sent corrections as backed up, unless one was deleted while the request was in flight. */
+export async function markCorrectionsSynced(storageId: string, sent: Correction[], epoch: number): Promise<void> {
+  if (!sent.length) return;
+  await transact([CORRECTIONS], "readwrite", async (transaction) => {
+    const store = transaction.objectStore(CORRECTIONS);
+    await Promise.all(sent.map(async (correction) => {
+      const row = await requestResult(store.get([storageId, correction.id]) as IDBRequest<StoredCorrection | undefined>);
+      if (row && row.correction.deleted === correction.deleted) store.put({ ...row, s: epoch } satisfies StoredCorrection);
+    }));
+  });
+}
+
+/**
+ * Takes the corrections from the backup: new ones are added, and a correction
+ * deleted elsewhere is deleted here. A correction never changes otherwise.
+ * Returns whether anything changed.
+ */
+export async function applyRemoteCorrections(storageId: string, corrections: Correction[], epoch: number): Promise<boolean> {
+  if (!corrections.length) return false;
+  return transact([CORRECTIONS, DIRTY_DAYS], "readwrite", async (transaction) => {
+    const store = transaction.objectStore(CORRECTIONS);
+    const touched = new Set<string>();
+    let changed = false;
+    await Promise.all(corrections.map(async (correction) => {
+      const row = await requestResult(store.get([storageId, correction.id]) as IDBRequest<StoredCorrection | undefined>);
+      if (row && (row.correction.deleted || !correction.deleted)) return;
+      // A local deletion that has not been sent yet is kept as it is.
+      const next = row ? { ...row.correction, deleted: true } : correction;
+      store.put({ storageId, id: correction.id, correction: next, s: row && row.s < epoch ? row.s : epoch } satisfies StoredCorrection);
+      markCorrectionDays(transaction, storageId, next, touched);
       changed = true;
     }));
     return changed;

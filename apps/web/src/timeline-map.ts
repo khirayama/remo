@@ -1,4 +1,5 @@
-import { dateKey, LifeEvent } from "./life-log";
+import { dateKey } from "./day";
+import type { LifeEvent } from "./life-log";
 
 export const PHOTO_CLUSTER_RADIUS_METERS = 50;
 export const MAX_DISPLAY_ACCURACY_METERS = 100;
@@ -20,6 +21,51 @@ export type PhotoLocationSuggestion = {
   distanceFromOriginalMeters?: number;
   previousId?: string;
   nextId?: string;
+};
+
+/** One point of a named place: stays within its radius belong to the place. */
+export type PlaceAnchor = { latitude: number; longitude: number; radiusMeters: number };
+
+/**
+ * A place the user named. Its own coordinate is the first anchor (with
+ * `radiusMeters`, 100m when absent); `anchors` are further points merged into
+ * it, for a place stays land in from more than one spot.
+ */
+export type NamedPlace = {
+  id: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  radiusMeters?: number;
+  anchors?: PlaceAnchor[];
+  deleted?: boolean;
+};
+
+export type TimelineCorrectionKind = "exclude" | "join_stay" | "not_stay";
+
+/**
+ * A correction the user (or an AI tool on their behalf) laid over the records.
+ * It never changes a record. Times are milliseconds, both ends included:
+ * `exclude` ignores the location samples in the range, `join_stay` makes the
+ * range one stay, `not_stay` turns the stays in it into movement. Corrections
+ * are applied oldest first (`createdAt`), so a newer one wins where they
+ * overlap. Only `deleted` ever changes after a correction is created.
+ */
+export type TimelineCorrection = {
+  id: string;
+  kind: TimelineCorrectionKind;
+  startedAt: number;
+  endedAt: number;
+  createdAt: number;
+  source?: "app" | "mcp";
+  deleted?: boolean;
+};
+
+/** What the user laid over the records of a day. */
+export type TimelineAdjustments = {
+  corrections?: TimelineCorrection[];
+  /** Stays at a named place take the coordinate of the anchor they matched. */
+  places?: NamedPlace[];
 };
 
 const MAX_CORRECTION_GAP_MS = 15 * 60 * 1000;
@@ -372,6 +418,10 @@ export type StayCluster = {
   endedAt: string;
   durationMs: number;
   events: CorrectedLocation[];
+  /** The named place the stay matched, when places were given. */
+  placeId?: string;
+  /** Whether a correction made or reshaped this stay. */
+  corrected?: boolean;
 };
 
 export type TimelineAnalysis = {
@@ -410,6 +460,8 @@ export type TimelineActivity =
     longitude: number;
     photos: LifeEvent[];
     events: CorrectedLocation[];
+    placeId?: string;
+    corrected?: boolean;
   }
   | {
     kind: "movement";
@@ -894,8 +946,11 @@ function stayPlaceCoordinate(visits: StayCluster[]): { latitude: number; longitu
 export function buildStayPlaces(events: LifeEvent[], analysis?: TimelineAnalysis): StayPlace[] {
   const places: StayPlace[] = [];
   for (const stay of analysis?.stayClusters ?? buildStayClusters(events)) {
+    // Stays at one named place are one place, however far apart its anchors are.
     const nearest = places
-      .map((place, index) => ({ index, distance: distanceMeters(place, stay) }))
+      .map((place, index) => ({ index, distance: stay.placeId || place.visits[0].placeId
+        ? (place.visits[0].placeId === stay.placeId ? 0 : Number.POSITIVE_INFINITY)
+        : distanceMeters(place, stay) }))
       .sort((first, second) => first.distance - second.distance)[0];
     if (nearest && nearest.distance <= STAY_PLACE_RADIUS_METERS) {
       const place = places[nearest.index];
@@ -937,7 +992,11 @@ export type StayVisitHistory = {
  * Collect revisits to the place at [target]. Stays are detected per day,
  * exactly like the day timeline, so every visit matches what that day shows.
  */
-export function buildStayVisitHistory(events: LifeEvent[], target: { latitude: number; longitude: number }): StayVisitHistory {
+export function buildStayVisitHistory(
+  events: LifeEvent[],
+  target: { latitude: number; longitude: number },
+  adjustments: TimelineAdjustments = {},
+): StayVisitHistory {
   const days = new Map<string, LifeEvent[]>();
   const nearbyDays = new Set<string>();
   events.forEach((event) => {
@@ -947,15 +1006,27 @@ export function buildStayVisitHistory(events: LifeEvent[], target: { latitude: n
     else days.set(day, [event]);
     if (hasCoordinates(event) && distanceMeters(event, target) <= STAY_HISTORY_SEARCH_RADIUS_METERS) nearbyDays.add(day);
   });
+  const isVisit = visitFilter(target, adjustments.places);
   const visits = [...nearbyDays]
-    .flatMap((day) => buildStayClusters(days.get(day) ?? []))
-    .filter((stay) => distanceMeters(stay, target) <= STAY_PLACE_RADIUS_METERS)
+    .flatMap((day) => analyzeTimeline(days.get(day) ?? [], { corrections: adjustments.corrections }).stayClusters)
+    .filter(isVisit)
     .sort((first, second) => second.startedAt.localeCompare(first.startedAt));
   return {
     visits,
     dayCount: new Set(visits.map((visit) => dateKey(visit.startedAt))).size,
     totalDurationMs: visits.reduce((total, visit) => total + visit.durationMs, 0),
   };
+}
+
+/**
+ * Which stays are visits to the place at [target]: when [target] is at a named
+ * place, the stays at that place (from any of its anchors); otherwise the
+ * stays within [STAY_PLACE_RADIUS_METERS].
+ */
+export function visitFilter(target: { latitude: number; longitude: number }, places?: readonly NamedPlace[]): (stay: { latitude: number; longitude: number }) => boolean {
+  const place = matchPlace(places, target)?.place;
+  if (place) return (stay) => matchPlace(places, stay)?.place.id === place.id;
+  return (stay) => !matchPlace(places, stay) && distanceMeters(stay, target) <= STAY_PLACE_RADIUS_METERS;
 }
 
 type TimelineNode =
@@ -984,6 +1055,8 @@ export function buildTimelineActivities(events: LifeEvent[], analysis?: Timeline
         latitude: stay.latitude,
         longitude: stay.longitude,
         events: stay.events,
+        ...(stay.placeId ? { placeId: stay.placeId } : {}),
+        ...(stay.corrected ? { corrected: true } : {}),
       },
     })),
     ...resolvedAnalysis.correctedLocations
@@ -1198,10 +1271,209 @@ function smoothedWalks(positions: CorrectedLocation[], stays: StayCluster[]): Co
   });
 }
 
-function analyzeTimeline(events: LifeEvent[]): TimelineAnalysis {
-  const corrected = correctedPositionEvents(events);
+// ---- Corrections and named places ----------------------------------------------
+
+export const DEFAULT_PLACE_RADIUS_METERS = STAY_PLACE_RADIUS_METERS;
+export const MIN_PLACE_RADIUS_METERS = 25;
+export const MAX_PLACE_RADIUS_METERS = 500;
+export const MAX_PLACE_ANCHORS = 20;
+/** The longest range one correction can cover. */
+export const MAX_CORRECTION_SPAN_MS = 24 * 60 * 60 * 1000;
+
+/** Live corrections, oldest first: a newer correction is applied later and wins. */
+function activeCorrections(corrections: TimelineCorrection[] | undefined): TimelineCorrection[] {
+  return (corrections ?? [])
+    .filter((correction) => !correction.deleted && correction.endedAt >= correction.startedAt)
+    .sort((first, second) => first.createdAt - second.createdAt || (first.id < second.id ? -1 : first.id > second.id ? 1 : 0));
+}
+
+/** The records without the location samples an `exclude` correction covers. Photos are kept. */
+export function withoutExcludedSamples(events: LifeEvent[], corrections: TimelineCorrection[] | undefined): LifeEvent[] {
+  const excludes = (corrections ?? []).filter((correction) => correction.kind === "exclude" && !correction.deleted);
+  if (!excludes.length) return events;
+  return events.filter((event) => {
+    if (event.source !== "location") return true;
+    const time = timestamp(event.startedAt);
+    return !excludes.some((correction) => time >= correction.startedAt && time <= correction.endedAt);
+  });
+}
+
+function stayFromPositions(members: CorrectedLocation[]): StayCluster {
+  const startedAt = members[0].event.startedAt;
+  const endedAt = members[members.length - 1].event.startedAt;
+  return {
+    id: "",
+    ...stayCenter(members),
+    startedAt,
+    endedAt,
+    durationMs: Math.max(0, timestamp(endedAt) - timestamp(startedAt)),
+    events: members,
+    corrected: true,
+  };
+}
+
+/**
+ * Applies `join_stay` and `not_stay` to the detected stays, oldest correction
+ * first. A join takes in every stay it overlaps and covers their union with
+ * its own range, so it keeps working when detection later moves a stay's
+ * edges; the positions in that span become one stay. `not_stay` drops the
+ * stays that lie at least half inside its range, which leaves their positions
+ * to the movement around them. Ids are given again in time order.
+ */
+function applyStayCorrections(stays: StayCluster[], positions: CorrectedLocation[], corrections: TimelineCorrection[]): StayCluster[] {
+  let result = stays;
+  for (const correction of corrections) {
+    if (correction.kind === "not_stay") {
+      result = result.filter((stay) => {
+        const start = timestamp(stay.startedAt);
+        const end = timestamp(stay.endedAt);
+        const overlap = Math.min(end, correction.endedAt) - Math.max(start, correction.startedAt);
+        if (end <= start) return !(start >= correction.startedAt && start <= correction.endedAt);
+        return overlap * 2 < end - start;
+      });
+    } else if (correction.kind === "join_stay") {
+      let spanStart = correction.startedAt;
+      let spanEnd = correction.endedAt;
+      const kept: StayCluster[] = [];
+      for (const stay of result) {
+        const start = timestamp(stay.startedAt);
+        const end = timestamp(stay.endedAt);
+        if (start <= correction.endedAt && end >= correction.startedAt) {
+          spanStart = Math.min(spanStart, start);
+          spanEnd = Math.max(spanEnd, end);
+        } else {
+          kept.push(stay);
+        }
+      }
+      const members = positions.filter((position) => {
+        const time = timestamp(position.event.startedAt);
+        return time >= spanStart && time <= spanEnd;
+      });
+      if (!members.length) continue;
+      result = [...kept, stayFromPositions(members)];
+    }
+  }
+  if (result === stays) return stays;
+  return result
+    .sort((first, second) => timestamp(first.startedAt) - timestamp(second.startedAt))
+    .map((stay, index) => ({ ...stay, id: `stay:${stay.startedAt}:${index}` }));
+}
+
+/** Every anchor of a place, its own coordinate first. */
+export function placeAnchors(place: NamedPlace): PlaceAnchor[] {
+  return [
+    { latitude: place.latitude, longitude: place.longitude, radiusMeters: place.radiusMeters ?? DEFAULT_PLACE_RADIUS_METERS },
+    ...(place.anchors ?? []),
+  ];
+}
+
+export type PlaceMatch<P extends NamedPlace = NamedPlace> = { place: P; anchor: PlaceAnchor; distanceMeters: number };
+
+/**
+ * The named place at [point]: of the anchors whose radius reaches the point,
+ * the nearest one. Deleted places never match.
+ */
+export function matchPlace<P extends NamedPlace>(places: readonly P[] | undefined, point: { latitude: number; longitude: number }): PlaceMatch<P> | undefined {
+  let best: PlaceMatch<P> | undefined;
+  for (const place of places ?? []) {
+    if (place.deleted) continue;
+    for (const anchor of placeAnchors(place)) {
+      const distance = distanceMeters(anchor, point);
+      if (distance <= anchor.radiusMeters && (!best || distance < best.distanceMeters)) {
+        best = { place, anchor, distanceMeters: distance };
+      }
+    }
+  }
+  return best;
+}
+
+/** Stays at a named place are drawn at the anchor they matched. */
+function snapStaysToPlaces(stays: StayCluster[], places: NamedPlace[] | undefined): StayCluster[] {
+  if (!places?.length) return stays;
+  return stays.map((stay) => {
+    const match = matchPlace(places, stay);
+    if (!match) return stay;
+    return { ...stay, latitude: match.anchor.latitude, longitude: match.anchor.longitude, placeId: match.place.id };
+  });
+}
+
+// The automatic rules smooth spikes of one or two fixes. A longer run of fixes
+// that jumps far away and straight back, faster than any trip, is left on the
+// route; it is offered to the user (and AI tools) to exclude.
+const OUTLIER_MAX_RUN = 5;
+const OUTLIER_MIN_DISTANCE_METERS = 300;
+const OUTLIER_MIN_SPEED_MPS = 30;
+const OUTLIER_MAX_NEIGHBOR_GAP_MS = 5 * 60 * 1000;
+const OUTLIER_MAX_RETURN_SHARE = 0.5;
+
+export type OutlierCandidate = {
+  /** Milliseconds, both ends included: an `exclude` correction for this range removes the run. */
+  startedAt: number;
+  endedAt: number;
+  eventIds: string[];
+  /** The fix of the run farthest from the route. */
+  latitude: number;
+  longitude: number;
+  /** How far that fix lies from the nearer of the fixes around the run. */
+  distanceMeters: number;
+};
+
+/**
+ * Runs of one to five location fixes outside any stay that leave the route by
+ * at least 300m and come back, faster than 30m/s both ways, while the fixes
+ * just before and after the run lie within half that distance of each other.
+ */
+export function findOutlierCandidates(analysis: TimelineAnalysis): OutlierCandidate[] {
+  const locations = analysis.correctedLocations;
+  const inStay = new Set(analysis.stayClusters.flatMap((stay) => stay.events.map((location) => location.event.id)));
+  const times = locations.map((location) => timestamp(location.event.startedAt));
+  const candidates: OutlierCandidate[] = [];
+  for (let before = 0; before < locations.length - 2; before += 1) {
+    for (let length = 1; length <= OUTLIER_MAX_RUN; length += 1) {
+      const after = before + length + 1;
+      if (after >= locations.length) break;
+      const run = locations.slice(before + 1, after);
+      if (run.every((location) => inStay.has(location.event.id))) continue;
+      const outMs = times[before + 1] - times[before];
+      const backMs = times[after] - times[after - 1];
+      if (outMs <= 0 || backMs <= 0 || outMs > OUTLIER_MAX_NEIGHBOR_GAP_MS || backMs > OUTLIER_MAX_NEIGHBOR_GAP_MS) continue;
+      const from = locations[before];
+      const to = locations[after];
+      let farthest = run[0];
+      let farthestDistance = -1;
+      let nearest = Number.POSITIVE_INFINITY;
+      for (const location of run) {
+        const distance = Math.min(distanceMeters(from, location), distanceMeters(location, to));
+        nearest = Math.min(nearest, distance);
+        if (distance > farthestDistance) {
+          farthest = location;
+          farthestDistance = distance;
+        }
+      }
+      if (nearest < OUTLIER_MIN_DISTANCE_METERS) continue;
+      if (distanceMeters(from, run[0]) / (outMs / 1000) < OUTLIER_MIN_SPEED_MPS) continue;
+      if (distanceMeters(run[run.length - 1], to) / (backMs / 1000) < OUTLIER_MIN_SPEED_MPS) continue;
+      if (distanceMeters(from, to) > nearest * OUTLIER_MAX_RETURN_SHARE) continue;
+      candidates.push({
+        startedAt: times[before + 1],
+        endedAt: times[after - 1],
+        eventIds: run.map((location) => location.event.id),
+        latitude: farthest.latitude,
+        longitude: farthest.longitude,
+        distanceMeters: farthestDistance,
+      });
+      before = after - 1;
+      break;
+    }
+  }
+  return candidates;
+}
+
+export function analyzeTimeline(events: LifeEvent[], adjustments: TimelineAdjustments = {}): TimelineAnalysis {
+  const corrections = activeCorrections(adjustments.corrections);
+  const corrected = correctedPositionEvents(withoutExcludedSamples(events, corrections));
   // Stays are detected on the corrected positions; smoothing only changes how the walks between them are drawn.
-  const stayClusters = correctedStayClusters(corrected);
+  const stayClusters = snapStaysToPlaces(applyStayCorrections(correctedStayClusters(corrected), corrected, corrections), adjustments.places);
   const correctedPositions = smoothedWalks(corrected, stayClusters);
   return {
     correctedPositions,
@@ -1210,8 +1482,8 @@ function analyzeTimeline(events: LifeEvent[]): TimelineAnalysis {
   };
 }
 
-export function buildTimelineSnapshot(events: LifeEvent[]): TimelineRenderSnapshot {
-  const analysis = analyzeTimeline(events);
+export function buildTimelineSnapshot(events: LifeEvent[], adjustments: TimelineAdjustments = {}): TimelineRenderSnapshot {
+  const analysis = analyzeTimeline(events, adjustments);
   const displayEvents = displayPhotoEventsWithLocations(events, analysis.correctedLocations);
   const photoClusters = clusterPhotoEvents(displayEvents);
   const stayPlaces = buildStayPlaces(events, analysis);

@@ -11,17 +11,23 @@
  * its center. `recorded` is the length of the fixes joined as they are. The second form also draws one time
  * window as an SVG: the recorded fixes in grey (orange: accuracy over 50m,
  * red: over 100m and not used) and the route the map draws on top of them.
+ * The corrections and named places in the export are laid over the records,
+ * as the app shows them; pass --raw to see the records without them.
  */
 import { readFileSync, writeFileSync } from "node:fs";
-import { dateKey, LifeEvent } from "../apps/web/src/life-log";
+import { Correction, dateKey, LifeEvent, normalizeCorrection, normalizePlace, Place } from "../apps/web/src/life-log";
 import { buildTimelineSnapshot, distanceMeters, isMostlyUntracked, MAX_DISPLAY_ACCURACY_METERS, STAY_CLUSTER_RADIUS_METERS, TimelineRenderSnapshot, UNTRACKED_GAP_MS } from "../apps/web/src/timeline-map";
 
-const [file, plotDay, plotFrom, plotTo, plotOutput] = process.argv.slice(2);
+const rawOnly = process.argv.includes("--raw");
+const [file, plotDay, plotFrom, plotTo, plotOutput] = process.argv.slice(2).filter((argument) => argument !== "--raw");
 if (!file || (plotDay && !plotOutput)) {
-  console.error("usage: timeline-report <export.json> [<day> <from HH:MM> <to HH:MM> <output.svg>]");
+  console.error("usage: timeline-report <export.json> [--raw] [<day> <from HH:MM> <to HH:MM> <output.svg>]");
   process.exit(1);
 }
-const document = JSON.parse(readFileSync(file, "utf8")) as { events: LifeEvent[]; exportedAt: string };
+const document = JSON.parse(readFileSync(file, "utf8")) as { events: LifeEvent[]; exportedAt: string; places?: unknown[]; corrections?: unknown[] };
+const places: Place[] = rawOnly ? [] : (document.places ?? []).flatMap((place) => normalizePlace(place) ?? []);
+const corrections: Correction[] = rawOnly ? [] : (document.corrections ?? []).flatMap((correction) => normalizeCorrection(correction) ?? []);
+if (places.length || corrections.length) console.log(`with ${corrections.length} correction(s) and ${places.length} named place(s) from the export (--raw to leave them out)`);
 const days = new Map<string, LifeEvent[]>();
 for (const event of document.events) {
   const day = dateKey(event.startedAt);
@@ -112,7 +118,7 @@ function plot(day: string, events: LifeEvent[], snapshot: TimelineRenderSnapshot
 
 for (const [day, events] of [...days].sort(([a], [b]) => a.localeCompare(b))) {
   if (plotDay && day !== plotDay) continue;
-  const snapshot = buildTimelineSnapshot(events);
+  const snapshot = buildTimelineSnapshot(events, { corrections, places });
   report(day, events, snapshot);
   if (plotDay) plot(day, events, snapshot);
 }

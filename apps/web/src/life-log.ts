@@ -1,5 +1,6 @@
 import { dateKey, dayRange } from "./day";
-import { clearStoredEvents, clearUploadedPhotoIds, countDirtyEvents, countEvents, loadEventsInRange, loadSyncState, loadUploadedPhotoIds, markPhotoUploaded, migrateLocalStorageValue, putLocalEvents, updateSyncState } from "./timeline-db";
+import { applyRemotePlaces, clearStoredEvents, clearUploadedPhotoIds, countDirtyEvents, countEvents, loadCorrections, loadEventsInRange, loadStoredPlaces, loadSyncState, loadUploadedPhotoIds, markPhotoUploaded, migrateLocalStorageValue, putLocalCorrections, putLocalEvents, updateSyncState } from "./timeline-db";
+import { MAX_CORRECTION_SPAN_MS, MAX_PLACE_ANCHORS, MAX_PLACE_RADIUS_METERS, MIN_PLACE_RADIUS_METERS, type PlaceAnchor, type TimelineCorrection, type TimelineCorrectionKind } from "./timeline-map";
 
 export { dateKey };
 
@@ -27,15 +28,85 @@ export type LifeEvent = {
   updatedAt: string;
 };
 
-/** A name the user gave to a place they stay at. `updatedAt` is in milliseconds. */
+/**
+ * A name the user gave to a place they stay at. `updatedAt` is in
+ * milliseconds. The coordinate is the place's first anchor (`radiusMeters`,
+ * 100m when absent); `anchors` are further points merged into it, and a place
+ * merged into another is deleted with `mergedInto` (docs/CORRECTIONS.md).
+ */
 export type Place = {
   id: string;
   name: string;
   latitude: number;
   longitude: number;
+  radiusMeters?: number;
+  anchors?: PlaceAnchor[];
+  mergedInto?: string;
   updatedAt: number;
   deleted: boolean;
 };
+
+/** A correction laid over the records (docs/CORRECTIONS.md). */
+export type Correction = TimelineCorrection & { source: "app" | "mcp"; deleted: boolean };
+
+const CORRECTION_KINDS = new Set<TimelineCorrectionKind>(["exclude", "join_stay", "not_stay"]);
+
+const finiteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const clampRadius = (value: number) => Math.min(MAX_PLACE_RADIUS_METERS, Math.max(MIN_PLACE_RADIUS_METERS, Math.round(value)));
+
+function normalizeAnchors(value: unknown): PlaceAnchor[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.slice(0, MAX_PLACE_ANCHORS).flatMap((item) => {
+    const raw = typeof item === "object" && item !== null ? item as Record<string, unknown> : {};
+    if (!finiteNumber(raw.latitude) || Math.abs(raw.latitude) > 90 || !finiteNumber(raw.longitude) || Math.abs(raw.longitude) > 180) return [];
+    return [{ latitude: raw.latitude, longitude: raw.longitude, radiusMeters: finiteNumber(raw.radiusMeters) ? clampRadius(raw.radiusMeters) : 100 }];
+  });
+}
+
+/** A place read from the backup or an import, or undefined when it is not one. */
+export function normalizePlace(value: unknown): Place | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.id !== "string" || !raw.id || !finiteNumber(raw.updatedAt)) return undefined;
+  if (!finiteNumber(raw.latitude) || !finiteNumber(raw.longitude)) return undefined;
+  const deleted = raw.deleted === true;
+  const name = typeof raw.name === "string" ? raw.name : "";
+  if (!deleted && !name.trim()) return undefined;
+  const anchors = normalizeAnchors(raw.anchors);
+  return {
+    id: raw.id,
+    name,
+    latitude: raw.latitude,
+    longitude: raw.longitude,
+    ...(finiteNumber(raw.radiusMeters) ? { radiusMeters: clampRadius(raw.radiusMeters) } : {}),
+    ...(anchors?.length ? { anchors } : {}),
+    ...(deleted && typeof raw.mergedInto === "string" && raw.mergedInto ? { mergedInto: raw.mergedInto } : {}),
+    updatedAt: raw.updatedAt,
+    deleted,
+  };
+}
+
+/** A correction read from the backup or an import, or undefined when it is not one. */
+export function normalizeCorrection(value: unknown): Correction | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.id !== "string" || !raw.id || typeof raw.kind !== "string" || !CORRECTION_KINDS.has(raw.kind as TimelineCorrectionKind)) return undefined;
+  if (!finiteNumber(raw.startedAt) || !finiteNumber(raw.endedAt) || raw.endedAt < raw.startedAt || raw.endedAt - raw.startedAt > MAX_CORRECTION_SPAN_MS) return undefined;
+  return {
+    id: raw.id,
+    kind: raw.kind as TimelineCorrectionKind,
+    startedAt: raw.startedAt,
+    endedAt: raw.endedAt,
+    createdAt: finiteNumber(raw.createdAt) ? raw.createdAt : 0,
+    source: raw.source === "mcp" ? "mcp" : "app",
+    deleted: raw.deleted === true,
+  };
+}
+
+/** A new correction made on this device. */
+export function newCorrection(kind: TimelineCorrectionKind, startedAt: number, endedAt: number): Correction {
+  return { id: crypto.randomUUID(), kind, startedAt, endedAt, createdAt: Date.now(), source: "app", deleted: false };
+}
 
 export type SyncCursor = {
   updatedAt: number;
@@ -303,8 +374,11 @@ export async function summarizeRange(storageId: string, range: ExportRange, sign
  */
 export async function buildExport(storageId: string, range: ExportRange): Promise<Blob> {
   const parts: string[] = [`{\n  "schemaVersion": 1,\n  "exportedAt": ${JSON.stringify(new Date().toISOString())},\n  "range": ${JSON.stringify(range)},\n  "events": [`];
+  const days = daysOf(range);
+  const rangeStart = days.length ? dayRange(days[0]).from : 0;
+  const rangeEnd = days.length ? dayRange(days[days.length - 1]).to : 0;
   const summary = { eventCount: 0, photoRecordCount: 0, photoCount: 0 };
-  for (const day of daysOf(range)) {
+  for (const day of days) {
     const events = await loadDayEvents(storageId, day);
     if (!events.length) continue;
     parts.push((summary.eventCount ? ",\n    " : "\n    ") + events.map((event) => JSON.stringify(event)).join(",\n    "));
@@ -315,7 +389,11 @@ export async function buildExport(storageId: string, range: ExportRange): Promis
       summary.photoCount += event.photoCount;
     }
   }
-  parts.push(`\n  ],\n  "summary": ${JSON.stringify(summary)}\n}\n`);
+  // The corrections and named places the timeline of this range is shown with.
+  const places = (await loadStoredPlaces(storageId)).filter((place) => !place.deleted);
+  const corrections = (await loadCorrections(storageId))
+    .filter((correction) => !correction.deleted && correction.startedAt < rangeEnd && correction.endedAt >= rangeStart);
+  parts.push(`\n  ],\n  "places": ${JSON.stringify(places)},\n  "corrections": ${JSON.stringify(corrections)},\n  "summary": ${JSON.stringify(summary)}\n}\n`);
   return new Blob(parts, { type: "application/json" });
 }
 
@@ -326,6 +404,28 @@ export async function downloadExport(storageId: string, range: ExportRange): Pro
   anchor.download = `remo-timeline-${range.from}-${range.to}-${new Date().toISOString().slice(0, 10)}.json`;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+/** What a Remo JSON file brings in besides its records. */
+export type ImportExtras = { places: Place[]; corrections: Correction[] };
+
+/** The named places and corrections of a Remo JSON file (absent in older exports). */
+export async function readImportExtras(file: Blob): Promise<ImportExtras> {
+  const parsed = JSON.parse(await file.text()) as { places?: unknown; corrections?: unknown };
+  const list = (value: unknown) => Array.isArray(value) ? value : [];
+  return {
+    places: list(parsed.places).flatMap((value) => normalizePlace(value) ?? []),
+    corrections: list(parsed.corrections).flatMap((value) => normalizeCorrection(value) ?? []),
+  };
+}
+
+/** Takes the places that are newer than the local copy and the corrections this device does not have. */
+export async function storeImportExtras(storageId: string, extras: ImportExtras): Promise<void> {
+  // Imported places are new to the backup too: epoch 0 marks them for upload.
+  if (extras.places.length) await applyRemotePlaces(storageId, extras.places, 0);
+  const known = new Set((await loadCorrections(storageId)).map((correction) => correction.id));
+  const fresh = extras.corrections.filter((correction) => !known.has(correction.id));
+  if (fresh.length) await putLocalCorrections(storageId, fresh);
 }
 
 export async function readImport(file: Blob): Promise<LifeEvent[]> {
