@@ -10,6 +10,12 @@ import java.net.URLEncoder
 
 data class RemoUser(val id: String, val email: String, val name: String)
 
+data class ApiToken(val id: String, val name: String, val createdAt: Long, val scope: String = "read") {
+    val canWrite: Boolean get() = scope == "write"
+}
+
+data class CreatedApiToken(val token: ApiToken, val plainToken: String)
+
 data class SyncCursor(val updatedAt: Long, val id: String) {
     fun token(): String = "$updatedAt|$id"
 
@@ -172,6 +178,18 @@ object ApiClient {
         }), token)
     }
 
+    /** Sleep sessions are keyed by start time; the later end wins on the server, so `updatedAt` is `endedAt`. */
+    suspend fun pushSleepSessions(sessions: List<SleepSession>, token: String? = SecureTokenStore.get()) = withContext(Dispatchers.IO) {
+        require(sessions.isNotEmpty() && sessions.size <= BATCH_SIZE)
+        val body = JSONObject().put("sessions", JSONArray().apply {
+            sessions.forEach {
+                put(JSONObject().put("id", "sleep:${it.startedAt}").put("startedAt", it.startedAt)
+                    .put("endedAt", it.endedAt).put("updatedAt", it.endedAt))
+            }
+        })
+        requireSuccess(request("POST", "/api/v1/sleep/batch", body.toString(), token))
+    }
+
     private fun postBatch(body: JSONObject, token: String?) {
         requireSuccess(request("POST", "/api/v1/events/batch", body.toString(), token))
     }
@@ -180,21 +198,104 @@ object ApiClient {
         val response = request("GET", "/api/v1/places", token = token)
         requireSuccess(response)
         val values = JSONObject(response.body).optJSONArray("data") ?: JSONArray()
-        List(values.length()) { index ->
-            values.getJSONObject(index).let {
-                NamedPlace(it.getString("id"), it.optString("name"), it.optDouble("latitude", 0.0), it.optDouble("longitude", 0.0), it.optLong("updatedAt"), it.optBoolean("deleted"))
-            }
-        }
+        List(values.length()) { index -> decodePlace(values.getJSONObject(index)) }
     }
 
     suspend fun pushPlaces(places: List<NamedPlace>, token: String?) = withContext(Dispatchers.IO) {
         val body = JSONObject().put("places", JSONArray().apply {
-            places.forEach {
-                put(JSONObject().put("id", it.id).put("name", it.name).put("latitude", it.latitude).put("longitude", it.longitude)
-                    .put("updatedAt", it.updatedAt).put("deleted", it.deleted))
-            }
+            places.forEach { put(placePayload(it)) }
         })
         requireSuccess(request("PUT", "/api/v1/places", body.toString(), token))
+    }
+
+    private fun placePayload(place: NamedPlace): JSONObject = JSONObject()
+        .put("id", place.id).put("name", place.name).put("latitude", place.latitude).put("longitude", place.longitude)
+        .put("updatedAt", place.updatedAt).put("deleted", place.deleted)
+        // An item left out keeps the server's value; an edited place sends all of
+        // them, so an empty anchor list removes the anchors added before.
+        .apply {
+            place.radiusMeters?.let { put("radiusMeters", it) }
+            put("anchors", JSONArray().apply {
+                place.anchors.forEach { put(JSONObject().put("latitude", it.latitude).put("longitude", it.longitude).put("radiusMeters", it.radiusMeters)) }
+            })
+            place.mergedInto?.let { put("mergedInto", it) }
+        }
+
+    private fun decodePlace(value: JSONObject): NamedPlace {
+        val anchors = value.optJSONArray("anchors")?.let { array ->
+            List(array.length()) { index ->
+                array.getJSONObject(index).let {
+                    PlaceAnchor(
+                        it.optDouble("latitude", 0.0),
+                        it.optDouble("longitude", 0.0),
+                        it.optDouble("radiusMeters", DEFAULT_PLACE_RADIUS_METERS).coerceIn(MIN_PLACE_RADIUS_METERS, MAX_PLACE_RADIUS_METERS),
+                    )
+                }
+            }
+        }.orEmpty()
+        return NamedPlace(
+            id = value.getString("id"),
+            name = value.optString("name"),
+            latitude = value.optDouble("latitude", 0.0),
+            longitude = value.optDouble("longitude", 0.0),
+            updatedAt = value.optLong("updatedAt"),
+            deleted = value.optBoolean("deleted"),
+            radiusMeters = if (value.isNull("radiusMeters")) null else value.optDouble("radiusMeters").coerceIn(MIN_PLACE_RADIUS_METERS, MAX_PLACE_RADIUS_METERS),
+            anchors = anchors.take(MAX_PLACE_ANCHORS),
+            mergedInto = if (value.isNull("mergedInto")) null else value.optString("mergedInto").takeIf(String::isNotBlank),
+        )
+    }
+
+    /** One page of the correction download: what changed and where to continue. */
+    data class CorrectionPage(val corrections: List<TimelineCorrection>, val cursor: Long, val hasMore: Boolean)
+
+    /** The server takes up to 200 corrections per request. */
+    const val CORRECTION_BATCH_SIZE = 200
+
+    suspend fun pushCorrections(corrections: List<TimelineCorrection>, token: String?) = withContext(Dispatchers.IO) {
+        require(corrections.isNotEmpty() && corrections.size <= CORRECTION_BATCH_SIZE)
+        val body = JSONObject().put("corrections", JSONArray().apply {
+            corrections.forEach { correction ->
+                put(JSONObject()
+                    .put("id", correction.id)
+                    .put("kind", correction.kind.wireValue)
+                    .put("startedAt", correction.startedAt)
+                    .put("endedAt", correction.endedAt)
+                    .put("createdAt", correction.createdAt)
+                    .put("source", correction.source.wireValue)
+                    .put("deleted", correction.deleted))
+            }
+        })
+        requireSuccess(request("PUT", "/api/v1/corrections", body.toString(), token))
+    }
+
+    /** Writes after [after], in the order they were written; follow up while [CorrectionPage.hasMore]. */
+    suspend fun fetchCorrections(after: Long, token: String?): CorrectionPage = withContext(Dispatchers.IO) {
+        val response = request("GET", "/api/v1/corrections?after=$after", token = token)
+        requireSuccess(response)
+        val data = JSONObject(response.body).getJSONObject("data")
+        val values = data.optJSONArray("corrections") ?: JSONArray()
+        CorrectionPage(
+            corrections = (0 until values.length()).mapNotNull { index -> decodeCorrection(values.getJSONObject(index)) },
+            cursor = data.optLong("cursor", after),
+            hasMore = data.optBoolean("hasMore"),
+        )
+    }
+
+    fun decodeCorrection(value: JSONObject): TimelineCorrection? {
+        val kind = timelineCorrectionKind(value.optString("kind")) ?: return null
+        val startedAt = value.optLong("startedAt", Long.MIN_VALUE)
+        val parsedEnd = value.optLong("endedAt", Long.MIN_VALUE)
+        if (startedAt == Long.MIN_VALUE || parsedEnd == Long.MIN_VALUE) return null
+        return TimelineCorrection(
+            id = value.optString("id").takeIf(String::isNotBlank) ?: return null,
+            kind = kind,
+            startedAt = startedAt,
+            endedAt = parsedEnd.coerceIn(startedAt, startedAt + MAX_CORRECTION_SPAN_MS),
+            createdAt = value.optLong("createdAt", 0L),
+            source = correctionSource(value.optString("source")),
+            deleted = value.optBoolean("deleted"),
+        )
     }
 
     suspend fun deleteAllData() = withContext(Dispatchers.IO) {
@@ -215,6 +316,32 @@ object ApiClient {
             throw ApiException(response.statusCode, message, code)
         }
     }
+
+    /** Tokens for the external API (MCP). The plain token is only returned when it is issued. */
+    suspend fun listApiTokens(): List<ApiToken> = withContext(Dispatchers.IO) {
+        val response = request("GET", "/api/v1/api-tokens", token = SecureTokenStore.get())
+        requireSuccess(response)
+        val values = JSONObject(response.body).optJSONArray("data") ?: JSONArray()
+        List(values.length()) { decodeApiToken(values.getJSONObject(it)) }
+    }
+
+    suspend fun createApiToken(name: String): CreatedApiToken = withContext(Dispatchers.IO) {
+        val response = request("POST", "/api/v1/api-tokens", JSONObject().put("name", name).toString(), SecureTokenStore.get())
+        requireSuccess(response)
+        val data = JSONObject(response.body).getJSONObject("data")
+        CreatedApiToken(decodeApiToken(data), data.getString("token"))
+    }
+
+    suspend fun deleteApiToken(id: String) = withContext(Dispatchers.IO) {
+        requireSuccess(request("DELETE", "/api/v1/api-tokens/${URLEncoder.encode(id, Charsets.UTF_8.name())}", token = SecureTokenStore.get()))
+    }
+
+    private fun decodeApiToken(value: JSONObject) = ApiToken(
+        value.getString("id"),
+        value.optString("name"),
+        value.optLong("createdAt"),
+        value.optString("scope", "read").ifBlank { "read" },
+    )
 
     private fun decodeEvent(value: JSONObject): LogEntry {
         val latitude = value.optDouble("latitude").takeUnless(Double::isNaN)

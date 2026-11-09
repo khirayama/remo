@@ -34,4 +34,16 @@ class SleepDataTest {
     fun emptySessionsAreIgnored() {
         assertEquals(emptyList<SleepSession>(), sleepSessionsEndingIn(listOf(SleepSession(30 * hour, 30 * hour)), day))
     }
+
+    @Test
+    fun mergeJoinsOverlapsAndSortsOldestFirst() {
+        val sessions = listOf(SleepSession(37 * hour, 38 * hour), SleepSession(24 * hour, 30 * hour), SleepSession(23 * hour, 29 * hour))
+        assertEquals(listOf(SleepSession(23 * hour, 30 * hour), SleepSession(37 * hour, 38 * hour)), mergeSleepSessions(sessions))
+    }
+
+    @Test
+    fun mergeJoinsTouchingSessionsAndDropsEmptyOnes() {
+        val sessions = listOf(SleepSession(0, 5 * hour), SleepSession(5 * hour, 8 * hour), SleepSession(9 * hour, 9 * hour))
+        assertEquals(listOf(SleepSession(0, 8 * hour)), mergeSleepSessions(sessions))
+    }
 }

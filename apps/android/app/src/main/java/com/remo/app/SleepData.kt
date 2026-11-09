@@ -22,7 +22,11 @@ private const val SLEEP_LOOKBACK_MS = 24 * 60 * 60 * 1000L
  * Sleep that ended within [day] (one day or a range of days), oldest first: a night counts for the day it ends on.
  * Several apps can write the same night to Health Connect, so overlapping sessions become one.
  */
-fun sleepSessionsEndingIn(sessions: List<SleepSession>, day: LongRange): List<SleepSession> {
+fun sleepSessionsEndingIn(sessions: List<SleepSession>, day: LongRange): List<SleepSession> =
+    mergeSleepSessions(sessions).filter { it.endedAt in day }
+
+/** Drops empty sessions and joins overlapping ones (the same night written by several apps), oldest first. */
+fun mergeSleepSessions(sessions: List<SleepSession>): List<SleepSession> {
     val merged = mutableListOf<SleepSession>()
     for (session in sessions.filter { it.endedAt > it.startedAt }.sortedBy(SleepSession::startedAt)) {
         val previous = merged.lastOrNull()
@@ -32,7 +36,7 @@ fun sleepSessionsEndingIn(sessions: List<SleepSession>, day: LongRange): List<Sl
             merged += session
         }
     }
-    return merged.filter { it.endedAt in day }
+    return merged
 }
 
 /** Falling asleep ([wake] false) or waking up ([wake] true) at [time]. */
@@ -49,7 +53,8 @@ fun sleepMoments(sessions: List<SleepSession>, day: LongRange): List<SleepMoment
 
 /**
  * Sleep is read from Health Connect whenever a day is shown or exported.
- * It is never stored or backed up: Health Connect stays the only copy on the device.
+ * It is not stored in the app's database: Health Connect stays the only copy on the device.
+ * While signed in, the sessions are also backed up to the cloud (see BackupCoordinator).
  */
 object SleepData {
     val permission: String = HealthPermission.getReadPermission(SleepSessionRecord::class)
@@ -64,6 +69,15 @@ object SleepData {
     suspend fun sessionsEndingIn(context: Context, day: LongRange): List<SleepSession> {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !isAvailable(context)) return emptyList()
         return attempt(emptyList()) { sleepSessionsEndingIn(read(context, day.first - SLEEP_LOOKBACK_MS, day.last + 1), day) }
+    }
+
+    /**
+     * All merged sessions that overlap [from]..[until], oldest first. `null` when Health Connect
+     * could not be read (being updated, disabled or its access revoked) so a backup does not skip the range.
+     */
+    suspend fun sessions(context: Context, from: Long, until: Long): List<SleepSession>? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !isAvailable(context)) return emptyList()
+        return attempt<List<SleepSession>?>(null) { mergeSleepSessions(read(context, from, until)) }
     }
 
     @RequiresApi(Build.VERSION_CODES.P)

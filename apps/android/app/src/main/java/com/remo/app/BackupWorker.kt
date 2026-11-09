@@ -19,6 +19,16 @@ import java.util.concurrent.TimeUnit
 /** The stored session is no longer accepted: the user has to sign in again. */
 class SessionExpiredException : Exception("セッションの有効期限が切れました")
 
+private const val SLEEP_BACKUP_OVERLAP_MS = 7 * 24 * 60 * 60 * 1000L
+private const val SLEEP_BACKUP_AHEAD_MS = 24 * 60 * 60 * 1000L
+
+/** The time range to back up: everything on the first run, otherwise from a week before the [cursor]. */
+internal fun sleepBackupRange(cursor: Long?, now: Long): Pair<Long, Long> =
+    (if (cursor == null) 0L else maxOf(0L, cursor - SLEEP_BACKUP_OVERLAP_MS)) to now + SLEEP_BACKUP_AHEAD_MS
+
+/** The newest end time that was sent, or [now] when there was nothing to send. */
+internal fun sleepBackupCursor(sessions: List<SleepSession>, now: Long): Long = sessions.maxOfOrNull(SleepSession::endedAt) ?: now
+
 /** A single gate shared by foreground refreshes and durable background backup. */
 object BackupCoordinator {
     const val STATUS_LOCAL = "端末に保存済み"
@@ -31,11 +41,14 @@ object BackupCoordinator {
     private var lastAttemptAt: Long? = null
     private var lastSuccessAt: Long? = null
     private var lastPullAt: Long? = null
+    private var lastSleepAt: Long? = null
     private var syncedRevision = -1L
     private var accountToken: String? = null
     private var status = STATUS_WAITING
 
     private const val PULL_INTERVAL_MS = 2 * 60_000L
+    /** Sleep changes a few times a day; reading Health Connect every minute is wasted work. */
+    private const val SLEEP_SYNC_INTERVAL_MS = 15 * 60_000L
 
     private fun preferences(context: Context) = context.getSharedPreferences("rem_sync", Context.MODE_PRIVATE)
 
@@ -52,6 +65,7 @@ object BackupCoordinator {
         lastAttemptAt = null
         lastSuccessAt = null
         lastPullAt = null
+        lastSleepAt = null
         syncedRevision = -1L
         status = STATUS_LOCAL
     }
@@ -67,6 +81,8 @@ object BackupCoordinator {
             remove(cursorKey(token))
             remove(legacyCursorKey(token))
             remove(fullPageKey(token))
+            remove(correctionCursorKey(token))
+            remove(sleepCursorKey(token))
             remove("sync_last_success_${accountKey(token)}")
             remove("sync_last_success_${token.hashCode()}")
         }
@@ -80,6 +96,11 @@ object BackupCoordinator {
     private fun cursorKey(token: String): String = "sync_cursor_${accountKey(token)}"
     /** Where an interrupted full download continues. */
     private fun fullPageKey(token: String): String = "sync_full_page_${accountKey(token)}"
+    /** How far the account's corrections have been read; kept per account. */
+    private fun correctionCursorKey(token: String): String = "sync_correction_cursor_${accountKey(token)}"
+
+    /** How far sleep has been backed up; kept per account. */
+    private fun sleepCursorKey(token: String): String = "sleep_synced_until_${accountKey(token)}"
 
     private fun loadCursor(context: Context, token: String): SyncCursor? {
         val preferences = preferences(context)
@@ -114,7 +135,7 @@ object BackupCoordinator {
         val account = SecureTokenStore.accountId() ?: return@withLock
         clearDevice(context)
         LogStore.get(context).claim(account)
-        SecureTokenStore.get()?.let { token -> preferences(context).edit { remove(cursorKey(token)); remove(fullPageKey(token)) } }
+        SecureTokenStore.get()?.let { token -> preferences(context).edit { remove(cursorKey(token)); remove(fullPageKey(token)); remove(correctionCursorKey(token)) } }
         resetSession()
     }
 
@@ -137,6 +158,7 @@ object BackupCoordinator {
             lastAttemptAt = null
             lastSuccessAt = null
             lastPullAt = null
+            lastSleepAt = null
             syncedRevision = -1L
         }
         val now = SystemClock.elapsedRealtime()
@@ -162,11 +184,27 @@ object BackupCoordinator {
                 ApiClient.pushEvents(batch, token)
                 store.markSynced(batch)
             }
+            // A failure reading or uploading Health Connect sleep must not hold
+            // back the records, places and photos; the next sync reads the same
+            // range again. An expired session still ends the whole backup.
+            val sleepDue = lastSleepAt?.let { now - it >= SLEEP_SYNC_INTERVAL_MS } ?: true
+            if (force || sleepDue) {
+                try {
+                    syncSleep(context, token)
+                    lastSleepAt = SystemClock.elapsedRealtime()
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (error: ApiException) {
+                    if (isSessionRejected(error)) throw error
+                } catch (_: Exception) {
+                }
+            }
             val revisionAfterPush = store.revision
             val pullDue = force || (lastPullAt?.let { now - it >= PULL_INTERVAL_MS } ?: true)
             if (pullDue) {
                 pull(context, store, token)
                 syncPlaces(store, token)
+                syncCorrections(context, store, token)
                 // Never keep an old account's response after sign-out/account change.
                 if (SecureTokenStore.get() != token) return@withLock STATUS_WAITING
                 lastPullAt = SystemClock.elapsedRealtime()
@@ -190,6 +228,23 @@ object BackupCoordinator {
             throw error
         }
     } }
+
+    /**
+     * Backs up sleep read from Health Connect. Nothing is stored locally except the cursor:
+     * the newest end time sent. Sessions are re-read from a week before it so edits are re-sent.
+     */
+    private suspend fun syncSleep(context: Context, token: String) {
+        if (!(SleepData.isAvailable(context) && SleepData.hasAccess(context))) return
+        val preferences = preferences(context)
+        val key = sleepCursorKey(token)
+        val now = System.currentTimeMillis()
+        val stored = if (preferences.contains(key)) preferences.getLong(key, 0L) else null
+        val (from, until) = sleepBackupRange(stored, now)
+        val sessions = SleepData.sessions(context, from, until) ?: return
+        sessions.chunked(ApiClient.BATCH_SIZE).forEach { ApiClient.pushSleepSessions(it, token) }
+        // Re-reading from a week before the cursor can find only older sessions; the cursor never moves back.
+        preferences.edit { putLong(key, maxOf(stored ?: 0L, sleepBackupCursor(sessions, now))) }
+    }
 
     /** Downloads page by page and applies each page, so a restore is never held in memory. */
     private suspend fun pull(context: Context, store: LogStore, token: String) {
@@ -233,6 +288,25 @@ object BackupCoordinator {
         store.applyRemotePlaces(ApiClient.fetchPlaces(token))
     }
 
+    /** Sends this device's corrections, then reads the account's from its cursor. */
+    private suspend fun syncCorrections(context: Context, store: LogStore, token: String) {
+        while (true) {
+            val batch = store.dirtyCorrections(ApiClient.CORRECTION_BATCH_SIZE)
+            if (batch.isEmpty()) break
+            ApiClient.pushCorrections(batch, token)
+            store.markCorrectionsSynced(batch)
+        }
+        var cursor = preferences(context).getLong(correctionCursorKey(token), 0L)
+        while (true) {
+            val page = ApiClient.fetchCorrections(cursor, token)
+            if (SecureTokenStore.get() != token) return
+            store.applyRemoteCorrections(page.corrections)
+            cursor = page.cursor
+            if (!page.hasMore) break
+        }
+        preferences(context).edit { putLong(correctionCursorKey(token), cursor) }
+    }
+
     private suspend fun clearDevice(context: Context) {
         LogStore.get(context).clearAll()
         StayIndexStorage.delete(context)
@@ -245,7 +319,7 @@ object BackupCoordinator {
         val token = SecureTokenStore.get()
         if (token != null && !belongsToOtherAccount(context)) {
             ApiClient.deleteAllData()
-            preferences(context).edit { remove(cursorKey(token)); remove(fullPageKey(token)) }
+            preferences(context).edit { remove(cursorKey(token)); remove(fullPageKey(token)); remove(correctionCursorKey(token)); remove(sleepCursorKey(token)) }
         }
         AutomaticCaptureService.setEnabled(context, false)
         clearDevice(context)
