@@ -23,6 +23,7 @@ struct SettingsActions {
     let onOpenAuth: () -> Void
     let onSignOut: () -> Void
     let onDeleteAccount: () -> Void
+    let onApiTokens: () -> Void
 }
 
 /// Settings grouped like Android: 記録 / バックアップ / データ / 削除.
@@ -94,6 +95,8 @@ struct SettingsView: View {
                             GroupDivider()
                             ActionRow(systemName: "person", title: email, subtitle: "ログイン中", action: nil)
                             GroupDivider()
+                            ActionRow(systemName: "key", title: "AIツールとの接続（MCP）", subtitle: "バックアップした滞在や移動をAIツールから読み取れるようにします", action: actions.onApiTokens) { RowChevron() }
+                            GroupDivider()
                             ActionRow(systemName: "rectangle.portrait.and.arrow.right", title: "ログアウト", action: actions.onSignOut)
                         }
                     } else {
@@ -149,9 +152,9 @@ struct SettingsView: View {
 
     private var sleepSubtitle: String {
         switch state.sleepAccess {
-        case .granted: "ヘルスケアの睡眠をタイムラインに表示しています"
+        case .granted: "ヘルスケアの睡眠をタイムラインに表示し、ログイン中はバックアップしています"
         case .noData: "睡眠を読み取れません。ヘルスケアに睡眠の記録がないか、Remoへの共有がオフになっています"
-        case .notRequested, .unavailable: "ヘルスケアの睡眠をタイムラインに表示します。バックアップはしません"
+        case .notRequested, .unavailable: "ヘルスケアの睡眠をタイムラインに表示します。許可するとログイン中はバックアップも行います"
         }
     }
 
