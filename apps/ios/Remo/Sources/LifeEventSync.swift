@@ -118,7 +118,63 @@ enum LifeEventSync {
             let longitude: Double
             let updatedAt: Double
             let deleted: Bool
+            let radiusMeters: Double?
+            let anchors: [PlaceAnchor]?
+            let mergedInto: String?
+
+            var place: NamedPlace {
+                NamedPlace(
+                    id: id,
+                    name: name,
+                    latitude: latitude,
+                    longitude: longitude,
+                    radiusMeters: radiusMeters,
+                    anchors: anchors,
+                    mergedInto: mergedInto,
+                    // The server keeps whole milliseconds; so does the local copy, or it would never compare equal.
+                    updatedAt: Date(timeIntervalSince1970: updatedAt / 1000),
+                    deleted: deleted,
+                )
+            }
         }
+    }
+
+    /// One correction as the API sends it. Times are milliseconds.
+    struct RemoteCorrection: Decodable {
+        let id: String
+        let kind: TimelineCorrectionKind
+        let startedAt: Double
+        let endedAt: Double
+        let createdAt: Double
+        let source: TimelineCorrectionSource?
+        let deleted: Bool?
+
+        var correction: TimelineCorrection {
+            TimelineCorrection(
+                id: id,
+                kind: kind,
+                startedAt: Date(timeIntervalSince1970: startedAt / 1000),
+                endedAt: Date(timeIntervalSince1970: endedAt / 1000),
+                createdAt: Int64(createdAt.rounded()),
+                source: source ?? .app,
+                deleted: deleted ?? false,
+            )
+        }
+    }
+
+    struct CorrectionsPage: Decodable {
+        let data: Page
+
+        struct Page: Decodable {
+            let corrections: [RemoteCorrection]
+            let cursor: Double
+            let hasMore: Bool
+        }
+    }
+
+    /// Reads one page of `/api/v1/corrections`; exposed for the sync tests.
+    static func decodeCorrectionsPage(_ data: Data) throws -> CorrectionsPage.Page {
+        try JSONDecoder().decode(CorrectionsPage.self, from: data).data
     }
 
     /// Backs this device's changes up and, when [pull] is set, brings in what
@@ -154,9 +210,15 @@ enum LifeEventSync {
             try await send("api/v1/events/batch", method: "POST", token: token, body: ["events": batch.map(eventPayload)])
             database.markSynced(batch)
         }
+        // Sleep is read from HealthKit, so a failure there never blocks the rest of the backup.
+        do { try await SleepBackup.synchronize(token: token, account: account) }
+        catch SyncError.unauthorized { throw SyncError.unauthorized }
+        catch {}
         guard pull else { return .synced }
         try await download(database: database, token: token, account: account)
         try await syncPlaces(database: database, token: token)
+        // Corrections come right after the places they name.
+        try await syncCorrections(database: database, token: token, account: account)
         return .synced
     }
 
@@ -203,17 +265,68 @@ enum LifeEventSync {
         let dirty = database.dirtyPlaces()
         for start in stride(from: 0, to: dirty.count, by: 200) {
             let batch = Array(dirty[start..<Swift.min(start + 200, dirty.count)])
-            try await send("api/v1/places", method: "PUT", token: token, body: ["places": batch.map { place -> [String: Any] in
-                ["id": place.id, "name": place.name, "latitude": place.latitude, "longitude": place.longitude, "updatedAt": (place.updatedAt.timeIntervalSince1970 * 1000).rounded(), "deleted": place.deleted]
-            }])
+            try await send("api/v1/places", method: "PUT", token: token, body: ["places": batch.map(placePayload)])
             database.markPlacesSynced(batch)
         }
         let data = try await request(AppConfig.apiBaseURL.appendingPathComponent("api/v1/places"), token: token)
         let places = try JSONDecoder().decode(PlacesResponse.self, from: data).data
-        database.applyRemotePlaces(places.map {
-            // The server keeps whole milliseconds; so does the local copy, or it would never compare equal.
-            NamedPlace(id: $0.id, name: $0.name, latitude: $0.latitude, longitude: $0.longitude, updatedAt: Date(timeIntervalSince1970: $0.updatedAt / 1000), deleted: $0.deleted)
-        })
+        database.applyRemotePlaces(places.map(\.place))
+    }
+
+    /// Every field of an edited place: an item left out keeps the server's
+    /// value, so an empty anchor list is sent to remove the last anchor.
+    private static func placePayload(_ place: NamedPlace) -> [String: Any] {
+        var body: [String: Any] = [
+            "id": place.id,
+            "name": place.name,
+            "latitude": place.latitude,
+            "longitude": place.longitude,
+            "updatedAt": (place.updatedAt.timeIntervalSince1970 * 1000).rounded(),
+            "deleted": place.deleted,
+        ]
+        if let radiusMeters = place.radiusMeters { body["radiusMeters"] = radiusMeters }
+        if let anchors = place.anchors {
+            body["anchors"] = anchors.map { ["latitude": $0.latitude, "longitude": $0.longitude, "radiusMeters": $0.radiusMeters] }
+        }
+        if let mergedInto = place.mergedInto { body["mergedInto"] = mergedInto }
+        return body
+    }
+
+    /// Sends the corrections that were not uploaded in this epoch and reads
+    /// every page after this account's cursor. A received correction is added
+    /// when it is missing here, and a deletion is applied; nothing else changes.
+    private static func syncCorrections(database: LogDatabase, token: String, account: String) async throws {
+        while true {
+            let batch = database.dirtyCorrections(limit: 200)
+            if batch.isEmpty { break }
+            try await send("api/v1/corrections", method: "PUT", token: token, body: ["corrections": batch.map(correctionPayload)])
+            database.markCorrectionsSynced(batch)
+        }
+        var cursor = correctionCursor(account: account)
+        while true {
+            var components = URLComponents(url: AppConfig.apiBaseURL.appendingPathComponent("api/v1/corrections"), resolvingAgainstBaseURL: false)!
+            components.queryItems = [URLQueryItem(name: "after", value: String(cursor))]
+            let data = try await request(components.url!, token: token)
+            // Never apply an old account's response after sign-out or an account change.
+            guard KeychainToken.load() == token else { throw SyncError.unavailable }
+            let page = try decodeCorrectionsPage(data)
+            database.applyRemoteCorrections(page.corrections.map(\.correction))
+            cursor = Int64(page.cursor)
+            UserDefaults.standard.set(String(cursor), forKey: correctionCursorKey(account))
+            if !page.hasMore { break }
+        }
+    }
+
+    private static func correctionPayload(_ correction: TimelineCorrection) -> [String: Any] {
+        [
+            "id": correction.id,
+            "kind": correction.kind.rawValue,
+            "startedAt": (correction.startedAt.timeIntervalSince1970 * 1000).rounded(),
+            "endedAt": (correction.endedAt.timeIntervalSince1970 * 1000).rounded(),
+            "createdAt": correction.createdAt,
+            "source": correction.source.rawValue,
+            "deleted": correction.deleted,
+        ]
     }
 
     static func deleteAll() async throws {
@@ -256,7 +369,7 @@ enum LifeEventSync {
     // A 2xx response means every item was handled: applied, or rejected by the
     // server as invalid. Either way it is done, so one malformed record cannot
     // block the rest of the queue forever.
-    private static func send(_ path: String, method: String, token: String, body: [String: Any]) async throws {
+    static func send(_ path: String, method: String, token: String, body: [String: Any]) async throws {
         var request = URLRequest(url: AppConfig.apiBaseURL.appendingPathComponent(path))
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -285,6 +398,12 @@ enum LifeEventSync {
     private static func cursorKey(_ account: String) -> String { "remo.sync.cursor.account.\(account)" }
     /// Where an interrupted full download continues.
     private static func fullPageKey(_ account: String) -> String { "remo.sync.full-page.account.\(account)" }
+    /// The last correction this account received, independent of the records' cursor.
+    private static func correctionCursorKey(_ account: String) -> String { "remo.corrections.cursor.account.\(account)" }
+
+    private static func correctionCursor(account: String) -> Int64 {
+        Int64(UserDefaults.standard.string(forKey: correctionCursorKey(account)) ?? "") ?? 0
+    }
 
     private static func loadCursor(account: String, token: String) -> SyncCursor? {
         if let cursor = SyncCursor.parse(UserDefaults.standard.string(forKey: cursorKey(account))) { return cursor }
@@ -303,6 +422,8 @@ enum LifeEventSync {
     static func forgetDownloadPosition(account: String) {
         UserDefaults.standard.removeObject(forKey: cursorKey(account))
         UserDefaults.standard.removeObject(forKey: fullPageKey(account))
+        // "Delete everything" also deletes the corrections, so their cursor starts again too.
+        UserDefaults.standard.removeObject(forKey: correctionCursorKey(account))
     }
 
     /// Forgets the sync state of the signed-in account after that account has
@@ -314,6 +435,7 @@ enum LifeEventSync {
         }
         guard let account = AuthStore.storedUserID() else { return }
         forgetDownloadPosition(account: account)
+        SleepBackup.forgetCursor(account: account)
         database.releaseOwner(account)
         // The partial download file of earlier versions is no longer used.
         try? FileManager.default.removeItem(at: FileManager.default.remoSupportDirectory().appendingPathComponent("remo-full-sync-staging.json"))

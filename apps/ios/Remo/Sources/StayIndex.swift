@@ -21,7 +21,7 @@ extension StayCluster {
 
 // Bump whenever stay detection or the cache layout changes so every cached
 // day is recomputed.
-let stayIndexVersion = 4
+let stayIndexVersion = 5
 
 /// Derived, device-local cache of each past day's stays. It is never synced or
 /// exported and can be dropped at any time: the database records which days
@@ -56,9 +56,12 @@ func stayDay(_ key: String, calendar: Calendar = .current) -> Date? {
     return calendar.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))
 }
 
-/// The stays of one day's records.
-func detectDayStays(_ entries: [LogEntry]) -> [StaySummary] {
-    buildStayClusters(entries).map(\.summary)
+/// The stays of one day's records with the corrections laid over them. Named
+/// places are left out: the cache holds the stays as detected, and the views
+/// match them to the places when they are shown, so naming a place never
+/// invalidates the cache.
+func detectDayStays(_ entries: [LogEntry], corrections: [TimelineCorrection] = []) -> [StaySummary] {
+    analyzeTimeline(entries, adjustments: TimelineAdjustments(corrections: corrections)).stayClusters.map(\.summary)
 }
 
 /// Detects the stays of `days` again, reading each day's records through
@@ -71,6 +74,7 @@ func refreshStayIndex(
     cache: inout StayIndexCache,
     days: [String],
     today: String,
+    corrections: [TimelineCorrection] = [],
     loadDay: (String) -> [LogEntry],
     onDay: (String) -> Void = { _ in },
     onProgress: (Int, Int) -> Void = { _, _ in },
@@ -83,7 +87,7 @@ func refreshStayIndex(
     let stale = Array(Set(days.filter { $0 < today })).sorted()
     for (index, day) in stale.enumerated() {
         try Task.checkCancellation()
-        let stays = detectDayStays(loadDay(day))
+        let stays = detectDayStays(loadDay(day), corrections: corrections)
         cache.days[day] = stays.isEmpty ? nil : stays
         changed = true
         onDay(day)
@@ -97,9 +101,12 @@ func allStays(_ cache: StayIndexCache, open: [StaySummary]) -> [StaySummary] {
     (cache.days.values.flatMap { $0 } + open).sorted { $0.startedAt < $1.startedAt }
 }
 
-/// A place built from every stay within `stayPlaceRadiusMeters` across all days.
+/// A place built from every stay within `stayPlaceRadiusMeters` across all
+/// days, or every stay at one named place.
 struct AllTimeStayPlace: Identifiable, Equatable {
     let id: String
+    /// The named place, when the stays matched one.
+    let placeId: String?
     let coordinate: CLLocationCoordinate2D
     /// Newest first.
     let visits: [StaySummary]
@@ -108,7 +115,7 @@ struct AllTimeStayPlace: Identifiable, Equatable {
     let lastVisitedAt: Date
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.id == rhs.id && lhs.visits == rhs.visits && lhs.coordinate.latitude == rhs.coordinate.latitude && lhs.coordinate.longitude == rhs.coordinate.longitude
+        lhs.id == rhs.id && lhs.placeId == rhs.placeId && lhs.visits == rhs.visits && lhs.coordinate.latitude == rhs.coordinate.latitude && lhs.coordinate.longitude == rhs.coordinate.longitude
     }
 }
 
@@ -118,13 +125,15 @@ private let placeGridDegrees = 0.01
 
 private final class PlaceBuilder {
     let id: String
+    let placeId: String?
     var coordinate: CLLocationCoordinate2D
     private var latitudes: [Double] = []
     private var longitudes: [Double] = []
     private(set) var visits: [StaySummary] = []
 
-    init(id: String, coordinate: CLLocationCoordinate2D) {
+    init(id: String, placeId: String? = nil, coordinate: CLLocationCoordinate2D) {
         self.id = id
+        self.placeId = placeId
         self.coordinate = coordinate
     }
 
@@ -133,6 +142,11 @@ private final class PlaceBuilder {
         insertSorted(&latitudes, stay.latitude)
         insertSorted(&longitudes, stay.longitude)
         coordinate = CLLocationCoordinate2D(latitude: latitudes[latitudes.count / 2], longitude: longitudes[longitudes.count / 2])
+    }
+
+    /// A named place sits at its own coordinate, however far apart its anchors are.
+    func addNamed(_ stay: StaySummary) {
+        visits.append(stay)
     }
 
     private func insertSorted(_ values: inout [Double], _ value: Double) {
@@ -152,11 +166,24 @@ private struct GridCell: Hashable {
 
 /// Group every stay into places the same way the day timeline groups one day
 /// (`buildStayPlaces`): each stay joins the nearest place within
-/// `stayPlaceRadiusMeters`, and a place sits at the median of its visits.
-func buildAllTimeStayPlaces(_ stays: [StaySummary], calendar: Calendar = .current) -> [AllTimeStayPlace] {
+/// `stayPlaceRadiusMeters`, and a place sits at the median of its visits. A
+/// stay that matches a named place is grouped under it, at its coordinate.
+func buildAllTimeStayPlaces(_ stays: [StaySummary], namedPlaces: [NamedPlace] = [], calendar: Calendar = .current) -> [AllTimeStayPlace] {
     var places: [PlaceBuilder] = []
+    var named: [String: PlaceBuilder] = [:]
     var grid: [GridCell: [PlaceBuilder]] = [:]
     for stay in stays.sorted(by: { $0.startedAt < $1.startedAt }) {
+        if let match = matchPlace(namedPlaces, stay.coordinate) {
+            if let place = named[match.place.id] {
+                place.addNamed(stay)
+            } else {
+                let place = PlaceBuilder(id: "named:\(match.place.id)", placeId: match.place.id, coordinate: CLLocationCoordinate2D(latitude: match.place.latitude, longitude: match.place.longitude))
+                place.addNamed(stay)
+                named[match.place.id] = place
+                places.append(place)
+            }
+            continue
+        }
         let cell = GridCell(row: Int(floor(stay.latitude / placeGridDegrees)), column: Int(floor(stay.longitude / placeGridDegrees)))
         var nearest: PlaceBuilder?
         var nearestDistance = Double.greatestFiniteMagnitude
@@ -183,6 +210,7 @@ func buildAllTimeStayPlaces(_ stays: [StaySummary], calendar: Calendar = .curren
     return places.map { place in
         AllTimeStayPlace(
             id: place.id,
+            placeId: place.placeId,
             coordinate: place.coordinate,
             visits: place.visits.reversed(),
             dayCount: Set(place.visits.map { stayDayKey($0.startedAt, calendar: calendar) }).count,
@@ -197,8 +225,9 @@ func buildAllTimeStayPlaces(_ stays: [StaySummary], calendar: Calendar = .curren
 }
 
 /// The same result as `buildStayVisitHistory`, read from already detected stays.
-func stayVisitHistory(from stays: [StaySummary], target: CLLocationCoordinate2D, calendar: Calendar = .current) -> StayVisitHistory {
-    stayVisitHistory(visits: stays.filter { distanceMeters($0.coordinate, target) <= stayPlaceRadiusMeters }.sorted { $0.startedAt > $1.startedAt }, calendar: calendar)
+func stayVisitHistory(from stays: [StaySummary], target: CLLocationCoordinate2D, places: [NamedPlace]? = nil, calendar: Calendar = .current) -> StayVisitHistory {
+    let isVisit = visitFilter(target: target, places: places)
+    return stayVisitHistory(visits: stays.filter { isVisit($0.latitude, $0.longitude) }.sorted { $0.startedAt > $1.startedAt }, calendar: calendar)
 }
 
 /// Summary counts for visits that are already newest first.
@@ -276,13 +305,15 @@ private actor StayIndexWorker {
         let today = stayDayKey(Date())
         let dirty = database.dirtyDays()
         let tokens = Dictionary(dirty.map { ($0.day, $0) }, uniquingKeysWith: { first, _ in first })
+        // Named places are matched when the stays are shown, never here.
+        let corrections = database.corrections()
         // The first pass covers every recorded day; an interrupted pass
         // continues with the days it has not reached.
         let days = working.complete
             ? dirty.map(\.day)
             : database.recordedDays().map { stayDayKey($0) }.filter { working.days[$0] == nil } + dirty.map(\.day)
         let load: (String) -> [LogEntry] = { day in stayDay(day).map { database.entries(onDayOf: $0) } ?? [] }
-        if try refreshStayIndex(cache: &working, days: days, today: today, loadDay: load, onDay: { day in
+        if try refreshStayIndex(cache: &working, days: days, today: today, corrections: corrections, loadDay: load, onDay: { day in
             if let token = tokens[day] { database.clearDirtyDays([token]) }
             unsaved = true
         }, onProgress: onProgress) { unsaved = true }
@@ -292,7 +323,7 @@ private actor StayIndexWorker {
         }
         // Today (and any record dated later) is detected on every update.
         let openDays = Set([today] + dirty.map(\.day).filter { $0 > today })
-        return allStays(working, open: openDays.flatMap { detectDayStays(load($0)) })
+        return allStays(working, open: openDays.flatMap { detectDayStays(load($0), corrections: corrections) })
     }
 
     func reset() { cache = nil }

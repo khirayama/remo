@@ -1,13 +1,34 @@
+import CoreLocation
 import Foundation
 
-/// A name the user gave to a place they stay at.
+/// One point of a named place: stays within its radius belong to the place.
+struct PlaceAnchor: Codable, Equatable {
+    let latitude: Double
+    let longitude: Double
+    let radiusMeters: Double
+}
+
+/// A name the user gave to a place they stay at. Its own coordinate is the
+/// first anchor (`radiusMeters`, 100m when absent); `anchors` are further
+/// points merged into it, for a place stays land in from more than one spot.
+/// `mergedInto` is set on a place a merge deleted.
 struct NamedPlace: Equatable, Identifiable {
     var id: String = UUID().uuidString
     var name: String
     var latitude: Double
     var longitude: Double
+    var radiusMeters: Double?
+    var anchors: [PlaceAnchor]?
+    var mergedInto: String?
     var updatedAt: Date = Date()
     var deleted = false
+
+    var coordinate: CLLocationCoordinate2D { CLLocationCoordinate2D(latitude: latitude, longitude: longitude) }
+}
+
+/// Rounds a radius into the range a place can use.
+func normalizedPlaceRadius(_ radius: Double) -> Double {
+    min(maxPlaceRadiusMeters, max(minPlaceRadiusMeters, radius))
 }
 
 /// A deletion waiting to be sent, with the hints that tell the server where the record is stored.
@@ -214,7 +235,7 @@ final class LogDatabase: @unchecked Sendable {
 
     func clear() {
         write { connection in
-            try connection.execute("DELETE FROM entries; DELETE FROM pending_deletes; DELETE FROM tombstones; DELETE FROM dirty_days; DELETE FROM places;")
+            try connection.execute("DELETE FROM entries; DELETE FROM pending_deletes; DELETE FROM tombstones; DELETE FROM dirty_days; DELETE FROM places; DELETE FROM corrections;")
             return true
         }
     }
@@ -257,11 +278,11 @@ final class LogDatabase: @unchecked Sendable {
         }
     }
 
-    /// True while records, deletions or places still have to be uploaded.
+    /// True while records, deletions, places or corrections still have to be uploaded.
     func hasPendingChanges() -> Bool {
         read(false) { connection in
             try connection.query(
-                "SELECT EXISTS (SELECT 1 FROM entries WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM pending_deletes) OR EXISTS (SELECT 1 FROM places WHERE synced_epoch < ?1)",
+                "SELECT EXISTS (SELECT 1 FROM entries WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM pending_deletes) OR EXISTS (SELECT 1 FROM places WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM corrections WHERE synced_epoch < ?1)",
                 [.integer(self.epoch)],
             ) { $0.integer(0) }.first == 1
         }
@@ -351,7 +372,7 @@ final class LogDatabase: @unchecked Sendable {
     // MARK: Places
 
     func places() -> [NamedPlace] {
-        read([]) { try $0.query("SELECT id, name, latitude, longitude, updated_at, deleted FROM places", row: Self.place) }
+        read([]) { try $0.query("SELECT \(Self.placeColumns) FROM places", row: Self.place) }
     }
 
     func putPlace(_ place: NamedPlace) {
@@ -362,7 +383,7 @@ final class LogDatabase: @unchecked Sendable {
     }
 
     func dirtyPlaces() -> [NamedPlace] {
-        read([]) { try $0.query("SELECT id, name, latitude, longitude, updated_at, deleted FROM places WHERE synced_epoch < ?", [.integer(self.epoch)], row: Self.place) }
+        read([]) { try $0.query("SELECT \(Self.placeColumns) FROM places WHERE synced_epoch < ?", [.integer(self.epoch)], row: Self.place) }
     }
 
     func markPlacesSynced(_ sent: [NamedPlace]) {
@@ -388,6 +409,124 @@ final class LogDatabase: @unchecked Sendable {
         }
     }
 
+    /// Adds imported places that are newer than the local copy; they are uploaded later.
+    func importPlaces(_ places: [NamedPlace]) {
+        guard !places.isEmpty else { return }
+        write { connection in
+            var changed = false
+            for place in places {
+                let local = try connection.query("SELECT updated_at FROM places WHERE id = ?", [.text(place.id)], row: { $0.double(0) }).first
+                if let local, Self.milliseconds(Date(timeIntervalSince1970: local)) >= Self.milliseconds(place.updatedAt) { continue }
+                try Self.store(connection, place, syncedEpoch: 0)
+                changed = true
+            }
+            return changed
+        }
+    }
+
+    // MARK: Corrections
+
+    func corrections() -> [TimelineCorrection] {
+        read([]) { try $0.query("SELECT \(Self.correctionColumns) FROM corrections", row: Self.correction) }
+    }
+
+    func correction(id: String) -> TimelineCorrection? {
+        read(nil) { try $0.query("SELECT \(Self.correctionColumns) FROM corrections WHERE id = ?", [.text(id)], row: Self.correction).first }
+    }
+
+    /// Corrections that overlap `[from, to)`; used by the export.
+    func corrections(from: Date, to: Date) -> [TimelineCorrection] {
+        read([]) { try $0.query(
+            "SELECT \(Self.correctionColumns) FROM corrections WHERE started_at <= ? AND ended_at >= ? ORDER BY started_at",
+            [.real(to.timeIntervalSince1970), .real(from.timeIntervalSince1970)],
+            row: Self.correction,
+        ) }
+    }
+
+    /// Saves a new correction or the only change one can have (`deleted`).
+    func putCorrection(_ correction: TimelineCorrection) {
+        write { connection in
+            if let previous = try Self.correction(connection, id: correction.id), previous.startedAt != correction.startedAt || previous.endedAt != correction.endedAt {
+                try self.markCorrectionDays(connection, from: previous.startedAt, to: previous.endedAt)
+            }
+            try Self.store(connection, correction, syncedEpoch: 0)
+            try self.markCorrectionDays(connection, from: correction.startedAt, to: correction.endedAt)
+            return true
+        }
+    }
+
+    /// Undoes a correction: it stays as a deleted row so the deletion is synced.
+    func deleteCorrection(id: String) {
+        write { connection in
+            guard let correction = try Self.correction(connection, id: id), !correction.deleted else { return false }
+            try connection.run("UPDATE corrections SET deleted = 1, synced_epoch = 0 WHERE id = ?", [.text(id)])
+            try self.markCorrectionDays(connection, from: correction.startedAt, to: correction.endedAt)
+            return true
+        }
+    }
+
+    /// Adds imported corrections that are not here yet; they are uploaded later.
+    func importCorrections(_ corrections: [TimelineCorrection]) {
+        guard !corrections.isEmpty else { return }
+        write { connection in
+            var changed = false
+            for correction in corrections {
+                guard try Self.correction(connection, id: correction.id) == nil else { continue }
+                try Self.store(connection, correction, syncedEpoch: 0)
+                try self.markCorrectionDays(connection, from: correction.startedAt, to: correction.endedAt)
+                changed = true
+            }
+            return changed
+        }
+    }
+
+    /// Corrections that have not been sent in the current epoch.
+    func dirtyCorrections(limit: Int) -> [TimelineCorrection] {
+        read([]) { try $0.query("SELECT \(Self.correctionColumns) FROM corrections WHERE synced_epoch < ? LIMIT ?", [.integer(self.epoch), .integer(Int64(limit))], row: Self.correction) }
+    }
+
+    func markCorrectionsSynced(_ sent: [TimelineCorrection]) {
+        guard !sent.isEmpty else { return }
+        write { connection in
+            try connection.run("UPDATE corrections SET synced_epoch = ? WHERE id = ? AND deleted = ?", sent.map { [.integer(self.epoch), .text($0.id), .integer($0.deleted ? 1 : 0)] })
+            return false
+        }
+    }
+
+    /// Adds corrections from the backup that are missing here, and applies a
+    /// deletion made on another device. A correction never changes otherwise.
+    func applyRemoteCorrections(_ corrections: [TimelineCorrection]) {
+        guard !corrections.isEmpty else { return }
+        write { connection in
+            var changed = false
+            for remote in corrections {
+                if let local = try Self.correction(connection, id: remote.id) {
+                    guard remote.deleted, !local.deleted else { continue }
+                    try connection.run("UPDATE corrections SET deleted = 1, synced_epoch = ? WHERE id = ?", [.integer(self.epoch), .text(remote.id)])
+                    try self.markCorrectionDays(connection, from: local.startedAt, to: local.endedAt)
+                    changed = true
+                    continue
+                }
+                try Self.store(connection, remote, syncedEpoch: self.epoch)
+                try self.markCorrectionDays(connection, from: remote.startedAt, to: remote.endedAt)
+                changed = true
+            }
+            return changed
+        }
+    }
+
+    /// A day whose records changed has to have its stays detected again.
+    private func markCorrectionDays(_ connection: SQLiteConnection, from start: Date, to end: Date) throws {
+        let calendar = calendar()
+        var day = calendar.startOfDay(for: min(start, end))
+        let last = calendar.startOfDay(for: max(start, end))
+        while day <= last {
+            try markDay(connection, day)
+            guard let next = calendar.date(byAdding: .day, value: 1, to: day) else { break }
+            day = next
+        }
+    }
+
     // MARK: Rows
 
     private static let columns = "id, started_at, latitude, longitude, original_latitude, original_longitude, location_source, auto_placement_disabled, accuracy_meters, media_type, photo_count, source, updated_at"
@@ -403,16 +542,81 @@ final class LogDatabase: @unchecked Sendable {
         try connection.run("INSERT OR REPLACE INTO entries (\(Self.columns), synced_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", Self.values(entry) + [.integer(syncedEpoch)])
     }
 
+    private static let placeColumns = "id, name, latitude, longitude, updated_at, deleted, radius_meters, anchors, merged_into"
+    private static let correctionColumns = "id, kind, started_at, ended_at, created_at, source, deleted"
+
     private static func store(_ connection: SQLiteConnection, _ place: NamedPlace, syncedEpoch: Int64) throws {
+        let anchors = place.anchors.map { anchors -> String? in
+            (try? JSONEncoder().encode(anchors)).flatMap { String(data: $0, encoding: .utf8) }
+        } ?? nil
         try connection.run(
-            "INSERT OR REPLACE INTO places (id, name, latitude, longitude, updated_at, deleted, synced_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [.text(place.id), .text(place.name), .real(place.latitude), .real(place.longitude), .real(place.updatedAt.timeIntervalSince1970), .integer(place.deleted ? 1 : 0), .integer(syncedEpoch)],
+            "INSERT OR REPLACE INTO places (id, name, latitude, longitude, updated_at, deleted, radius_meters, anchors, merged_into, synced_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                .text(place.id),
+                .text(place.name),
+                .real(place.latitude),
+                .real(place.longitude),
+                .real(place.updatedAt.timeIntervalSince1970),
+                .integer(place.deleted ? 1 : 0),
+                place.radiusMeters.map { SQLiteValue.real(normalizedPlaceRadius($0)) } ?? .null,
+                anchors.map { SQLiteValue.text($0) } ?? .null,
+                place.mergedInto.map { SQLiteValue.text($0) } ?? .null,
+                .integer(syncedEpoch),
+            ],
         )
     }
 
     private static func place(_ row: SQLiteRow) -> NamedPlace? {
         guard let id = row.text(0), let latitude = row.double(2), let longitude = row.double(3), let updatedAt = row.double(4) else { return nil }
-        return NamedPlace(id: id, name: row.text(1) ?? "", latitude: latitude, longitude: longitude, updatedAt: Date(timeIntervalSince1970: updatedAt), deleted: row.integer(5) == 1)
+        let anchors = row.text(7).flatMap { try? JSONDecoder().decode([PlaceAnchor].self, from: Data($0.utf8)) }
+        return NamedPlace(
+            id: id,
+            name: row.text(1) ?? "",
+            latitude: latitude,
+            longitude: longitude,
+            radiusMeters: row.double(6).map(normalizedPlaceRadius),
+            anchors: anchors,
+            mergedInto: row.text(8),
+            updatedAt: Date(timeIntervalSince1970: updatedAt),
+            deleted: row.integer(5) == 1,
+        )
+    }
+
+    private static func store(_ connection: SQLiteConnection, _ correction: TimelineCorrection, syncedEpoch: Int64) throws {
+        try connection.run(
+            "INSERT OR REPLACE INTO corrections (id, kind, started_at, ended_at, created_at, source, deleted, synced_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                .text(correction.id),
+                .text(correction.kind.rawValue),
+                .real(correction.startedAt.timeIntervalSince1970),
+                .real(correction.endedAt.timeIntervalSince1970),
+                .real(Double(correction.createdAt)),
+                .text(correction.source.rawValue),
+                .integer(correction.deleted ? 1 : 0),
+                .integer(syncedEpoch),
+            ],
+        )
+    }
+
+    private static func correction(_ row: SQLiteRow) -> TimelineCorrection? {
+        guard let id = row.text(0),
+              let kind = row.text(1).flatMap(TimelineCorrectionKind.init(rawValue:)),
+              let startedAt = row.double(2),
+              let endedAt = row.double(3),
+              let createdAt = row.double(4) else { return nil }
+        return TimelineCorrection(
+            id: id,
+            kind: kind,
+            startedAt: Date(timeIntervalSince1970: startedAt),
+            endedAt: Date(timeIntervalSince1970: endedAt),
+            createdAt: Int64(createdAt.rounded()),
+            source: row.text(5).flatMap(TimelineCorrectionSource.init(rawValue:)) ?? .app,
+            deleted: row.integer(6) == 1,
+        )
+    }
+
+    private static func correction(_ connection: SQLiteConnection, id: String) throws -> TimelineCorrection? {
+        try connection.query("SELECT \(correctionColumns) FROM corrections WHERE id = ?", [.text(id)], row: correction).first
     }
 
     private static func entry(_ connection: SQLiteConnection, id: String) throws -> LogEntry? {
@@ -511,28 +715,51 @@ final class LogDatabase: @unchecked Sendable {
             CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY NOT NULL, value TEXT);
             """)
         let version = try connection.query("PRAGMA user_version") { $0.integer(0) }.first ?? 0
-        guard version < 2 else { return }
-        // Version 1 kept the upload queue in pending_upserts. Each record now
-        // carries the sync epoch it was backed up in (0: not yet); the account
-        // that was signed in becomes the owner of the records.
-        try connection.transaction {
-            try connection.execute("""
-                ALTER TABLE entries ADD COLUMN synced_epoch INTEGER NOT NULL DEFAULT 1;
-                CREATE TABLE IF NOT EXISTS pending_upserts (id TEXT PRIMARY KEY NOT NULL);
-                UPDATE entries SET synced_epoch = 0 WHERE id IN (SELECT id FROM pending_upserts);
-                DROP TABLE pending_upserts;
-                ALTER TABLE pending_deletes ADD COLUMN deleted_at REAL;
-                ALTER TABLE pending_deletes ADD COLUMN started_at REAL;
-                ALTER TABLE pending_deletes ADD COLUMN source TEXT;
-                CREATE INDEX entries_sync ON entries(synced_epoch);
-                CREATE INDEX entries_photo ON entries(started_at) WHERE source = 'photo';
-                CREATE TABLE tombstones (id TEXT PRIMARY KEY NOT NULL);
-                CREATE TABLE dirty_days (day TEXT PRIMARY KEY NOT NULL, token INTEGER NOT NULL);
-                CREATE TABLE places (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, updated_at REAL NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, synced_epoch INTEGER NOT NULL DEFAULT 0);
-                PRAGMA user_version = 2;
-                """)
-            if let account = defaults.string(forKey: "remo.auth.account-id"), !account.isEmpty {
-                try connection.run("INSERT OR REPLACE INTO metadata (name, value) VALUES ('owner', ?)", [.text(account)])
+        if version < 2 {
+            // Version 1 kept the upload queue in pending_upserts. Each record now
+            // carries the sync epoch it was backed up in (0: not yet); the account
+            // that was signed in becomes the owner of the records.
+            try connection.transaction {
+                try connection.execute("""
+                    ALTER TABLE entries ADD COLUMN synced_epoch INTEGER NOT NULL DEFAULT 1;
+                    CREATE TABLE IF NOT EXISTS pending_upserts (id TEXT PRIMARY KEY NOT NULL);
+                    UPDATE entries SET synced_epoch = 0 WHERE id IN (SELECT id FROM pending_upserts);
+                    DROP TABLE pending_upserts;
+                    ALTER TABLE pending_deletes ADD COLUMN deleted_at REAL;
+                    ALTER TABLE pending_deletes ADD COLUMN started_at REAL;
+                    ALTER TABLE pending_deletes ADD COLUMN source TEXT;
+                    CREATE INDEX entries_sync ON entries(synced_epoch);
+                    CREATE INDEX entries_photo ON entries(started_at) WHERE source = 'photo';
+                    CREATE TABLE tombstones (id TEXT PRIMARY KEY NOT NULL);
+                    CREATE TABLE dirty_days (day TEXT PRIMARY KEY NOT NULL, token INTEGER NOT NULL);
+                    CREATE TABLE places (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, updated_at REAL NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, synced_epoch INTEGER NOT NULL DEFAULT 0);
+                    PRAGMA user_version = 2;
+                    """)
+                if let account = defaults.string(forKey: "remo.auth.account-id"), !account.isEmpty {
+                    try connection.run("INSERT OR REPLACE INTO metadata (name, value) VALUES ('owner', ?)", [.text(account)])
+                }
+            }
+        }
+        if version < 3 {
+            // Named places gained anchors and merges; corrections are new.
+            try connection.transaction {
+                try connection.execute("""
+                    ALTER TABLE places ADD COLUMN radius_meters REAL;
+                    ALTER TABLE places ADD COLUMN anchors TEXT;
+                    ALTER TABLE places ADD COLUMN merged_into TEXT;
+                    CREATE TABLE IF NOT EXISTS corrections (
+                      id TEXT PRIMARY KEY NOT NULL,
+                      kind TEXT NOT NULL,
+                      started_at REAL NOT NULL,
+                      ended_at REAL NOT NULL,
+                      created_at REAL NOT NULL,
+                      source TEXT NOT NULL,
+                      deleted INTEGER NOT NULL DEFAULT 0,
+                      synced_epoch INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE INDEX IF NOT EXISTS corrections_sync ON corrections(synced_epoch);
+                    PRAGMA user_version = 3;
+                    """)
             }
         }
     }

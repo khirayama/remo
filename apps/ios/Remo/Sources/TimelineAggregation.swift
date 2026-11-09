@@ -48,6 +48,10 @@ struct StayCluster: Identifiable {
     let endedAt: Date
     let duration: TimeInterval
     let entries: [CorrectedLocation]
+    /// The named place the stay matched; its coordinate is the matched anchor's.
+    var placeId: String? = nil
+    /// Whether a `join_stay` correction made this stay.
+    var corrected = false
 }
 
 struct StayPlace: Identifiable {
@@ -79,6 +83,9 @@ struct TimelineActivity: Identifiable {
     let entries: [CorrectedLocation]
     /// Time inside a movement during which nothing was recorded.
     var untracked: TimeInterval = 0
+    /// The named place a stay matched, and whether a correction made it.
+    var placeId: String? = nil
+    var corrected = false
 
     /// Whether a movement is a hole in the record rather than a recorded trip.
     var isMostlyUntracked: Bool { untracked > 0 && untracked * 2 >= duration }
@@ -97,6 +104,13 @@ struct TimelineAnalysis {
     let stayClusters: [StayCluster]
 }
 
+/// What the user laid over the records of a day.
+struct TimelineAdjustments {
+    var corrections: [TimelineCorrection] = []
+    /// Stays at a named place take the coordinate of the anchor they matched.
+    var places: [NamedPlace] = []
+}
+
 struct TimelineRenderSnapshot {
     let analysis: TimelineAnalysis
     let displayLogs: [LogEntry]
@@ -107,8 +121,8 @@ struct TimelineRenderSnapshot {
     let replay: RouteReplay?
     let mapCoordinates: [CLLocationCoordinate2D]
 
-    init(logs: [LogEntry]) {
-        let analysis = analyzeTimeline(logs)
+    init(logs: [LogEntry], corrections: [TimelineCorrection] = [], places: [NamedPlace] = []) {
+        let analysis = analyzeTimeline(logs, adjustments: TimelineAdjustments(corrections: corrections, places: places))
         let displayLogs = displayPhotoLogs(logs, locations: analysis.correctedLocations)
         let photoClusters = clusterPhotoLogs(displayLogs)
         let stayPlaces = buildStayPlaces(from: analysis.stayClusters)
@@ -967,10 +981,244 @@ private func smoothedWalks(_ positions: [CorrectedLocation], stays: [StayCluster
     }
 }
 
-func analyzeTimeline(_ logs: [LogEntry]) -> TimelineAnalysis {
-    let corrected = correctedPositionLogs(logs)
+// MARK: - Corrections and named places
+
+/// Live corrections, oldest first: a newer correction is applied later and wins.
+private func activeCorrections(_ corrections: [TimelineCorrection]) -> [TimelineCorrection] {
+    corrections
+        .filter { !$0.deleted && $0.endedAt >= $0.startedAt }
+        .sorted { first, second in
+            if first.createdAt != second.createdAt { return first.createdAt < second.createdAt }
+            return first.id < second.id
+        }
+}
+
+private func milliseconds(_ date: Date) -> Int64 {
+    Int64((date.timeIntervalSince1970 * 1000).rounded())
+}
+
+/// The records without the location samples an `exclude` correction covers. Photos are kept.
+func withoutExcludedSamples(_ logs: [LogEntry], corrections: [TimelineCorrection]) -> [LogEntry] {
+    let excludes = corrections.filter { $0.kind == .exclude && !$0.deleted }
+    guard !excludes.isEmpty else { return logs }
+    return logs.filter { entry in
+        guard entry.source == .location else { return true }
+        return !excludes.contains { entry.startedAt >= $0.startedAt && entry.startedAt <= $0.endedAt }
+    }
+}
+
+private func stayFromPositions(_ members: [CorrectedLocation]) -> StayCluster {
+    let startedAt = members[0].entry.startedAt
+    let endedAt = members[members.count - 1].entry.startedAt
+    return StayCluster(
+        id: "",
+        coordinate: stayCenter(members),
+        startedAt: startedAt,
+        endedAt: endedAt,
+        duration: max(0, endedAt.timeIntervalSince(startedAt)),
+        entries: members,
+        corrected: true,
+    )
+}
+
+/// Applies `join_stay` and `not_stay` to the detected stays, oldest correction
+/// first. A join takes in every stay it overlaps and covers their union with
+/// its own range, so it keeps working when detection later moves a stay's
+/// edges; the positions in that span become one stay. `not_stay` drops the
+/// stays that lie at least half inside its range, which leaves their positions
+/// to the movement around them. Ids are given again in time order.
+private func applyStayCorrections(_ stays: [StayCluster], positions: [CorrectedLocation], corrections: [TimelineCorrection]) -> [StayCluster] {
+    var result = stays
+    var changed = false
+    for correction in corrections {
+        switch correction.kind {
+        case .notStay:
+            result = result.filter { stay in
+                let start = stay.startedAt
+                let end = stay.endedAt
+                let overlap = min(end, correction.endedAt).timeIntervalSince(max(start, correction.startedAt))
+                if end <= start { return !(start >= correction.startedAt && start <= correction.endedAt) }
+                return overlap * 2 < end.timeIntervalSince(start)
+            }
+            changed = true
+        case .joinStay:
+            var spanStart = correction.startedAt
+            var spanEnd = correction.endedAt
+            var kept: [StayCluster] = []
+            for stay in result {
+                if stay.startedAt <= correction.endedAt && stay.endedAt >= correction.startedAt {
+                    spanStart = min(spanStart, stay.startedAt)
+                    spanEnd = max(spanEnd, stay.endedAt)
+                } else {
+                    kept.append(stay)
+                }
+            }
+            let members = positions.filter { $0.entry.startedAt >= spanStart && $0.entry.startedAt <= spanEnd }
+            if members.isEmpty { continue }
+            result = kept + [stayFromPositions(members)]
+            changed = true
+        case .exclude:
+            continue
+        }
+    }
+    guard changed else { return stays }
+    return result
+        .sorted { $0.startedAt < $1.startedAt }
+        .enumerated()
+        .map { index, stay in
+            StayCluster(
+                id: "stay:\(stay.startedAt.timeIntervalSince1970):\(index)",
+                coordinate: stay.coordinate,
+                startedAt: stay.startedAt,
+                endedAt: stay.endedAt,
+                duration: stay.duration,
+                entries: stay.entries,
+                placeId: stay.placeId,
+                corrected: stay.corrected,
+            )
+        }
+}
+
+/// Every anchor of a place, its own coordinate first.
+func placeAnchors(_ place: NamedPlace) -> [PlaceAnchor] {
+    [
+        PlaceAnchor(latitude: place.latitude, longitude: place.longitude, radiusMeters: place.radiusMeters ?? defaultPlaceRadiusMeters),
+    ] + (place.anchors ?? [])
+}
+
+struct PlaceMatch {
+    let place: NamedPlace
+    let anchor: PlaceAnchor
+    let distanceMeters: Double
+}
+
+/// The named place at `coordinate`: of the anchors whose radius reaches the
+/// point, the nearest one. Deleted places never match.
+func matchPlace(_ places: [NamedPlace]?, _ coordinate: CLLocationCoordinate2D) -> PlaceMatch? {
+    var best: PlaceMatch?
+    for place in places ?? [] where !place.deleted {
+        for anchor in placeAnchors(place) {
+            let distance = distanceMeters(CLLocationCoordinate2D(latitude: anchor.latitude, longitude: anchor.longitude), coordinate)
+            if distance <= anchor.radiusMeters, best == nil || distance < best!.distanceMeters {
+                best = PlaceMatch(place: place, anchor: anchor, distanceMeters: distance)
+            }
+        }
+    }
+    return best
+}
+
+/// Stays at a named place are drawn at the anchor they matched.
+private func snapStaysToPlaces(_ stays: [StayCluster], places: [NamedPlace]) -> [StayCluster] {
+    guard !places.isEmpty else { return stays }
+    return stays.map { stay in
+        guard let match = matchPlace(places, stay.coordinate) else { return stay }
+        var snapped = stay
+        snapped = StayCluster(
+            id: stay.id,
+            coordinate: CLLocationCoordinate2D(latitude: match.anchor.latitude, longitude: match.anchor.longitude),
+            startedAt: stay.startedAt,
+            endedAt: stay.endedAt,
+            duration: stay.duration,
+            entries: stay.entries,
+            placeId: match.place.id,
+            corrected: stay.corrected,
+        )
+        return snapped
+    }
+}
+
+/// Which stays are visits to the place at `target`: when `target` is at a
+/// named place, the stays at that place (from any of its anchors); otherwise
+/// the stays within `stayPlaceRadiusMeters`.
+func visitFilter(target: CLLocationCoordinate2D, places: [NamedPlace]?) -> (Double, Double) -> Bool {
+    if let place = matchPlace(places, target)?.place {
+        return { latitude, longitude in
+            matchPlace(places, CLLocationCoordinate2D(latitude: latitude, longitude: longitude))?.place.id == place.id
+        }
+    }
+    return { latitude, longitude in
+        let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+        return matchPlace(places, coordinate) == nil && distanceMeters(coordinate, target) <= stayPlaceRadiusMeters
+    }
+}
+
+// The automatic rules smooth spikes of one or two fixes. A longer run of fixes
+// that jumps far away and straight back, faster than any trip, is left on the
+// route; it is offered to the user (and AI tools) to exclude.
+private let outlierMaxRun = 5
+private let outlierMinDistanceMeters = 300.0
+private let outlierMinSpeedMps = 30.0
+private let outlierMaxNeighborGap: TimeInterval = 5 * 60
+private let outlierMaxReturnShare = 0.5
+
+struct OutlierCandidate {
+    /// Both ends included: an `exclude` correction for this range removes the run.
+    let startedAt: Date
+    let endedAt: Date
+    let eventIds: [String]
+    /// The fix of the run farthest from the route.
+    let latitude: Double
+    let longitude: Double
+    /// How far that fix lies from the nearer of the fixes around the run.
+    let distanceMeters: Double
+}
+
+/// Runs of one to five location fixes outside any stay that leave the route by
+/// at least 300m and come back, faster than 30m/s both ways, while the fixes
+/// just before and after the run lie within half that distance of each other.
+func findOutlierCandidates(_ analysis: TimelineAnalysis) -> [OutlierCandidate] {
+    let locations = analysis.correctedLocations
+    let inStay = Set(analysis.stayClusters.flatMap { $0.entries.map { $0.entry.id } })
+    let times = locations.map { $0.entry.startedAt }
+    var candidates: [OutlierCandidate] = []
+    var before = 0
+    while before < locations.count - 2 {
+        for length in 1...outlierMaxRun {
+            let after = before + length + 1
+            if after >= locations.count { break }
+            let run = Array(locations[(before + 1)..<after])
+            if run.allSatisfy({ inStay.contains($0.entry.id) }) { continue }
+            let outGap = times[before + 1].timeIntervalSince(times[before])
+            let backGap = times[after].timeIntervalSince(times[after - 1])
+            if outGap <= 0 || backGap <= 0 || outGap > outlierMaxNeighborGap || backGap > outlierMaxNeighborGap { continue }
+            let from = locations[before].coordinate
+            let to = locations[after].coordinate
+            var farthest = run[0]
+            var farthestDistance = -1.0
+            var nearest = Double.greatestFiniteMagnitude
+            for location in run {
+                let distance = min(distanceMeters(from, location.coordinate), distanceMeters(location.coordinate, to))
+                nearest = min(nearest, distance)
+                if distance > farthestDistance {
+                    farthest = location
+                    farthestDistance = distance
+                }
+            }
+            if nearest < outlierMinDistanceMeters { continue }
+            if distanceMeters(from, run[0].coordinate) / outGap < outlierMinSpeedMps { continue }
+            if distanceMeters(run[run.count - 1].coordinate, to) / backGap < outlierMinSpeedMps { continue }
+            if distanceMeters(from, to) > nearest * outlierMaxReturnShare { continue }
+            candidates.append(OutlierCandidate(
+                startedAt: times[before + 1],
+                endedAt: times[after - 1],
+                eventIds: run.map { $0.entry.id },
+                latitude: farthest.latitude,
+                longitude: farthest.longitude,
+                distanceMeters: farthestDistance,
+            ))
+            before = after - 1
+            break
+        }
+        before += 1
+    }
+    return candidates
+}
+
+func analyzeTimeline(_ logs: [LogEntry], adjustments: TimelineAdjustments = TimelineAdjustments()) -> TimelineAnalysis {
+    let corrections = activeCorrections(adjustments.corrections)
+    let corrected = correctedPositionLogs(withoutExcludedSamples(logs, corrections: corrections))
     // Stays are detected on the corrected positions; smoothing only changes how the walks between them are drawn.
-    let stayClusters = correctedStayClusters(corrected)
+    let stayClusters = snapStaysToPlaces(applyStayCorrections(correctedStayClusters(corrected), positions: corrected, corrections: corrections), places: adjustments.places)
     let correctedPositions = smoothedWalks(corrected, stays: stayClusters)
     return TimelineAnalysis(
         correctedPositions: correctedPositions,
@@ -987,16 +1235,24 @@ func buildStayPlaces(_ logs: [LogEntry]) -> [StayPlace] {
 func buildStayPlaces(from stays: [StayCluster]) -> [StayPlace] {
     var places: [StayPlace] = []
     for stay in stays {
-        let nearest = places.enumerated().min { first, second in
-            distanceMeters(first.element.coordinate, stay.coordinate) < distanceMeters(second.element.coordinate, stay.coordinate)
-        }
-        if let nearest, distanceMeters(nearest.element.coordinate, stay.coordinate) <= stayPlaceRadiusMeters {
-            let visits = nearest.element.visits + [stay]
+        // Stays at one named place are one place, however far apart its anchors are.
+        let nearest = places.enumerated().map { index, place -> (index: Int, distance: Double) in
+            let distance: Double
+            if stay.placeId != nil || place.visits.first?.placeId != nil {
+                distance = place.visits.first?.placeId == stay.placeId ? 0 : .greatestFiniteMagnitude
+            } else {
+                distance = distanceMeters(place.coordinate, stay.coordinate)
+            }
+            return (index, distance)
+        }.min { $0.distance < $1.distance }
+        if let nearest, nearest.distance <= stayPlaceRadiusMeters {
+            let place = places[nearest.index]
+            let visits = place.visits + [stay]
             let coordinate = CLLocationCoordinate2D(
                 latitude: median(visits.map { $0.coordinate.latitude }),
                 longitude: median(visits.map { $0.coordinate.longitude }),
             )
-            places[nearest.offset] = StayPlace(id: nearest.element.id, coordinate: coordinate, visits: visits)
+            places[nearest.index] = StayPlace(id: place.id, coordinate: coordinate, visits: visits)
         } else {
             places.append(StayPlace(id: "stay-place:\(stay.id)", coordinate: stay.coordinate, visits: [stay]))
         }
@@ -1016,8 +1272,9 @@ struct StayVisitHistory {
 
 /// Collect revisits to the place at `target`. Stays are detected per day,
 /// exactly like the day timeline, so every visit matches what that day shows.
-func buildStayVisitHistory(_ logs: [LogEntry], target: CLLocationCoordinate2D, calendar: Calendar = .current) -> StayVisitHistory {
+func buildStayVisitHistory(_ logs: [LogEntry], target: CLLocationCoordinate2D, places: [NamedPlace]? = nil, corrections: [TimelineCorrection] = [], calendar: Calendar = .current) -> StayVisitHistory {
     let days = Dictionary(grouping: logs) { calendar.startOfDay(for: $0.startedAt) }
+    let isVisit = visitFilter(target: target, places: places)
     let visits = days.values
         .filter { entries in
             entries.contains { entry in
@@ -1025,8 +1282,8 @@ func buildStayVisitHistory(_ logs: [LogEntry], target: CLLocationCoordinate2D, c
                 return distanceMeters(CLLocationCoordinate2D(latitude: latitude, longitude: longitude), target) <= stayHistorySearchRadiusMeters
             }
         }
-        .flatMap { buildStayClusters($0) }
-        .filter { distanceMeters($0.coordinate, target) <= stayPlaceRadiusMeters }
+        .flatMap { analyzeTimeline($0, adjustments: TimelineAdjustments(corrections: corrections)).stayClusters }
+        .filter { isVisit($0.coordinate.latitude, $0.coordinate.longitude) }
         .sorted { $0.startedAt > $1.startedAt }
     return stayVisitHistory(visits: visits.map(\.summary), calendar: calendar)
 }
@@ -1110,6 +1367,8 @@ func buildTimelineActivities(_ logs: [LogEntry], analysis: TimelineAnalysis? = n
                 path: [stay.coordinate],
                 distance: nil,
                 entries: stay.entries,
+                placeId: stay.placeId,
+                corrected: stay.corrected,
             ))
         }
     }

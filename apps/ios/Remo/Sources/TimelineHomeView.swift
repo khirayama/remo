@@ -45,6 +45,11 @@ struct TimelineHomeView: View {
     let onOpenSettings: () -> Void
     /// Names the place at a coordinate; an empty name removes it.
     let onRenamePlace: (CLLocationCoordinate2D, String) -> Void
+    /// Corrections laid over this device's records.
+    let corrections: [TimelineCorrection]
+    let onAddCorrection: (TimelineCorrectionKind, Date, Date) -> Void
+    let onRemoveCorrection: (TimelineCorrection) -> Void
+    let onSavePlaces: ([NamedPlace]) -> Void
     @ObservedObject var stayIndex: StayIndexStore
     @ObservedObject private var namedPlaces = NamedPlaces.shared
 
@@ -74,6 +79,13 @@ struct TimelineHomeView: View {
     @State private var allPlacesCamera = AllPlacesCamera()
 
     private var loaded: Bool { loadedDate == date }
+
+    /// Changes to the corrections or the named places change the day's timeline.
+    private var adjustmentsSignature: String {
+        let corrections = corrections.map { "\($0.id):\($0.deleted)" }.sorted().joined(separator: ",")
+        let places = namedPlaces.places.map { "\($0.id):\($0.updatedAt.timeIntervalSince1970):\($0.deleted):\($0.radiusMeters ?? -1):\($0.anchors?.count ?? -1):\($0.mergedInto ?? "")" }.sorted().joined(separator: ",")
+        return corrections + "#" + places
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -184,12 +196,16 @@ struct TimelineHomeView: View {
         // Picking an activity in the sheet hands the map back to that activity.
         .onChange(of: focus) { _, focus in if focus != nil { stopReplay() } }
         .onChange(of: snapshotRevision) { _, _ in if snapshot.replay == nil { stopReplay() } }
-        .task(id: logs.map { "\($0.id):\($0.updatedAt.timeIntervalSince1970)" }.joined(separator: "|") + "@\(date.timeIntervalSince1970)@\(logsDate?.timeIntervalSince1970 ?? 0)") {
+        .task(id: logs.map { "\($0.id):\($0.updatedAt.timeIntervalSince1970)" }.joined(separator: "|") + "@\(date.timeIntervalSince1970)@\(logsDate?.timeIntervalSince1970 ?? 0)@\(adjustmentsSignature)") {
             // The records of the previous day are still shown while the new day is read.
             guard logsDate == date else { return }
             let requestedDate = date
             let logs = logs
-            let next = await Task.detached(priority: .userInitiated) { TimelineRenderSnapshot(logs: logs) }.value
+            let corrections = corrections
+            let places = namedPlaces.places
+            let next = await Task.detached(priority: .userInitiated) {
+                TimelineRenderSnapshot(logs: logs, corrections: corrections, places: places)
+            }.value
             guard !Task.isCancelled, requestedDate == date else { return }
             snapshot = next
             snapshotRevision += 1
@@ -210,12 +226,13 @@ struct TimelineHomeView: View {
             cameraRequest = nil
             stopReplay()
         }
-        .task(id: "\(stayIndex.revision)@\(period.rawValue)") {
+        .task(id: "\(stayIndex.revision)@\(period.rawValue)@\(adjustmentsSignature)") {
             guard let stays = stayIndex.stays else { return }
             let period = period
+            let namedPlaces = namedPlaces.places
             let (filtered, grouped) = await Task.detached(priority: .userInitiated) {
                 let filtered = stays.filter { period.includes($0) }
-                return (filtered, buildAllTimeStayPlaces(filtered))
+                return (filtered, buildAllTimeStayPlaces(filtered, namedPlaces: namedPlaces))
             }.value
             guard !Task.isCancelled else { return }
             periodStays = filtered
@@ -231,7 +248,7 @@ struct TimelineHomeView: View {
             }
         }
         .sheet(item: $historyTarget) { target in
-            PlaceHistorySheet(stays: stayIndex.stays, target: target, onClose: { historyTarget = nil }, onRename: { onRenamePlace(target.coordinate, $0) }) { day in
+            PlaceHistorySheet(stays: stayIndex.stays, target: target, onClose: { historyTarget = nil }, onRename: { onRenamePlace(target.coordinate, $0) }, onSavePlaces: onSavePlaces) { day in
                 historyTarget = nil
                 mode = .day
                 date = day
@@ -356,6 +373,9 @@ struct TimelineHomeView: View {
                 expanded: expanded,
                 placesExpanded: $placesExpanded,
                 bottomPadding: safeBottom + 24,
+                corrections: corrections,
+                onAddCorrection: onAddCorrection,
+                onRemoveCorrection: onRemoveCorrection,
                 onFocus: { activity in
                     focus = focus?.activityID == activity.id ? nil : TimelineMapFocus(activity: activity)
                 },
@@ -414,6 +434,13 @@ private struct ReplayPhotoPop: View {
                 }
                 .frame(width: 148, height: 148)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
+                // A video's poster frame looks like a photo without its badge.
+                .overlay(alignment: .bottomLeading) {
+                    if cluster.entries.first?.mediaType == .video {
+                        Image(systemName: "play.circle").font(.system(size: 24, weight: .semibold)).foregroundStyle(.white)
+                            .padding(8)
+                    }
+                }
                 Text("\(cluster.entries.first.map { formatTime($0.startedAt) } ?? "") · \(mediaSummary(photoCount: cluster.photoCount, videoCount: cluster.videoCount))")
                     .font(RemoFont.labelMedium)
                     .foregroundStyle(RemoStyle.inkSecondary)
@@ -701,12 +728,18 @@ private struct TimelineSheetList: View {
     let expanded: Bool
     @Binding var placesExpanded: Bool
     let bottomPadding: CGFloat
+    let corrections: [TimelineCorrection]
+    let onAddCorrection: (TimelineCorrectionKind, Date, Date) -> Void
+    let onRemoveCorrection: (TimelineCorrection) -> Void
     let onFocus: (TimelineActivity) -> Void
     let onSelectPhotos: ([LogEntry]) -> Void
     let onOpenHistory: (PlaceHistoryTarget) -> Void
 
     var body: some View {
         let items = buildSheetItems(snapshot, sleep: sleep)
+        let outliers = findOutlierCandidates(snapshot.analysis)
+        let dayCorrections = dayCorrections()
+        let previousStays = previousStays(in: items)
         ScrollViewReader { reader in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
@@ -728,7 +761,23 @@ private struct TimelineSheetList: View {
                             let isFirst = index == 0, isLast = index == items.count - 1
                             switch item {
                             case let .activity(activity, sleep):
-                                ActivityRow(activity: activity, sleep: sleep, label: labels[activity.id], isFirst: isFirst, isLast: isLast, selected: selectedActivityID == activity.id, assets: assets, onClick: { onFocus(activity) }, onSelectPhotos: onSelectPhotos) {
+                                ActivityRow(
+                                    activity: activity,
+                                    sleep: sleep,
+                                    label: labels[activity.id],
+                                    isFirst: isFirst,
+                                    isLast: isLast,
+                                    selected: selectedActivityID == activity.id,
+                                    assets: assets,
+                                    canJoinPrevious: previousStays[activity.id] != nil,
+                                    onClick: { onFocus(activity) },
+                                    onSelectPhotos: onSelectPhotos,
+                                    onJoinPrevious: {
+                                        guard let previous = previousStays[activity.id] else { return }
+                                        onAddCorrection(.joinStay, previous.startedAt, activity.endedAt)
+                                    },
+                                    onNotStay: { onAddCorrection(.notStay, activity.startedAt, activity.endedAt) },
+                                ) {
                                     if let coordinate = activity.coordinate { onOpenHistory(PlaceHistoryTarget(coordinate: coordinate, label: labels[activity.id])) }
                                 }
                             case let .photos(entries):
@@ -737,6 +786,14 @@ private struct TimelineSheetList: View {
                                 SleepRow(session: session, isFirst: isFirst, isLast: isLast)
                             }
                         }
+                    }
+                    if loaded, !outliers.isEmpty {
+                        OutlierSection(candidates: outliers) { candidate in
+                            onAddCorrection(.exclude, candidate.startedAt, candidate.endedAt)
+                        }
+                    }
+                    if loaded, !dayCorrections.isEmpty {
+                        CorrectionsSection(corrections: dayCorrections, onRemove: onRemoveCorrection)
                     }
                     if loaded, !snapshot.stayPlaces.isEmpty {
                         StayPlacesSection(places: snapshot.stayPlaces, labels: labels, expanded: $placesExpanded, onOpenHistory: onOpenHistory)
@@ -750,6 +807,28 @@ private struct TimelineSheetList: View {
             .onChange(of: expanded) { _, value in if !value { withAnimation { reader.scrollTo("top", anchor: .top) } } }
             .onChange(of: date) { _, _ in reader.scrollTo("top", anchor: .top) }
         }
+    }
+
+    /// The stay earlier on the same day that joins to each stay.
+    private func previousStays(in items: [SheetItem]) -> [String: TimelineActivity] {
+        var previous: [String: TimelineActivity] = [:]
+        var lastStay: TimelineActivity?
+        for item in items {
+            guard case let .activity(activity, _) = item, activity.kind == .stay else { continue }
+            if let lastStay { previous[activity.id] = lastStay }
+            lastStay = activity
+        }
+        return previous
+    }
+
+    /// Corrections that overlap this day, oldest first.
+    private func dayCorrections() -> [TimelineCorrection] {
+        let calendar = Calendar.current
+        let start = calendar.startOfDay(for: date)
+        let end = calendar.date(byAdding: .day, value: 1, to: start) ?? start
+        return corrections
+            .filter { !$0.deleted && $0.startedAt < end && $0.endedAt >= start }
+            .sorted { $0.startedAt < $1.startedAt }
     }
 }
 
@@ -848,8 +927,12 @@ private struct ActivityRow: View {
     let isLast: Bool
     let selected: Bool
     let assets: [PHAsset]
+    /// Whether a stay earlier on the same day can be joined to this one.
+    let canJoinPrevious: Bool
     let onClick: () -> Void
     let onSelectPhotos: ([LogEntry]) -> Void
+    let onJoinPrevious: () -> Void
+    let onNotStay: () -> Void
     let onOpenHistory: () -> Void
 
     private var isStay: Bool { activity.kind == .stay }
@@ -882,9 +965,101 @@ private struct ActivityRow: View {
                     .buttonStyle(TextActionStyle())
                     .padding(.top, 6)
                     .padding(.leading, -12)
+                    HStack(spacing: 16) {
+                        if canJoinPrevious {
+                            Button("前の滞在とつなげる", action: onJoinPrevious)
+                                .accessibilityHint("2つの滞在を1つにまとめます")
+                        }
+                        Button("滞在ではない", action: onNotStay)
+                            .accessibilityHint("この滞在を移動として扱います")
+                    }
+                    .buttonStyle(TextActionStyle())
+                    .padding(.top, 4)
+                    .padding(.leading, -12)
                 }
             }
         }
+    }
+}
+
+/// Runs of fixes that left the route and came back, offered for exclusion. The
+/// automatic rules only smooth one or two of them.
+private struct OutlierSection: View {
+    let candidates: [OutlierCandidate]
+    let onExclude: (OutlierCandidate) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Rectangle().fill(RemoStyle.outline).frame(height: 1).padding(.horizontal, 20)
+            HStack(spacing: 12) {
+                IconBadge(systemName: "location.slash", tint: RemoStyle.amber, container: RemoStyle.amberContainer)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("飛んだ測位 \(candidates.count)か所").font(RemoFont.titleSmall).foregroundStyle(RemoStyle.ink).lineLimit(1)
+                    Text("遠くへ飛んで戻る測位です。除外すると移動の線がなめらかになります。")
+                        .font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkSecondary).lineLimit(2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Button("除外する") {
+                    for candidate in candidates { onExclude(candidate) }
+                }
+                .buttonStyle(TextActionStyle())
+                .accessibilityHint("飛んだ測位をすべて除外します")
+            }
+            .padding(.leading, 20)
+            .padding(.trailing, 16)
+            .padding(.vertical, 12)
+        }
+        .padding(.top, 12)
+    }
+}
+
+/// The corrections laid over this day, each of which can be undone.
+private struct CorrectionsSection: View {
+    let corrections: [TimelineCorrection]
+    let onRemove: (TimelineCorrection) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Rectangle().fill(RemoStyle.outline).frame(height: 1).padding(.horizontal, 20)
+            HStack(spacing: 8) {
+                Text("この日の補正").font(RemoFont.titleSmall).foregroundStyle(RemoStyle.ink)
+                Spacer()
+                Text("\(corrections.count)件").font(RemoFont.labelMedium).foregroundStyle(RemoStyle.inkTertiary)
+            }
+            .padding(.leading, 20)
+            .padding(.trailing, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 4)
+            ForEach(corrections) { correction in
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(correction.kind.label).font(RemoFont.bodyLarge).foregroundStyle(RemoStyle.ink).lineLimit(1)
+                            if correction.source == .mcp {
+                                Text("AI")
+                                    .font(RemoFont.labelSmall)
+                                    .foregroundStyle(RemoStyle.onGreenContainer)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(RemoStyle.greenContainer, in: Capsule())
+                            }
+                        }
+                        Text("\(formatTime(correction.startedAt))–\(formatTime(correction.endedAt))")
+                            .font(RemoFont.bodySmall.monospacedDigit())
+                            .foregroundStyle(RemoStyle.inkSecondary)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Button("取り消す") { onRemove(correction) }
+                        .buttonStyle(TextActionStyle())
+                        .accessibilityHint("この補正を元に戻します")
+                }
+                .padding(.leading, 20)
+                .padding(.trailing, 16)
+                .padding(.vertical, 6)
+            }
+        }
+        .padding(.top, 12)
     }
 }
 
@@ -975,7 +1150,7 @@ private struct StayPlacesSection: View {
                 HStack(spacing: 8) {
                     VStack(alignment: .leading, spacing: 0) {
                         Text("滞在した場所").font(RemoFont.titleSmall).foregroundStyle(RemoStyle.ink)
-                        Text("\(places.count)か所 · 100m以内の滞在は同じ場所にまとめています").font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkSecondary)
+                        Text("\(places.count)か所 · 同じ場所の滞在はまとめています").font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkSecondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     Image(systemName: expanded ? "chevron.up" : "chevron.down").font(.system(size: 14, weight: .semibold)).foregroundStyle(RemoStyle.inkSecondary).frame(width: 24, height: 24)
@@ -1035,10 +1210,12 @@ private struct PlaceHistorySheet: View {
     let target: PlaceHistoryTarget
     let onClose: () -> Void
     let onRename: (String) -> Void
+    let onSavePlaces: ([NamedPlace]) -> Void
     let onOpenDay: (Date) -> Void
     @State private var history: StayVisitHistory?
     @State private var naming = false
     @State private var draftName = ""
+    @State private var merging = false
     @ObservedObject private var namedPlaces = NamedPlaces.shared
 
     var body: some View {
@@ -1050,7 +1227,7 @@ private struct PlaceHistorySheet: View {
             HStack(spacing: 0) {
                 VStack(alignment: .leading, spacing: 0) {
                     Text(named?.name ?? "訪問履歴").font(RemoFont.headline).foregroundStyle(RemoStyle.ink).lineLimit(1)
-                    Text("\(detail) · 100m以内の滞在")
+                    Text("\(detail) · \(named == nil ? "100m以内の滞在" : "この場所の滞在")")
                         .font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkSecondary).lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1064,7 +1241,7 @@ private struct PlaceHistorySheet: View {
             .padding(.trailing, 8)
             .padding(.bottom, 12)
             if let history {
-                content(history)
+                content(history, named: named)
             } else {
                 ProgressView().tint(RemoStyle.green).frame(maxWidth: .infinity).padding(.vertical, 32)
                 Spacer(minLength: 0)
@@ -1075,11 +1252,11 @@ private struct PlaceHistorySheet: View {
         .presentationDragIndicator(.hidden)
         .presentationCornerRadius(RemoRadius.extraLarge)
         .presentationBackground(RemoStyle.surface)
-        .task(id: stays?.count) {
+        .task(id: "\(stays?.count ?? 0)@\(namedPlaces.places.count)") {
             // Read from the stay index, so the history matches the all-places
             // map; until the index is ready the sheet shows that it is being prepared.
             if let visits = target.visits { return history = stayVisitHistory(visits: visits) }
-            if let stays { history = stayVisitHistory(from: stays, target: target.coordinate) }
+            if let stays { history = stayVisitHistory(from: stays, target: target.coordinate, places: namedPlaces.places) }
         }
         .alert(named != nil ? "場所の名前を変更" : "場所に名前を付ける", isPresented: $naming) {
             TextField("名前", text: $draftName)
@@ -1094,7 +1271,7 @@ private struct PlaceHistorySheet: View {
         }
     }
 
-    private func content(_ history: StayVisitHistory) -> some View {
+    private func content(_ history: StayVisitHistory, named: NamedPlace?) -> some View {
         // Match the day grouping of `buildStayVisitHistory` and the day timeline.
         let calendar = Calendar.current
         var days: [(day: Date, visits: [StaySummary])] = []
@@ -1104,6 +1281,10 @@ private struct PlaceHistorySheet: View {
         }
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
+                if let named {
+                    placeControls(named)
+                    if merging { mergeCandidates(named) }
+                }
                 HStack(spacing: 8) {
                     SummaryChip(systemName: RemoGlyphName.place, tint: RemoStyle.green, text: "\(history.visits.count)回")
                     SummaryChip(systemName: "calendar", tint: RemoStyle.teal, text: "\(history.dayCount)日")
@@ -1138,6 +1319,157 @@ private struct PlaceHistorySheet: View {
             }
             .padding(.bottom, 16)
         }
+    }
+
+    /// The radius the place matches at and the anchors added to it.
+    private func placeControls(_ named: NamedPlace) -> some View {
+        let anchors = placeAnchors(named)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("半径").font(RemoFont.labelMedium).foregroundStyle(RemoStyle.inkSecondary)
+                ForEach(placeRadiusChoices, id: \.self) { choice in
+                    let selected = Int(anchors[0].radiusMeters) == Int(choice)
+                    Button { updateRadius(choice, named) } label: {
+                        Text("\(Int(choice))m")
+                            .font(RemoFont.labelMedium)
+                            .foregroundStyle(selected ? RemoStyle.onGreenContainer : RemoStyle.inkSecondary)
+                            .padding(.horizontal, 10)
+                            .frame(height: 26)
+                            .background(selected ? RemoStyle.greenContainer : RemoStyle.surfaceMuted, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(selected ? .isSelected : [])
+                }
+                Spacer(minLength: 0)
+            }
+            if anchors.count > 1 {
+                Text("追加の基準点 \(anchors.count - 1)か所").font(RemoFont.labelMedium).foregroundStyle(RemoStyle.inkSecondary)
+                ForEach(Array(anchors.dropFirst().enumerated()), id: \.offset) { index, anchor in
+                    HStack(spacing: 8) {
+                        Image(systemName: "mappin.and.ellipse").font(.system(size: 12)).foregroundStyle(RemoStyle.inkTertiary)
+                        Text("\(formatCoordinates(latitude: anchor.latitude, longitude: anchor.longitude)) · \(Int(anchor.radiusMeters))m")
+                            .font(RemoFont.labelMedium.monospacedDigit()).foregroundStyle(RemoStyle.inkSecondary).lineLimit(1)
+                        Spacer(minLength: 0)
+                        Button("外す") { removeAnchor(at: index, named) }
+                            .buttonStyle(TextActionStyle())
+                            .accessibilityHint("この基準点を外します")
+                    }
+                }
+            }
+            Button(merging ? "近くの場所をまとめるのをやめる" : "近くの場所をまとめる") {
+                withAnimation(.easeOut(duration: 0.2)) { merging.toggle() }
+            }
+            .buttonStyle(TextActionStyle())
+            .disabled(stays == nil)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 10)
+    }
+
+    private struct MergeCandidate: Identifiable {
+        let id: String
+        let title: String
+        let distanceMeters: Double
+        let coordinate: CLLocationCoordinate2D
+        let place: NamedPlace?
+    }
+
+    private func mergeCandidates(_ named: NamedPlace) -> some View {
+        let candidates = nearbyPlaces(named)
+        return VStack(alignment: .leading, spacing: 0) {
+            Text("1km以内の、近い順").font(RemoFont.labelMedium).foregroundStyle(RemoStyle.inkTertiary).padding(.horizontal, 20).padding(.bottom, 4)
+            if candidates.isEmpty {
+                Text("まとめられる場所はありません").font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkSecondary).padding(.horizontal, 20)
+            }
+            ForEach(candidates) { candidate in
+                Button { merge(candidate, into: named) } label: {
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(candidate.title).font(RemoFont.bodyLarge).foregroundStyle(RemoStyle.ink).lineLimit(1)
+                            Text("\(formatDistance(candidate.distanceMeters)) · \(candidate.place == nil ? "滞在のまとまり" : "名前付きの場所")")
+                                .font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkSecondary).lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "plus.circle").font(.system(size: 18)).foregroundStyle(RemoStyle.green)
+                    }
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 20)
+                .accessibilityHint("この場所をまとめます")
+            }
+        }
+        .padding(.bottom, 8)
+    }
+
+    /// Unnamed stay groups and other named places within 1km, nearest first.
+    private func nearbyPlaces(_ named: NamedPlace) -> [MergeCandidate] {
+        var candidates: [MergeCandidate] = []
+        if let stays {
+            for place in buildAllTimeStayPlaces(stays, namedPlaces: namedPlaces.places) where place.placeId == nil {
+                let distance = distanceMeters(place.coordinate, named.coordinate)
+                guard distance <= 1000, distance > 0.5 else { continue }
+                candidates.append(MergeCandidate(
+                    id: place.id,
+                    title: formatCoordinates(latitude: place.coordinate.latitude, longitude: place.coordinate.longitude),
+                    distanceMeters: distance,
+                    coordinate: place.coordinate,
+                    place: nil,
+                ))
+            }
+        }
+        for place in namedPlaces.places where !place.deleted && place.id != named.id {
+            let distance = distanceMeters(place.coordinate, named.coordinate)
+            guard distance <= 1000 else { continue }
+            candidates.append(MergeCandidate(
+                id: "named:\(place.id)",
+                title: place.name,
+                distanceMeters: distance,
+                coordinate: place.coordinate,
+                place: place,
+            ))
+        }
+        return candidates.sorted { $0.distanceMeters < $1.distanceMeters }
+    }
+
+    /// Whole milliseconds, like the backup keeps them.
+    private static var now: Date { Date(timeIntervalSince1970: (Date().timeIntervalSince1970 * 1000).rounded() / 1000) }
+
+    private func updateRadius(_ radius: Double, _ named: NamedPlace) {
+        var updated = named
+        updated.radiusMeters = normalizedPlaceRadius(radius)
+        updated.updatedAt = Self.now
+        onSavePlaces([updated])
+    }
+
+    private func removeAnchor(at index: Int, _ named: NamedPlace) {
+        guard var anchors = named.anchors, anchors.indices.contains(index) else { return }
+        anchors.remove(at: index)
+        var updated = named
+        updated.anchors = anchors
+        updated.updatedAt = Self.now
+        onSavePlaces([updated])
+    }
+
+    /// An unnamed group becomes an anchor; a named place gives every anchor and
+    /// is deleted, pointing at the place it was merged into.
+    private func merge(_ candidate: MergeCandidate, into named: NamedPlace) {
+        var updated = named
+        let added = candidate.place.map(placeAnchors) ?? [PlaceAnchor(latitude: candidate.coordinate.latitude, longitude: candidate.coordinate.longitude, radiusMeters: defaultPlaceRadiusMeters)]
+        var anchors = (updated.anchors ?? []) + added
+        anchors = Array(anchors.prefix(maxPlaceAnchors))
+        updated.anchors = anchors
+        updated.updatedAt = Self.now
+        var places = [updated]
+        if var other = candidate.place {
+            other.deleted = true
+            other.mergedInto = named.id
+            other.updatedAt = Self.now
+            places.append(other)
+        }
+        withAnimation(.easeOut(duration: 0.2)) { merging = false }
+        onSavePlaces(places)
     }
 }
 
@@ -1244,7 +1576,7 @@ private struct AllPlacesList: View {
                         HStack {
                             SectionLabel("訪問回数の多い順")
                             Spacer()
-                            Text("100m以内は同じ場所").font(RemoFont.labelMedium).foregroundStyle(RemoStyle.inkTertiary)
+                            Text("同じ場所はまとめています").font(RemoFont.labelMedium).foregroundStyle(RemoStyle.inkTertiary)
                         }
                         .padding(.horizontal, 20)
                         .padding(.top, 8)

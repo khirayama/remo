@@ -708,6 +708,13 @@ private func photoMarkerImage(thumbnail: UIImage?, count: Int, isVideo: Bool) ->
                 glyph.draw(at: CGPoint(x: center.x - glyph.size.width / 2, y: center.y - glyph.size.height / 2))
             }
         }
+        // A video now has a poster frame, so the glyph alone no longer says it
+        // is a video: badge the thumbnail.
+        if isVideo, thumbnail != nil,
+           let badge = UIImage(systemName: "play.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold))?
+            .withTintColor(.white, renderingMode: .alwaysOriginal) {
+            badge.draw(at: CGPoint(x: center.x - radius + 1, y: center.y + radius - badge.size.height - 1))
+        }
         guard count > 1 else { return }
         let text = count > 99 ? "99+" : "\(count)"
         let attributes: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 10, weight: .bold), .foregroundColor: UIColor.white]
@@ -728,14 +735,18 @@ func nearestPhotoAsset(_ log: LogEntry, assets: [PHAsset]) -> PHAsset? {
     let candidates = assets.filter { asset in
         log.mediaType == .video ? asset.mediaType == .video : asset.mediaType == .image
     }
-    return candidates.first { $0.creationDate == log.startedAt }
-        ?? candidates.filter { asset in
-            guard let creationDate = asset.creationDate else { return false }
-            return Calendar.current.isDate(creationDate, inSameDayAs: log.startedAt)
-        }.min { first, second in
-            guard let firstDate = first.creationDate, let secondDate = second.creationDate else { return false }
-            return abs(firstDate.timeIntervalSince(log.startedAt)) < abs(secondDate.timeIntervalSince(log.startedAt))
-        }
+    if let exact = candidates.first(where: { $0.creationDate == log.startedAt }) { return exact }
+    // The record's own photo can be gone from the library while its preview
+    // is backed up. Another local photo from the same day is not a stand-in
+    // for it; the cloud preview is.
+    if log.source == .photo, PhotoIndexDatabase.shared.hasArchivedPhotos(eventID: log.id) { return nil }
+    return candidates.filter { asset in
+        guard let creationDate = asset.creationDate else { return false }
+        return Calendar.current.isDate(creationDate, inSameDayAs: log.startedAt)
+    }.min { first, second in
+        guard let firstDate = first.creationDate, let secondDate = second.creationDate else { return false }
+        return abs(firstDate.timeIntervalSince(log.startedAt)) < abs(secondDate.timeIntervalSince(log.startedAt))
+    }
 }
 
 // MARK: - Location picker
