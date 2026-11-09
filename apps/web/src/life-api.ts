@@ -1,5 +1,5 @@
-import { LifeEvent, MediaType, PhotoLocationSource, Place, SyncCursor } from "./life-log";
-import { applyRemoteChanges, applyRemotePlaces, countDirtyEvents, loadDirtyEvents, loadDirtyPlaces, loadPendingDeletes, loadSyncState, markEventsSynced, markPlacesSynced, PendingDeletion, removePendingDeletes, updateSyncState } from "./timeline-db";
+import { LifeEvent, MediaType, normalizeCorrection, normalizePlace, PhotoLocationSource, SyncCursor } from "./life-log";
+import { applyRemoteChanges, applyRemoteCorrections, applyRemotePlaces, countDirtyEvents, loadDirtyCorrections, loadDirtyEvents, loadDirtyPlaces, loadPendingDeletes, loadSyncState, markCorrectionsSynced, markEventsSynced, markPlacesSynced, PendingDeletion, removePendingDeletes, updateSyncState } from "./timeline-db";
 
 import { apiBaseURL as baseURL } from "./api-base";
 
@@ -214,8 +214,40 @@ async function syncPlaces(storageId: string, epoch: number): Promise<boolean> {
     await markPlacesSynced(storageId, batch, epoch);
   }
   const response = await request("/api/v1/places");
-  const payload = await response.json() as { data?: Place[] };
-  return applyRemotePlaces(storageId, payload.data ?? [], epoch);
+  const payload = await response.json() as { data?: unknown[] };
+  return applyRemotePlaces(storageId, (payload.data ?? []).flatMap((place) => normalizePlace(place) ?? []), epoch);
+}
+
+const CORRECTION_BATCH = 200;
+const MAX_CORRECTION_PAGES = 100;
+
+/**
+ * Sends the corrections created or deleted here, then takes the ones written
+ * since this account's cursor (docs/CORRECTIONS.md). Returns whether any local
+ * correction changed.
+ */
+async function syncCorrections(storageId: string, userId: string, epoch: number): Promise<boolean> {
+  const dirty = await loadDirtyCorrections(storageId, epoch);
+  for (let index = 0; index < dirty.length; index += CORRECTION_BATCH) {
+    const batch = dirty.slice(index, index + CORRECTION_BATCH);
+    await request("/api/v1/corrections", jsonBody("PUT", { corrections: batch }));
+    await markCorrectionsSynced(storageId, batch, epoch);
+  }
+  let after = (await loadSyncState(storageId)).correctionCursors[userId] ?? 0;
+  let changed = false;
+  for (let page = 0; page < MAX_CORRECTION_PAGES; page += 1) {
+    const response = await request(`/api/v1/corrections?after=${after}`);
+    const payload = await response.json() as { data?: { corrections?: unknown[]; cursor?: number; hasMore?: boolean } };
+    const corrections = (payload.data?.corrections ?? []).flatMap((correction) => normalizeCorrection(correction) ?? []);
+    if (await applyRemoteCorrections(storageId, corrections, epoch)) changed = true;
+    const cursor = payload.data?.cursor;
+    if (typeof cursor === "number" && cursor !== after) {
+      after = cursor;
+      await updateSyncState(storageId, (next) => { next.correctionCursors[userId] = cursor; });
+    }
+    if (!payload.data?.hasMore) break;
+  }
+  return changed;
 }
 
 export async function deleteAllCloudData(): Promise<void> {
@@ -239,6 +271,31 @@ export async function deleteAccount(password: string): Promise<AccountDeletionRe
   if (response.status === 429) return "rate_limited";
   const payload = await response.json().catch(() => null) as { error?: { code?: string } } | null;
   return payload?.error?.code === "invalid_password" ? "invalid_password" : "failed";
+}
+
+/** `write` tokens may also change named places and corrections. */
+export type ApiTokenScope = "read" | "write";
+export type ApiToken = { id: string; name: string; scope: ApiTokenScope; createdAt: number };
+
+/** Tokens for the external API (MCP). The plain token is only returned when it is issued. */
+export async function listApiTokens(): Promise<ApiToken[]> {
+  const payload = await (await request("/api/v1/api-tokens")).json() as { data?: ApiToken[] };
+  return payload.data ?? [];
+}
+
+export type ApiTokenCreation = { created: ApiToken & { token: string } } | { error: "token_limit" | "failed" };
+
+export async function createApiToken(name: string, scope: ApiTokenScope = "read"): Promise<ApiTokenCreation> {
+  const response = await fetch(`${baseURL}/api/v1/api-tokens`, { credentials: "include", ...jsonBody("POST", { name, scope }) });
+  if (response.status === 401) throw new UnauthorizedError();
+  if (response.status === 409) return { error: "token_limit" };
+  if (!response.ok) return { error: "failed" };
+  const payload = await response.json() as { data: ApiToken & { token: string } };
+  return { created: payload.data };
+}
+
+export async function deleteApiToken(id: string): Promise<void> {
+  await request(`/api/v1/api-tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 export type SyncOutcome = {
@@ -271,6 +328,7 @@ export async function synchronizeEvents(storageId: string, userId: string, optio
     if (options.pull ?? true) {
       await pull(storageId, userId, epoch, outcome);
       if (await syncPlaces(storageId, epoch)) outcome.changed = true;
+      if (await syncCorrections(storageId, userId, epoch)) outcome.changed = true;
     }
   } catch (error) {
     outcome.online = false;

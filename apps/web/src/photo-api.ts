@@ -5,6 +5,10 @@ import { apiBaseURL as baseURL } from "./api-base";
 export async function uploadPhotoPreview(storageId: string, eventId: string): Promise<boolean> {
   const stored = await loadPhotoPreview(storageId, eventId);
   if (!stored) return false;
+  // A video whose poster frame could not be drawn kept the video itself as its
+  // preview. There is no image to back up, and retrying would leave the backup
+  // pending forever, so it counts as done.
+  if (stored.type.startsWith("video/")) return true;
   const blob = await makeBackupThumbnail(stored);
   if (!blob) return false;
   const hash = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());

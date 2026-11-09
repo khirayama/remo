@@ -64,7 +64,7 @@ export function Icon({ name, size = 24, className, style }: { name: IconName; si
   return <svg className={className} style={style} width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d={ICON_PATHS[name]}/></svg>;
 }
 
-export type BadgeTone = "green" | "teal" | "amber" | "neutral";
+export type BadgeTone = "green" | "teal" | "amber" | "indigo" | "neutral";
 
 /** Circular tinted badge used for timeline kinds, settings and empty states. */
 export function IconBadge({ name, tone, size = 32, iconSize = 18 }: { name: IconName; tone: BadgeTone; size?: number; iconSize?: number }) {

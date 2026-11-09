@@ -1,14 +1,18 @@
 import { ChangeEvent, FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+import { ApiTokenDialog } from "./ApiTokenDialog";
 import { authClient } from "./auth-client";
 import { deleteAccount, deleteAllCloudData, synchronizeEvents } from "./life-api";
-import { claimRecords, clearEvents, countUnsavedEvents, dateKey, downloadExport, ExportRange, ExportSummary, forgetAccount, lastBackupKey, LifeEvent, loadDayEvents, loadUploadedPhotos, localDeviceStorageId, migrateLegacyTimeline, Ownership, ownershipFor, Place, readImport, rememberUploadedPhoto, replaceRecords, storeImported, summarizeRange } from "./life-log";
-import { clearDirtyDays, countEvents, deleteLocalEvents, listRecordedDays, loadDirtyDays, loadEvent, loadEventsInRange, loadStoredPlaces, putLocalEvents, putLocalPlace, requestPersistentStorage, storageUsage, StorageUsage } from "./timeline-db";
+import { claimRecords, clearEvents, Correction, countUnsavedEvents, dateKey, downloadExport, ExportRange, ExportSummary, forgetAccount, lastBackupKey, LifeEvent, loadDayEvents, loadUploadedPhotos, localDeviceStorageId, migrateLegacyTimeline, newCorrection, Ownership, ownershipFor, Place, readImport, readImportExtras, rememberUploadedPhoto, replaceRecords, storeImported, storeImportExtras, summarizeRange } from "./life-log";
+import { clearDirtyDays, countEvents, deleteLocalEvents, listRecordedDays, loadCorrections, loadDirtyDays, loadEvent, loadEventsInRange, loadStoredPlaces, putLocalCorrections, putLocalEvents, putLocalPlace, requestPersistentStorage, storageUsage, StorageUsage } from "./timeline-db";
+import { dayRange } from "./day";
+import { fetchSleepSessions, SleepSession } from "./sleep-api";
+import { buildSheetItems, daySummary, sleepStartedBefore } from "./timeline-sheet";
 import { readPhotoMetadata } from "./photo-metadata";
 import { deleteAllPhotoPreviews, deletePhotoPreview, listLocalPhotoPreviewIds, loadPhotoPreview, makePhotoThumbnail, migratePhotoPreviews, savePhotoPreview } from "./photo-storage";
 import { loadRemotePhotoPreview, loadRemotePhotoPreviews, uploadPhotoPreview } from "./photo-api";
-import { buildTimelineSnapshot, distanceMeters, PHOTO_LOCATION_SUGGESTION_WINDOW_MS, PhotoCluster, StayCluster, StayPlace, StayVisit, StayVisitHistory, STAY_PLACE_RADIUS_METERS, TimelineActivity, TimelineRenderSnapshot, UNTRACKED_GAP_MS, isMostlyUntracked, stayCircleRadiusMeters, suggestPhotoLocation } from "./timeline-map";
+import { buildTimelineSnapshot, DEFAULT_PLACE_RADIUS_METERS, distanceMeters, findOutlierCandidates, matchPlace, MAX_PLACE_ANCHORS, OutlierCandidate, placeAnchors, TimelineCorrectionKind, PHOTO_LOCATION_SUGGESTION_WINDOW_MS, PhotoCluster, StayCluster, StayPlace, StayVisit, StayVisitHistory, STAY_PLACE_RADIUS_METERS, TimelineActivity, TimelineRenderSnapshot, UNTRACKED_GAP_MS, isMostlyUntracked, stayCircleRadiusMeters, suggestPhotoLocation } from "./timeline-map";
 import { allStays, AllTimeStayPlace, buildAllTimeStayPlaces, detectDayStays, historyOf, parseStayIndexCache, refreshStayIndex, StayIndexCache, StaySummary, stayVisitHistoryFromStays } from "./stay-index";
 import { deleteStayIndexCache, loadStayIndexCache, saveStayIndexCache } from "./stay-index-storage";
 import { isFreshFix, isStationary } from "./capture-policy";
@@ -47,7 +51,6 @@ const TILE_ATTRIBUTION = import.meta.env.VITE_MAP_TILE_ATTRIBUTION || "© OpenSt
 const REMOTE_PREVIEW_CONCURRENCY = 4;
 
 /** Unassigned photos taken within this gap of each other share one timeline row. */
-const PHOTO_GROUP_GAP_MS = 30 * 60 * 1000;
 const DESKTOP_QUERY = "(min-width: 721px)";
 /** Height of the controls stacked over the top of the map. */
 const MAP_TOP_INSET = 112;
@@ -73,20 +76,24 @@ function coordinates(event: { latitude?: number; longitude?: number }) {
   return hasUsableCoordinates(event) ? `${event.latitude.toFixed(5)}, ${event.longitude.toFixed(5)}` : "位置情報なし";
 }
 
-/** The name the user gave to the place at [coordinate], if there is one within the stay-place radius. */
+/** The place the user named at [coordinate]: the nearest anchor whose radius reaches it. */
 function namedPlaceAt(places: Place[], coordinate: { latitude: number; longitude: number }): Place | undefined {
-  let nearest: Place | undefined;
-  let nearestDistance = STAY_PLACE_RADIUS_METERS;
-  for (const place of places) {
-    if (place.deleted) continue;
-    const distance = distanceMeters(place, coordinate);
-    if (distance <= nearestDistance) {
-      nearest = place;
-      nearestDistance = distance;
-    }
-  }
-  return nearest;
+  return matchPlace(places, coordinate)?.place;
 }
+
+/** How far a named place reaches, for the history sheet. */
+function placeReach(place: Place) {
+  const extra = place.anchors?.length ?? 0;
+  return `半径${place.radiusMeters ?? DEFAULT_PLACE_RADIUS_METERS}m${extra ? ` · ほか${extra}地点` : ""}`;
+}
+
+const CORRECTION_LABELS: Record<TimelineCorrectionKind, string> = {
+  exclude: "測位を除外",
+  join_stay: "滞在をつなげる",
+  not_stay: "滞在ではない",
+};
+
+const timeOf = (milliseconds: number) => formatTime(new Date(milliseconds));
 
 /** A place's name, or its coordinate when it has none. */
 function placeLabel(places: Place[], coordinate: { latitude: number; longitude: number }) {
@@ -437,39 +444,6 @@ function RecordingPill({ recording, onClick }: { recording: boolean; onClick: ()
 
 // ---- Timeline sheet -------------------------------------------------------
 
-type SheetItem =
-  | { kind: "activity"; id: string; startedAt: string; activity: TimelineActivity }
-  | { kind: "photos"; id: string; startedAt: string; entries: LifeEvent[] };
-
-function buildSheetItems(timeline: TimelineRenderSnapshot): SheetItem[] {
-  const assignedPhotoIds = new Set(timeline.activities.flatMap((activity) => activity.photos.map((photo) => photo.id)));
-  const ordered: SheetItem[] = [
-    ...timeline.activities.map((activity) => ({ kind: "activity" as const, id: activity.id, startedAt: activity.startedAt, activity })),
-    ...timeline.displayEvents.filter((event) => event.source === "photo" && !assignedPhotoIds.has(event.id))
-      .map((event) => ({ kind: "photos" as const, id: `photos:${event.id}`, startedAt: event.startedAt, entries: [event] })),
-  ].sort((a, b) => a.startedAt.localeCompare(b.startedAt) || (a.kind === "activity" ? -1 : 1));
-  const result: SheetItem[] = [];
-  for (const item of ordered) {
-    const previous = result.at(-1);
-    if (item.kind === "photos" && previous?.kind === "photos"
-      && new Date(item.startedAt).getTime() - new Date(previous.entries.at(-1)!.startedAt).getTime() <= PHOTO_GROUP_GAP_MS) {
-      result[result.length - 1] = { ...previous, entries: [...previous.entries, ...item.entries] };
-    } else {
-      result.push(item);
-    }
-  }
-  return result;
-}
-
-function daySummary(timeline: TimelineRenderSnapshot) {
-  const media = timeline.displayEvents.filter((event) => event.source === "photo");
-  return {
-    distanceMeters: timeline.activities.reduce((sum, activity) => sum + (activity.kind === "movement" && Number.isFinite(activity.distanceMeters) ? activity.distanceMeters : 0), 0),
-    stayCount: timeline.activities.filter((activity) => activity.kind === "stay").length,
-    mediaCount: media.reduce((sum, event) => sum + event.photoCount, 0),
-  };
-}
-
 function DayHeader({ selectedDate, onDateChange }: { selectedDate: string; onDateChange: (value: string) => void }) {
   const today = dateKey(new Date());
   const isToday = selectedDate >= today;
@@ -530,7 +504,7 @@ function RowTitle({ title, trailing }: { title: string; trailing?: string }) {
   return <span className="row-title"><strong>{title}</strong>{trailing && <span>{trailing}</span>}</span>;
 }
 
-function ActivityRow({ activity, placeName, isFirst, isLast, selected, previews, onFocus, onSelectPhotos, onOpenHistory }: { activity: TimelineActivity; placeName?: string; isFirst: boolean; isLast: boolean; selected: boolean; previews: Map<string, string>; onFocus: () => void; onSelectPhotos: (photos: LifeEvent[]) => void; onOpenHistory: () => void }) {
+function ActivityRow({ activity, placeName, isFirst, isLast, selected, previews, onFocus, onSelectPhotos, onOpenHistory, onJoinPrevious, onNotStay }: { activity: TimelineActivity; placeName?: string; isFirst: boolean; isLast: boolean; selected: boolean; previews: Map<string, string>; onFocus: () => void; onSelectPhotos: (photos: LifeEvent[]) => void; onOpenHistory: () => void; /** Present when an earlier stay of the day can be joined to this one. */ onJoinPrevious?: () => void; onNotStay: () => void }) {
   const stay = activity.kind === "stay";
   return <TimelineRow startedAt={activity.startedAt} endedAt={activity.endedAt} isFirst={isFirst} isLast={isLast} badge={stay ? <IconBadge name="place" tone="green"/> : <IconBadge name="route" tone="teal"/>}>
     <div className={`row-card ${activity.kind}${selected ? " selected" : ""}`} role="button" tabIndex={0} aria-pressed={selected} onClick={onFocus} onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); onFocus(); } }}>
@@ -539,7 +513,25 @@ function ActivityRow({ activity, placeName, isFirst, isLast, selected, previews,
         ? `直線距離 ${formatDistance(activity.distanceMeters)}`
         : activity.untrackedMs > 0 ? `${formatDistance(activity.distanceMeters)}・うち記録なし ${activityDurationLabel(activity.untrackedMs)}` : formatDistance(activity.distanceMeters)}</span>}
       {activity.photos.length > 0 && <PhotoStrip entries={activity.photos} previews={previews} onOpen={() => onSelectPhotos(activity.photos)}/>}
-      {stay && selected && <button type="button" className="text-button row-card-action" onClick={(event) => { event.stopPropagation(); onOpenHistory(); }}><Icon name="restore" size={18}/>この場所の訪問履歴</button>}
+      {stay && selected && <div className="row-card-actions">
+        <button type="button" className="text-button row-card-action" onClick={(event) => { event.stopPropagation(); onOpenHistory(); }}><Icon name="restore" size={18}/>この場所の訪問履歴</button>
+        {onJoinPrevious && <button type="button" className="text-button row-card-action" onClick={(event) => { event.stopPropagation(); onJoinPrevious(); }}><Icon name="route" size={18}/>前の滞在とつなげる</button>}
+        <button type="button" className="text-button row-card-action" onClick={(event) => { event.stopPropagation(); onNotStay(); }}><Icon name="eventBusy" size={18}/>滞在ではない</button>
+      </div>}
+    </div>
+  </TimelineRow>;
+}
+
+/** Sleep from the cloud backup; read-only, so it is not a button. */
+function SleepRow({ session, day, isFirst, isLast }: { session: SleepSession; day: string; isFirst: boolean; isLast: boolean }) {
+  const startedBefore = sleepStartedBefore(session, day);
+  const startedAt = new Date(session.startedAt);
+  const endedAt = new Date(session.endedAt);
+  // Both times sit in the rail like the phone apps; the subtitle names the bedtime and wake-up.
+  return <TimelineRow startedAt={startedAt.toISOString()} endedAt={endedAt.toISOString()} isFirst={isFirst} isLast={isLast} badge={<IconBadge name="bedtime" tone="indigo"/>}>
+    <div className="row-card sleep">
+      <RowTitle title="睡眠" trailing={activityDurationLabel(session.endedAt - session.startedAt)}/>
+      <span className="row-subtitle">{`${startedBefore ? "前日 " : ""}${formatTime(startedAt)} 就寝 → ${formatTime(endedAt)} 起床`}</span>
     </div>
   </TimelineRow>;
 }
@@ -574,6 +566,54 @@ function StayPlacesSection({ places, placeNames, onOpenHistory }: { places: Stay
   </section>;
 }
 
+/** Fixes that jump off the route, and the corrections laid over the day, with undo. */
+function DayCorrectionsSection({ outliers, corrections, onExclude, onUndo }: { outliers: OutlierCandidate[]; corrections: Correction[]; onExclude: () => void; onUndo: (correction: Correction) => void }) {
+  if (!outliers.length && !corrections.length) return null;
+  return <section className="day-corrections">
+    {outliers.length > 0 && <div className="day-correction-row outlier">
+      <IconBadge name="route" tone="amber"/>
+      <div><strong>飛んだ測位 {outliers.length}か所</strong><small>線から大きく外れてすぐ戻る測位です。除外すると線と滞在から外します（元の記録は残ります）。</small></div>
+      <button type="button" className="text-button" onClick={onExclude}>除外する</button>
+    </div>}
+    {corrections.length > 0 && <>
+      <div className="section-label-row"><span>この日の補正</span><small>{corrections.length}件</small></div>
+      <ul className="day-correction-list">{corrections.map((correction) => <li key={correction.id} className="day-correction-row">
+        <div>
+          <strong>{CORRECTION_LABELS[correction.kind]}{correction.source === "mcp" && <span className="token-badge">AI</span>}</strong>
+          <small>{timeOf(correction.startedAt)}{correction.endedAt > correction.startedAt && timeOf(correction.endedAt) !== timeOf(correction.startedAt) ? `–${timeOf(correction.endedAt)}` : ""}</small>
+        </div>
+        <button type="button" className="text-button" onClick={() => onUndo(correction)}>取り消す</button>
+      </li>)}</ul>
+    </>}
+  </section>;
+}
+
+/** A place a named place can take in: another named place, or a recurring place without a name. */
+type MergeCandidate = { id: string; label: string; latitude: number; longitude: number; distanceMeters: number; detail: string; place?: Place };
+
+const MERGE_SEARCH_METERS = 1000;
+const PLACE_RADIUS_OPTIONS = [50, 100, 200, 300];
+
+function nearestAnchorDistance(place: Place, point: { latitude: number; longitude: number }) {
+  return Math.min(...placeAnchors(place).map((anchor) => distanceMeters(anchor, point)));
+}
+
+/** Picks a place to merge into [target]. */
+function MergePlaceDialog({ target, candidates, onDismiss, onMerge }: { target: Place; candidates: MergeCandidate[]; onDismiss: () => void; onMerge: (candidate: MergeCandidate) => void }) {
+  const full = (target.anchors?.length ?? 0) >= MAX_PLACE_ANCHORS;
+  return <Dialog title="近くの場所をまとめる" onDismiss={onDismiss} actions={<button type="button" className="text-button" onClick={onDismiss}>キャンセル</button>}>
+    <p>選んだ場所の滞在を「{target.name}」として表示します。名前のある場所を選ぶと、その場所は「{target.name}」に統合されます。</p>
+    {full ? <p className="dialog-strong">これ以上地点を追加できません（{MAX_PLACE_ANCHORS}地点まで）。</p>
+      : candidates.length === 0 ? <p>1km以内にまとめられる場所はありません。</p>
+        : <ul className="merge-candidates">{candidates.map((candidate) => <li key={candidate.id}>
+          <button type="button" className="stay-place-row" onClick={() => onMerge(candidate)}>
+            <IconBadge name="place" tone={candidate.place ? "teal" : "green"}/>
+            <div><strong>{candidate.label}</strong><small>{formatDistance(candidate.distanceMeters)} · {candidate.detail}</small></div>
+          </button>
+        </li>)}</ul>}
+  </Dialog>;
+}
+
 /** Names a place, renames it, or removes its name. */
 function PlaceNameDialog({ current, onDismiss, onSave }: { current?: Place; onDismiss: () => void; onSave: (name: string) => void }) {
   const [name, setName] = useState(current?.name ?? "");
@@ -591,7 +631,7 @@ function PlaceNameDialog({ current, onDismiss, onSave }: { current?: Place; onDi
 }
 
 /** All-time visits to one place, grouped by day. Tapping a day opens it. */
-function PlaceHistorySheet({ history, place, placeNames, onClose, onOpenDay, onRename }: { history?: StayVisitHistory; place: MapCoordinate; placeNames: Place[]; onClose: () => void; onOpenDay: (day: string) => void; onRename: (place: MapCoordinate, current: Place | undefined, name: string) => void }) {
+function PlaceHistorySheet({ history, place, placeNames, mergeCandidates, onClose, onOpenDay, onRename, onSavePlace, onMerge }: { history?: StayVisitHistory; place: MapCoordinate; placeNames: Place[]; mergeCandidates: (target: Place) => MergeCandidate[]; onClose: () => void; onOpenDay: (day: string) => void; onRename: (place: MapCoordinate, current: Place | undefined, name: string) => void; onSavePlace: (place: Place) => void; onMerge: (target: Place, candidate: MergeCandidate) => void }) {
   const days = useMemo(() => {
     const groups: { day: string; visits: StayVisit[] }[] = [];
     history?.visits.forEach((visit) => {
@@ -605,16 +645,30 @@ function PlaceHistorySheet({ history, place, placeNames, onClose, onOpenDay, onR
   const first = history?.visits.at(-1);
   const named = namedPlaceAt(placeNames, place);
   const [naming, setNaming] = useState(false);
+  const [merging, setMerging] = useState(false);
   const modalRef = useModalFocus<HTMLElement>();
   useEscape(onClose);
   return <div className="scrim sheet-scrim" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
     <section ref={modalRef} data-modal tabIndex={-1} className="modal-sheet" role="dialog" aria-modal="true" aria-label="訪問履歴">
       <SheetHandle/>
       <header className="modal-sheet-header">
-        <div><h2>{named?.name ?? "訪問履歴"}</h2><p>{coordinates(place)} · 100m以内の滞在</p></div>
+        <div><h2>{named?.name ?? "訪問履歴"}</h2><p>{named ? `${coordinates(named)} · ${placeReach(named)}` : `${coordinates(place)} · 100m以内の滞在`}</p></div>
         <IconButton icon="edit" label={named ? "場所の名前を変更" : "場所に名前を付ける"} onClick={() => setNaming(true)}/>
         <IconButton icon="close" label="閉じる" onClick={onClose}/>
       </header>
+      {named && <div className="place-reach">
+        <div className="place-reach-row">
+          <span>範囲</span>
+          <div className="segmented compact" role="radiogroup" aria-label="場所の範囲">
+            {PLACE_RADIUS_OPTIONS.map((radius) => <button key={radius} type="button" role="radio" aria-checked={(named.radiusMeters ?? DEFAULT_PLACE_RADIUS_METERS) === radius} className={(named.radiusMeters ?? DEFAULT_PLACE_RADIUS_METERS) === radius ? "active" : ""} onClick={() => onSavePlace({ ...named, radiusMeters: radius, updatedAt: Date.now() })}>{radius}m</button>)}
+          </div>
+        </div>
+        {(named.anchors ?? []).length > 0 && <ul className="place-anchors">{named.anchors!.map((anchor, index) => <li key={`${anchor.latitude},${anchor.longitude},${index}`}>
+          <span>{coordinates(anchor)} · 半径{anchor.radiusMeters}m</span>
+          <button type="button" className="text-button" onClick={() => onSavePlace({ ...named, anchors: named.anchors!.filter((_, other) => other !== index), updatedAt: Date.now() })}>外す</button>
+        </li>)}</ul>}
+        <button type="button" className="text-button" onClick={() => setMerging(true)}><Icon name="place" size={18}/>近くの場所をまとめる</button>
+      </div>}
       {history ? <>
         <div className="place-history-summary">
           <SummaryChip icon="place" tone="green" text={`${history.visits.length}回`}/>
@@ -634,6 +688,7 @@ function PlaceHistorySheet({ history, place, placeNames, onClose, onOpenDay, onR
       </> : <div className="all-places-status"><Spinner size={20}/><span>過去の記録を集計しています…</span></div>}
     </section>
     {naming && <PlaceNameDialog current={named} onDismiss={() => setNaming(false)} onSave={(name) => { setNaming(false); onRename(place, named, name); }}/>}
+    {merging && named && <MergePlaceDialog target={named} candidates={mergeCandidates(named)} onDismiss={() => setMerging(false)} onMerge={(candidate) => { setMerging(false); onMerge(named, candidate); }}/>}
   </div>;
 }
 
@@ -704,10 +759,17 @@ function periodStart(period: PlacePeriod, now = Date.now()) {
   return days === undefined ? undefined : new Date(now - days * 86_400_000).toISOString();
 }
 
-function TimelineHome({ dayEvents, loadedDate, stayIndex, placeNames, previews, selectedDate, currentLocation, autoCapture, onDateChange, onSelectPhotos, onOpenSettings, onRenamePlace }: { dayEvents: LifeEvent[]; /** The day [dayEvents] belong to; it trails `selectedDate` while a day loads. */ loadedDate: string; stayIndex: StayIndexState; placeNames: Place[]; previews: Map<string, string>; selectedDate: string; currentLocation?: CurrentLocation; autoCapture: boolean; onDateChange: (value: string) => void; onSelectPhotos: (photos: LifeEvent[]) => void; onOpenSettings: () => void; onRenamePlace: (place: MapCoordinate, current: Place | undefined, name: string) => void }) {
-  const timeline = useMemo(() => buildTimelineSnapshot(dayEvents), [dayEvents]);
-  const items = useMemo(() => buildSheetItems(timeline), [timeline]);
-  const summary = useMemo(() => daySummary(timeline), [timeline]);
+function TimelineHome({ dayEvents, sleep, loadedDate, stayIndex, placeNames, corrections, previews, selectedDate, currentLocation, autoCapture, onDateChange, onSelectPhotos, onOpenSettings, onRenamePlace, onSavePlace, onMergePlace, onAddCorrections, onUndoCorrection }: { dayEvents: LifeEvent[]; /** Sleep that ended on the loaded day, read from the cloud. */ sleep: SleepSession[]; /** The day [dayEvents] belong to; it trails `selectedDate` while a day loads. */ loadedDate: string; stayIndex: StayIndexState; placeNames: Place[]; corrections: Correction[]; previews: Map<string, string>; selectedDate: string; currentLocation?: CurrentLocation; autoCapture: boolean; onDateChange: (value: string) => void; onSelectPhotos: (photos: LifeEvent[]) => void; onOpenSettings: () => void; onRenamePlace: (place: MapCoordinate, current: Place | undefined, name: string) => void; onSavePlace: (place: Place) => void; onMergePlace: (target: Place, candidate: MergeCandidate) => void; onAddCorrections: (corrections: Correction[]) => void; onUndoCorrection: (correction: Correction) => void }) {
+  // The corrections laid over the loaded day, oldest first.
+  const dayCorrections = useMemo(() => {
+    if (!loadedDate) return [];
+    const { from, to } = dayRange(loadedDate);
+    return corrections.filter((correction) => !correction.deleted && correction.startedAt < to && correction.endedAt >= from);
+  }, [corrections, loadedDate]);
+  const timeline = useMemo(() => buildTimelineSnapshot(dayEvents, { corrections: dayCorrections, places: placeNames }), [dayCorrections, dayEvents, placeNames]);
+  const outliers = useMemo(() => findOutlierCandidates(timeline), [timeline]);
+  const items = useMemo(() => buildSheetItems(timeline, sleep), [sleep, timeline]);
+  const summary = useMemo(() => daySummary(timeline, sleep), [sleep, timeline]);
   const desktop = useMediaQuery(DESKTOP_QUERY);
   const [mode, setMode] = useState<HomeMode>("day");
   const [period, setPeriod] = useState<PlacePeriod>("all");
@@ -723,14 +785,38 @@ function TimelineHome({ dayEvents, loadedDate, stayIndex, placeNames, previews, 
     const from = periodStart(period);
     return from === undefined ? stayIndex.stays : stayIndex.stays?.filter((stay) => stay.startedAt >= from);
   }, [period, stayIndex.stays]);
-  const places = useMemo(() => periodStays && buildAllTimeStayPlaces(periodStays), [periodStays]);
+  const places = useMemo(() => periodStays && buildAllTimeStayPlaces(periodStays, placeNames), [periodStays, placeNames]);
+  const allTimePlaces = useMemo(() => stayIndex.stays && buildAllTimeStayPlaces(stayIndex.stays, placeNames), [placeNames, stayIndex.stays]);
+  const mergeCandidates = useCallback((target: Place): MergeCandidate[] => {
+    const unnamed = (allTimePlaces ?? []).filter((place) => !place.placeId).map((place): MergeCandidate => ({
+      id: place.id,
+      label: coordinates(place),
+      latitude: place.latitude,
+      longitude: place.longitude,
+      distanceMeters: nearestAnchorDistance(target, place),
+      detail: `${place.visits.length}回 · 最終 ${formatDate(place.lastVisitedAt)}`,
+    }));
+    const named = placeNames.filter((place) => !place.deleted && place.id !== target.id).map((place): MergeCandidate => ({
+      id: place.id,
+      label: place.name,
+      latitude: place.latitude,
+      longitude: place.longitude,
+      distanceMeters: Math.min(...placeAnchors(place).map((anchor) => nearestAnchorDistance(target, anchor))),
+      detail: "名前のある場所",
+      place,
+    }));
+    return [...named, ...unnamed]
+      .filter((candidate) => candidate.distanceMeters <= MERGE_SEARCH_METERS)
+      .sort((first, second) => first.distanceMeters - second.distanceMeters)
+      .slice(0, 30);
+  }, [allTimePlaces, placeNames]);
   const selectedPlace = places?.find((place) => place.id === selectedPlaceId);
   // A day's stay history is read from the index, so it matches the all-places
   // map; until the index is ready the sheet shows that it is being prepared.
   const dayHistory = useMemo(() => {
     if (!historyPlace || !stayIndex.stays) return undefined;
-    return stayVisitHistoryFromStays(stayIndex.stays, historyPlace);
-  }, [historyPlace, stayIndex.stays]);
+    return stayVisitHistoryFromStays(stayIndex.stays, historyPlace, placeNames);
+  }, [historyPlace, placeNames, stayIndex.stays]);
 
   useEffect(() => {
     setFocus(undefined);
@@ -765,6 +851,25 @@ function TimelineHome({ dayEvents, loadedDate, stayIndex, placeNames, previews, 
   function selectPlace(place: AllTimeStayPlace) {
     setSelectedPlaceId(place.id);
     setShowPlaceHistory(true);
+  }
+
+  function stayPlaceName(activity: TimelineActivity) {
+    if (activity.kind !== "stay" || !activity.placeId) return undefined;
+    return placeNames.find((place) => place.id === activity.placeId)?.name;
+  }
+
+  function addCorrection(kind: TimelineCorrectionKind, activity: TimelineActivity, from = activity) {
+    setFocus(undefined);
+    onAddCorrections([newCorrection(kind, Date.parse(from.startedAt), Date.parse(activity.endedAt))]);
+  }
+
+  /** Joining is offered when an earlier stay of the day is within a correction's reach. */
+  function joinPrevious(activity: TimelineActivity) {
+    if (activity.kind !== "stay") return undefined;
+    const index = timeline.activities.findIndex((candidate) => candidate.id === activity.id);
+    const previous = timeline.activities.slice(0, Math.max(0, index)).reverse().find((candidate) => candidate.kind === "stay");
+    if (!previous || Date.parse(activity.endedAt) - Date.parse(previous.startedAt) > 24 * 60 * 60 * 1000) return undefined;
+    return () => addCorrection("join_stay", activity, previous);
   }
 
   function openDay(day: string) {
@@ -806,26 +911,30 @@ function TimelineHome({ dayEvents, loadedDate, stayIndex, placeNames, previews, 
           : <>
             <DayHeader selectedDate={selectedDate} onDateChange={onDateChange}/>
             <div className="day-summary">
-              {summary.distanceMeters < 1 && summary.stayCount === 0 && summary.mediaCount === 0
+              {summary.distanceMeters < 1 && summary.stayCount === 0 && summary.mediaCount === 0 && summary.sleepMs === 0
                 ? <span className="day-summary-empty">記録はありません</span>
                 : <>
                   {summary.distanceMeters >= 1 && <SummaryChip icon="route" tone="teal" text={formatDistance(summary.distanceMeters)}/>}
                   {summary.stayCount > 0 && <SummaryChip icon="place" tone="green" text={`滞在 ${summary.stayCount}`}/>}
                   {summary.mediaCount > 0 && <SummaryChip icon="photoCamera" tone="amber" text={String(summary.mediaCount)}/>}
+                  {summary.sleepMs > 0 && <SummaryChip icon="bedtime" tone="indigo" text={activityDurationLabel(summary.sleepMs)}/>}
                 </>}
             </div>
             {items.length ? <>
               <div className="section-label-row"><span>タイムライン</span><small>{items.length}件</small></div>
-              <ol className="timeline-list">{items.map((item, index) => item.kind === "activity"
-                ? <ActivityRow key={item.id} activity={item.activity} placeName={item.activity.kind === "stay" ? namedPlaceAt(placeNames, item.activity)?.name : undefined} isFirst={index === 0} isLast={index === items.length - 1} selected={focus?.activityId === item.id} previews={previews} onFocus={() => { toggleFocus(item.activity); if (!desktop) setExpanded(true); }} onSelectPhotos={onSelectPhotos} onOpenHistory={() => item.activity.kind === "stay" && setHistoryPlace({ latitude: item.activity.latitude, longitude: item.activity.longitude })}/>
+              <ol className="timeline-list">{items.map((item, index) => item.kind === "sleep"
+                ? <SleepRow key={item.id} session={item.session} day={loadedDate} isFirst={index === 0} isLast={index === items.length - 1}/>
+                : item.kind === "activity"
+                ? <ActivityRow key={item.id} activity={item.activity} placeName={stayPlaceName(item.activity)} isFirst={index === 0} isLast={index === items.length - 1} selected={focus?.activityId === item.id} previews={previews} onFocus={() => { toggleFocus(item.activity); if (!desktop) setExpanded(true); }} onSelectPhotos={onSelectPhotos} onOpenHistory={() => item.activity.kind === "stay" && setHistoryPlace({ latitude: item.activity.latitude, longitude: item.activity.longitude })} onJoinPrevious={joinPrevious(item.activity)} onNotStay={() => addCorrection("not_stay", item.activity)}/>
                 : <PhotoGroupRow key={item.id} entries={item.entries} isFirst={index === 0} isLast={index === items.length - 1} previews={previews} onOpen={() => onSelectPhotos(item.entries)}/>)}</ol>
             </> : <EmptyTimeline autoCapture={autoCapture}/>}
+            <DayCorrectionsSection outliers={outliers} corrections={dayCorrections} onExclude={() => { setFocus(undefined); onAddCorrections(outliers.map((outlier) => newCorrection("exclude", outlier.startedAt, outlier.endedAt))); }} onUndo={onUndoCorrection}/>
             {timeline.stayPlaces.length > 0 && <StayPlacesSection key={selectedDate} places={timeline.stayPlaces} placeNames={placeNames} onOpenHistory={(place) => setHistoryPlace({ latitude: place.latitude, longitude: place.longitude })}/>}
           </>}
       </div>
     </section>
-    {mode === "day" && historyPlace && <PlaceHistorySheet history={dayHistory} place={historyPlace} placeNames={placeNames} onClose={() => setHistoryPlace(undefined)} onOpenDay={openDay} onRename={onRenamePlace}/>}
-    {mode === "all" && showPlaceHistory && selectedPlace && <PlaceHistorySheet history={historyOf(selectedPlace.visits)} place={selectedPlace} placeNames={placeNames} onClose={() => setShowPlaceHistory(false)} onOpenDay={openDay} onRename={onRenamePlace}/>}
+    {mode === "day" && historyPlace && <PlaceHistorySheet history={dayHistory} place={historyPlace} placeNames={placeNames} mergeCandidates={mergeCandidates} onClose={() => setHistoryPlace(undefined)} onOpenDay={openDay} onRename={onRenamePlace} onSavePlace={onSavePlace} onMerge={onMergePlace}/>}
+    {mode === "all" && showPlaceHistory && selectedPlace && <PlaceHistorySheet history={historyOf(selectedPlace.visits)} place={selectedPlace} placeNames={placeNames} mergeCandidates={mergeCandidates} onClose={() => setShowPlaceHistory(false)} onOpenDay={openDay} onRename={onRenamePlace} onSavePlace={onSavePlace} onMerge={onMergePlace}/>}
   </section>;
 }
 
@@ -842,8 +951,7 @@ function PhotoListSheet({ photos, previews, signedIn, onClose, onEditLocation }:
     const urls: string[] = [];
     void (async () => {
       for (const photo of sorted) {
-        // Videos have no backed-up preview.
-        if (photo.mediaType === "video") continue;
+        // Videos back up their poster-frame preview like photos.
         const blobs = await loadRemotePhotoPreviews(photo.id).catch(() => []);
         if (cancelled) break;
         const images = blobs.map((blob) => URL.createObjectURL(blob));
@@ -1075,7 +1183,7 @@ function storageSubtitle(usage: StorageUsage | undefined, eventCount: number) {
   return usage.persisted ? used : `${used}（ブラウザが容量不足時に削除する可能性があります。エクスポートかバックアップをおすすめします）`;
 }
 
-function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBackupAt, eventCount, storage, onBack, onToggleCapture, onAddPhotos, onExport, onImport, onDeleteAll, onBackup, onOpenAuth, onSignOut, onDeleteAccount }: {
+function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBackupAt, eventCount, storage, onBack, onToggleCapture, onAddPhotos, onExport, onImport, onDeleteAll, onBackup, onOpenAuth, onSignOut, onDeleteAccount, onOpenApiTokens }: {
   user?: { id: string; email: string };
   captureEnabled: boolean;
   captureIssue?: string;
@@ -1093,6 +1201,7 @@ function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBac
   onOpenAuth: () => void;
   onSignOut: () => void;
   onDeleteAccount: () => void;
+  onOpenApiTokens: () => void;
 }) {
   const modalRef = useModalFocus<HTMLDivElement>();
   useEscape(onBack);
@@ -1106,6 +1215,7 @@ function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBac
       {user ? <SettingsGroup title="バックアップ">
         <ActionRow icon={lastBackupAt ? "cloudDone" : "cloudUpload"} title={syncState} subtitle={lastBackupAt ? `最終バックアップ ${formatBackupTime(lastBackupAt)}` : "まだバックアップされていません"} trailing={<button type="button" className="text-button" onClick={onBackup}>今すぐ</button>}/>
         <ActionRow icon="person" title={user.email} subtitle="ログイン中"/>
+        <ActionRow icon="key" title="AIツールとの接続（MCP）" subtitle="バックアップした滞在や移動をAIツールから読み取れるようにします" trailing={<Chevron/>} onClick={onOpenApiTokens}/>
         <ActionRow icon="logout" title="ログアウト" onClick={onSignOut}/>
       </SettingsGroup> : <section className="settings-group"><h3>バックアップ</h3><div className="grouped-surface backup-card">
         <div><Icon name="cloudUpload" className="tint-green"/><span><strong>クラウドにバックアップ</strong><small>ログインすると記録と写真の縮小画像をバックアップします。元写真と動画本体は含まれません。</small></span></div>
@@ -1216,6 +1326,7 @@ function useStayIndex(storageId: string, revision: number): StayIndexState {
           cacheRef.current = cache;
         }
         const dirty = await loadDirtyDays(storageId);
+        const corrections = (await loadCorrections(storageId)).filter((correction) => !correction.deleted);
         // The first pass covers every recorded day; an interrupted pass
         // continues with the days it has not reached.
         const days = cache.complete
@@ -1224,6 +1335,7 @@ function useStayIndex(storageId: string, revision: number): StayIndexState {
         if (controller.signal.aborted) return;
         const result = await refreshStayIndex(cache, days, (day) => loadDayEvents(storageId, day), {
           today,
+          corrections,
           signal: controller.signal,
           onProgress: (done, total) => setState((current) => ({ ...current, progress: { done, total } })),
         });
@@ -1238,7 +1350,7 @@ function useStayIndex(storageId: string, revision: number): StayIndexState {
         if (result.aborted || controller.signal.aborted) return;
         // Today (and any record dated later) is detected on every update.
         const openDays = [...new Set([today, ...dirty.map((entry) => entry.day).filter((day) => day > today)])];
-        const openStays = (await Promise.all(openDays.map(async (day) => detectDayStays(await loadDayEvents(storageId, day))))).flat();
+        const openStays = (await Promise.all(openDays.map(async (day) => detectDayStays(await loadDayEvents(storageId, day), corrections)))).flat();
         if (!controller.signal.aborted) setState({ stays: allStays(cache, openStays) });
       })().catch(() => undefined);
     }, cacheRef.current ? STAY_INDEX_DEBOUNCE_MS : 0);
@@ -1310,8 +1422,13 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
   const [dayRecords, setDayRecords] = useState<{ date: string; events: LifeEvent[] }>({ date: "", events: [] });
   const dayEvents = dayRecords.events;
   const [revision, setRevision] = useState(0);
+  // Sleep is never stored locally: it is read from the cloud for the shown day.
+  const [daySleep, setDaySleep] = useState<{ date: string; sessions: SleepSession[] }>();
+  // Changes when a backup round-trip finishes, so sleep is read again.
+  const [backupRevision, setBackupRevision] = useState(0);
   const [eventCount, setEventCount] = useState(0);
   const [placeNames, setPlaceNames] = useState<Place[]>([]);
+  const [corrections, setCorrections] = useState<Correction[]>([]);
   const [storage, setStorage] = useState<StorageUsage>();
   const stayIndex = useStayIndex(storageId, revision);
   const [selectedDate, setSelectedDate] = useState(() => dateKey(new Date()));
@@ -1325,6 +1442,7 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
   const [exporting, setExporting] = useState(false);
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [showAccountDeletion, setShowAccountDeletion] = useState(false);
+  const [showApiTokens, setShowApiTokens] = useState(false);
   const [signOutRequest, setSignOutRequest] = useState<{ unsaved: number }>();
   // Recording is opt-out, but the browser is only asked after the user chose to start.
   const [capturePreference, setCapturePreference] = useState(storedCapturePreference);
@@ -1403,6 +1521,17 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
     void migrateLegacyTimeline(storageId).then(recordsChanged).catch(() => undefined);
   }, [recordsChanged, storageId]);
 
+  useEffect(() => {
+    if (!accountId) { setDaySleep({ date: selectedDate, sessions: [] }); return; }
+    let cancelled = false;
+    const { from, to } = dayRange(selectedDate);
+    void fetchSleepSessions(from, to).then((sessions) => {
+      if (!cancelled) setDaySleep({ date: selectedDate, sessions: sessions ?? [] });
+    });
+    return () => { cancelled = true; };
+  // Local record changes do not affect sleep, which lives only in the cloud.
+  }, [accountId, backupRevision, selectedDate]);
+
   // The selected day.
   useEffect(() => {
     let cancelled = false;
@@ -1417,6 +1546,7 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
   useEffect(() => {
     let cancelled = false;
     void loadStoredPlaces(storageId).then((places) => { if (!cancelled) setPlaceNames(places); }).catch(() => undefined);
+    void loadCorrections(storageId).then((loaded) => { if (!cancelled) setCorrections(loaded); }).catch(() => undefined);
     return () => { cancelled = true; };
   }, [revision, storageId]);
 
@@ -1456,10 +1586,10 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
     return () => { cancelled = true; };
   }, [accountId, storageId]);
 
-  // Previews are loaded only for the photos on screen: the selected day and an
+  // Previews are loaded only for the media on screen: the selected day and an
   // open photo list. Each record is tried once per account, including records
-  // that have no preview (videos, photos never uploaded), so a new location
-  // sample does not re-request every missing preview.
+  // that have no preview (media never uploaded), so a new location sample does
+  // not re-request every missing preview.
   const previewAttemptsRef = useRef<{ accountId?: string; ids: Set<string> }>({ ids: new Set() });
   const visiblePhotos = useMemo(() => {
     const visible = new Map<string, LifeEvent>();
@@ -1494,13 +1624,11 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
       const localIds = await listLocalPhotoPreviewIds(storageId);
       publish(await Promise.all(missing.filter((event) => localIds.has(event.id))
         .map(async (event) => ({ id: event.id, blob: await loadPhotoPreview(storageId, event.id) }))));
-      // Videos are never uploaded, so only photos are looked up in the cloud.
+      // Videos upload their poster-frame preview too, so every record is looked up in the cloud.
       const remote = missing.filter((event) => !localIds.has(event.id));
       if (!previewAccountId) { publish(remote.map((event) => ({ id: event.id }))); return; }
-      publish(remote.filter((event) => event.mediaType === "video").map((event) => ({ id: event.id })));
-      const photos = remote.filter((event) => event.mediaType !== "video");
-      for (let index = 0; index < photos.length && !cancelled; index += REMOTE_PREVIEW_CONCURRENCY) {
-        publish(await Promise.all(photos.slice(index, index + REMOTE_PREVIEW_CONCURRENCY)
+      for (let index = 0; index < remote.length && !cancelled; index += REMOTE_PREVIEW_CONCURRENCY) {
+        publish(await Promise.all(remote.slice(index, index + REMOTE_PREVIEW_CONCURRENCY)
           .map(async (event) => ({ id: event.id, blob: await loadRemotePhotoPreview(event.id).catch(() => undefined) }))));
       }
     })();
@@ -1557,8 +1685,9 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
         const waiting = [...localPhotos].filter((id) => !uploaded.has(id));
         for (const id of waiting.slice(0, 20)) {
           const event = await loadEvent(storageId, id);
-          // A preview without its record, or of a video, is never uploaded.
-          if (!event || event.source !== "photo" || event.mediaType === "video") continue;
+          // A preview without its record is never uploaded. Videos upload their
+          // poster-frame preview (makeVideoThumbnail) just like photos.
+          if (!event || event.source !== "photo") continue;
           if (await uploadPhotoPreview(storageId, id).catch(() => false)) await rememberUploadedPhoto(accountId, id);
           else photoBackupPending = true;
         }
@@ -1577,6 +1706,7 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
       setSyncState("オフライン · 端末に保存済み");
     } finally {
       syncInFlightRef.current = false;
+      setBackupRevision((value) => value + 1);
     }
   // forgetPreviews only touches refs and stable setters.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1813,16 +1943,40 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
     if (await commit(() => putLocalEvents(storageId, [updated]))) void syncNow(true);
   }
 
+  async function savePlaces(places: Place[]) {
+    if (await commit(async () => { for (const place of places) await putLocalPlace(storageId, place); })) void syncNow(true);
+  }
+
   async function renamePlace(coordinate: MapCoordinate, current: Place | undefined, name: string) {
-    const place: Place = {
-      id: current?.id ?? crypto.randomUUID(),
-      name,
-      latitude: current?.latitude ?? coordinate.latitude,
-      longitude: current?.longitude ?? coordinate.longitude,
-      updatedAt: Date.now(),
-      deleted: name === "",
-    };
-    if (await commit(() => putLocalPlace(storageId, place))) void syncNow(true);
+    // Renaming keeps the place's radius and anchors; removing the name deletes the place.
+    const place: Place = current
+      ? name === ""
+        ? { id: current.id, name: "", latitude: current.latitude, longitude: current.longitude, updatedAt: Date.now(), deleted: true }
+        : { ...current, name, updatedAt: Date.now() }
+      : { id: crypto.randomUUID(), name, latitude: coordinate.latitude, longitude: coordinate.longitude, updatedAt: Date.now(), deleted: name === "" };
+    await savePlaces([place]);
+  }
+
+  /** Adds a nearby place's stays to [target]: a named place goes into it, an unnamed one becomes an anchor. */
+  async function mergePlace(target: Place, candidate: MergeCandidate) {
+    const now = Date.now();
+    const added = candidate.place
+      ? placeAnchors(candidate.place)
+      : [{ latitude: candidate.latitude, longitude: candidate.longitude, radiusMeters: DEFAULT_PLACE_RADIUS_METERS }];
+    const anchors = [...(target.anchors ?? []), ...added].slice(0, MAX_PLACE_ANCHORS);
+    await savePlaces([
+      { ...target, anchors, updatedAt: now },
+      ...(candidate.place ? [{ id: candidate.place.id, name: "", latitude: candidate.place.latitude, longitude: candidate.place.longitude, mergedInto: target.id, updatedAt: now, deleted: true }] : []),
+    ]);
+  }
+
+  async function addCorrections(added: Correction[]) {
+    if (!added.length) return;
+    if (await commit(() => putLocalCorrections(storageId, added))) void syncNow(true);
+  }
+
+  async function undoCorrection(correction: Correction) {
+    if (await commit(() => putLocalCorrections(storageId, [{ ...correction, deleted: true }]))) void syncNow(true);
   }
 
   async function importFile(input: ChangeEvent<HTMLInputElement>) {
@@ -1832,7 +1986,8 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
     setPhotoStatus("JSONを読み込み中…");
     try {
       const imported = await readImport(file);
-      if (!await commit(() => storeImported(storageId, imported))) return;
+      const extras = await readImportExtras(file);
+      if (!await commit(async () => { await storeImported(storageId, imported); await storeImportExtras(storageId, extras); })) return;
       const latest = imported.reduce<LifeEvent | undefined>((current, item) => !current || item.startedAt > current.startedAt ? item : current, undefined);
       if (latest) setSelectedDate(dateKey(latest.startedAt));
       setPhotoStatus(`${imported.length}件の記録を読み込みました`);
@@ -1930,8 +2085,9 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
         onOpenAuth={onOpenAuth}
         onSignOut={() => void requestSignOut()}
         onDeleteAccount={() => setShowAccountDeletion(true)}
+        onOpenApiTokens={() => setShowApiTokens(true)}
       />
-      : <TimelineHome dayEvents={dayEvents} loadedDate={dayRecords.date} stayIndex={stayIndex} placeNames={placeNames} previews={photoPreviews} selectedDate={selectedDate} currentLocation={currentLocation} autoCapture={captureEnabled} onDateChange={setSelectedDate} onSelectPhotos={(photos) => { setSelected(undefined); setSelectedPhotos(photos); }} onOpenSettings={() => setShowSettings(true)} onRenamePlace={(place, current, name) => void renamePlace(place, current, name)}/>}
+      : <TimelineHome dayEvents={dayEvents} sleep={daySleep?.date === dayRecords.date ? daySleep.sessions : []} loadedDate={dayRecords.date} stayIndex={stayIndex} placeNames={placeNames} previews={photoPreviews} selectedDate={selectedDate} currentLocation={currentLocation} autoCapture={captureEnabled} onDateChange={setSelectedDate} onSelectPhotos={(photos) => { setSelected(undefined); setSelectedPhotos(photos); }} onOpenSettings={() => setShowSettings(true)} onRenamePlace={(place, current, name) => void renamePlace(place, current, name)} corrections={corrections} onSavePlace={(place) => void savePlaces([place])} onMergePlace={(target, candidate) => void mergePlace(target, candidate)} onAddCorrections={(added) => void addCorrections(added)} onUndoCorrection={(correction) => void undoCorrection(correction)}/>}
     <div className="snackbar-host" aria-live="polite">
       {storageStatus && <div className="snackbar" role="alert">{storageStatus}</div>}
       {photoStatus && <div className="snackbar" role="status">{photoStatus}</div>}
@@ -1942,6 +2098,7 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
       : <LocationRecordDialog event={selected.event} onClose={() => setSelected(undefined)} onDelete={() => void remove(selected.event)}/>)}
     {showExportDialog && <ExportRangeDialog storageId={storageId} range={exportRange} exporting={exporting} onChange={setExportRange} onClose={() => setShowExportDialog(false)} onExport={() => void exportSelectedRange()}/>}
     {confirmDeleteAll && <ConfirmDeleteDialog title="すべての記録を削除しますか？" message={accountId && ownership === "owned" ? "このブラウザとクラウドのバックアップから、位置と写真の記録をすべて削除し、位置情報の記録を停止します。他の端末に保存されている記録は、その端末に残ります。この操作は元に戻せません。" : "このブラウザから、位置と写真の記録をすべて削除し、位置情報の記録を停止します。この操作は元に戻せません。"} confirmLabel="すべて削除" onDismiss={() => setConfirmDeleteAll(false)} onConfirm={() => void removeAll()}/>}
+    {showApiTokens && accountId && <ApiTokenDialog onDismiss={() => setShowApiTokens(false)} onUnauthorized={() => { setShowApiTokens(false); setSyncState(SYNC_SESSION_EXPIRED); }}/>}
     {showAccountDeletion && accountId && <AccountDeletionDialog onDismiss={() => setShowAccountDeletion(false)} onDeleted={() => {
       // The backup no longer exists: the records here count as not backed up,
       // so a later account receives all of them.
