@@ -9,6 +9,8 @@
 - `remo-timeline-2026-10-13.sample.json`: 近くまで歩いて折り返す散歩（滞在にしない）、帰宅直後に約190m手前へ飛び戻る測位（自宅の滞在に含める）を含む例
 - `remo-timeline-<日付>.expected.json`: 各サンプルから作られる滞在・移動（開始・終了時刻、滞在の座標、移動の記録なし時間、写真数）。Web（`apps/web/src/golden.test.ts`）・Android（`SharedTimelineFixtureTest`）・iOS（`SharedTimelineFixtureTests`）が同じ結果になることを確認します。判定ロジックを意図して変更したときは `cd apps/web && npx vitest run -u src/golden.test.ts` で再生成し、Android/iOSの実装を合わせてください
 
+- `corrections.cases.json` / `corrections.expected.json`: 上のサンプルに補正（測位の除外・滞在をつなげる・滞在ではない）と名前付きの場所（基準点）を重ねたケースと、その結果（活動・外れ値の候補・すべての滞在のまとめ）。Web（`apps/web/src/corrections-golden.test.ts`）・Android・iOS が同じ結果になることを確認します。再生成は `cd apps/web && npx vitest run -u src/corrections-golden.test.ts`（[docs/CORRECTIONS.md](../../docs/CORRECTIONS.md)）
+
 Web で確認する場合は、開発サーバーを起動して「設定 → JSONをインポート」から JSON を読み込んでください。インポート後は現在のユーザーのローカルデータへ追加されます。
 
 このデータに含まれる座標はサンプルとして扱い、実在の個人・場所を推測したり、外部へ同期したりしないでください。

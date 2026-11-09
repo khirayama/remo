@@ -1,0 +1,89 @@
+{
+  "description": "Corrections and named places laid over the shared timeline samples. Each case runs remo-timeline-<day>.sample.json (plus extraEvents) through the timeline with the corrections and places; corrections.expected.json holds the result every platform has to produce. allPlaces groups the stays of every sample day (with its corrections) into all-time places.",
+  "cases": [
+    {
+      "name": "join-two-stays",
+      "day": "2026-10-11",
+      "corrections": [
+        { "id": "c-join", "kind": "join_stay", "startedAt": 1791689402171, "endedAt": 1791691849237, "createdAt": 1 }
+      ]
+    },
+    {
+      "name": "not-stay-short-stop",
+      "day": "2026-10-11",
+      "corrections": [
+        { "id": "c-not-stay", "kind": "not_stay", "startedAt": 1791692079246, "endedAt": 1791692327255, "createdAt": 1 }
+      ]
+    },
+    {
+      "name": "exclude-samples",
+      "day": "2026-09-01",
+      "corrections": [
+        { "id": "c-exclude", "kind": "exclude", "startedAt": 1788251087757, "endedAt": 1788251573189, "createdAt": 1 }
+      ]
+    },
+    {
+      "name": "newer-correction-wins-and-deleted-is-ignored",
+      "day": "2026-10-02",
+      "corrections": [
+        { "id": "c-join-newer", "kind": "join_stay", "startedAt": 1790897411120, "endedAt": 1790900074252, "createdAt": 2 },
+        { "id": "c-not-stay-older", "kind": "not_stay", "startedAt": 1790898163219, "endedAt": 1790898996237, "createdAt": 1 },
+        { "id": "c-deleted", "kind": "not_stay", "startedAt": 1790901582285, "endedAt": 1790905746045, "createdAt": 3, "deleted": true }
+      ]
+    },
+    {
+      "name": "places-snap-and-anchors",
+      "day": "2026-10-02",
+      "corrections": [],
+      "places": [
+        {
+          "id": "p-home",
+          "name": "Home",
+          "latitude": 33.5808,
+          "longitude": 130.3881,
+          "radiusMeters": 100,
+          "anchors": [{ "latitude": 33.5834, "longitude": 130.3899, "radiusMeters": 60 }]
+        },
+        { "id": "p-deleted", "name": "Gone", "latitude": 33.58378, "longitude": 130.39253, "deleted": true }
+      ]
+    },
+    {
+      "name": "outlier-run",
+      "day": "2026-10-13",
+      "extraEvents": [
+        { "id": "spike-1", "startedAt": "2026-10-13T00:29:58.000Z", "latitude": 33.6008, "longitude": 130.3827, "accuracyMeters": 10, "photoCount": 0, "source": "location", "updatedAt": "2026-10-13T00:29:58.000Z" },
+        { "id": "spike-2", "startedAt": "2026-10-13T00:30:00.000Z", "latitude": 33.6009, "longitude": 130.3828, "accuracyMeters": 10, "photoCount": 0, "source": "location", "updatedAt": "2026-10-13T00:30:00.000Z" },
+        { "id": "spike-3", "startedAt": "2026-10-13T00:30:02.000Z", "latitude": 33.6008, "longitude": 130.3829, "accuracyMeters": 10, "photoCount": 0, "source": "location", "updatedAt": "2026-10-13T00:30:02.000Z" }
+      ],
+      "corrections": []
+    },
+    {
+      "name": "outlier-run-excluded",
+      "day": "2026-10-13",
+      "extraEvents": [
+        { "id": "spike-1", "startedAt": "2026-10-13T00:29:58.000Z", "latitude": 33.6008, "longitude": 130.3827, "accuracyMeters": 10, "photoCount": 0, "source": "location", "updatedAt": "2026-10-13T00:29:58.000Z" },
+        { "id": "spike-2", "startedAt": "2026-10-13T00:30:00.000Z", "latitude": 33.6009, "longitude": 130.3828, "accuracyMeters": 10, "photoCount": 0, "source": "location", "updatedAt": "2026-10-13T00:30:00.000Z" },
+        { "id": "spike-3", "startedAt": "2026-10-13T00:30:02.000Z", "latitude": 33.6008, "longitude": 130.3829, "accuracyMeters": 10, "photoCount": 0, "source": "location", "updatedAt": "2026-10-13T00:30:02.000Z" }
+      ],
+      "corrections": [
+        { "id": "c-exclude-spike", "kind": "exclude", "startedAt": 1791851398000, "endedAt": 1791851402000, "createdAt": 1 }
+      ]
+    }
+  ],
+  "allPlaces": {
+    "days": ["2026-09-01", "2026-10-01", "2026-10-02", "2026-10-11", "2026-10-13"],
+    "corrections": [
+      { "id": "c-join", "kind": "join_stay", "startedAt": 1791689402171, "endedAt": 1791691849237, "createdAt": 1 }
+    ],
+    "places": [
+      {
+        "id": "p-home",
+        "name": "Home",
+        "latitude": 33.5808,
+        "longitude": 130.3881,
+        "radiusMeters": 100,
+        "anchors": [{ "latitude": 33.5834, "longitude": 130.3899, "radiusMeters": 60 }]
+      }
+    ]
+  }
+}

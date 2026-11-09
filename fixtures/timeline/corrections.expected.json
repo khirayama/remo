@@ -1,0 +1,490 @@
+{
+  "cases": [
+    {
+      "name": "join-two-stays",
+      "activities": [
+        {
+          "kind": "stay",
+          "startedAt": 1791689402171,
+          "endedAt": 1791691849237,
+          "latitude": 33.58186,
+          "longitude": 130.38655,
+          "placeId": null,
+          "corrected": true,
+          "photoCount": 10
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1791691849237,
+          "endedAt": 1791692079246,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1791692079246,
+          "endedAt": 1791692327255,
+          "latitude": 33.58395,
+          "longitude": 130.38815,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1791692327255,
+          "endedAt": 1791692547254,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1791692547254,
+          "endedAt": 1791694503840,
+          "latitude": 33.58542,
+          "longitude": 130.39067,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 1
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1791694503840,
+          "endedAt": 1791695157307,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1791695157307,
+          "endedAt": 1791696938439,
+          "latitude": 33.58089,
+          "longitude": 130.38819,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 1
+        }
+      ],
+      "outliers": []
+    },
+    {
+      "name": "not-stay-short-stop",
+      "activities": [
+        {
+          "kind": "stay",
+          "startedAt": 1791689402171,
+          "endedAt": 1791690912224,
+          "latitude": 33.58087,
+          "longitude": 130.38821,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 3
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1791690912224,
+          "endedAt": 1791691072224,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1791691072224,
+          "endedAt": 1791691849237,
+          "latitude": 33.58186,
+          "longitude": 130.38655,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 7
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1791691849237,
+          "endedAt": 1791692547254,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1791692547254,
+          "endedAt": 1791694503840,
+          "latitude": 33.58542,
+          "longitude": 130.39067,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 1
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1791694503840,
+          "endedAt": 1791695157307,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1791695157307,
+          "endedAt": 1791696938439,
+          "latitude": 33.58089,
+          "longitude": 130.38819,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 1
+        }
+      ],
+      "outliers": []
+    },
+    {
+      "name": "exclude-samples",
+      "activities": [
+        {
+          "kind": "stay",
+          "startedAt": 1788240640300,
+          "endedAt": 1788250734000,
+          "latitude": 33.58088,
+          "longitude": 130.38811,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1788250734000,
+          "endedAt": 1788252017497,
+          "untrackedMs": 763765,
+          "photoCount": 1
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1788252017497,
+          "endedAt": 1788273771000,
+          "latitude": 33.58081,
+          "longitude": 130.38817,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 1
+        }
+      ],
+      "outliers": []
+    },
+    {
+      "name": "newer-correction-wins-and-deleted-is-ignored",
+      "activities": [
+        {
+          "kind": "stay",
+          "startedAt": 1790897411120,
+          "endedAt": 1790900074252,
+          "latitude": 33.58086,
+          "longitude": 130.38808,
+          "placeId": null,
+          "corrected": true,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1790900074252,
+          "endedAt": 1790900819269,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1790900819269,
+          "endedAt": 1790901166277,
+          "latitude": 33.58171,
+          "longitude": 130.38965,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1790901166277,
+          "endedAt": 1790901582285,
+          "untrackedMs": 0,
+          "photoCount": 1
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1790901582285,
+          "endedAt": 1790905746045,
+          "latitude": 33.58378,
+          "longitude": 130.39253,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1790905746045,
+          "endedAt": 1790906316471,
+          "untrackedMs": 0,
+          "photoCount": 1
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1790906316471,
+          "endedAt": 1790906938393,
+          "latitude": 33.58084,
+          "longitude": 130.38812,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        }
+      ],
+      "outliers": []
+    },
+    {
+      "name": "places-snap-and-anchors",
+      "activities": [
+        {
+          "kind": "stay",
+          "startedAt": 1790897411120,
+          "endedAt": 1790897932033,
+          "latitude": 33.5808,
+          "longitude": 130.3881,
+          "placeId": "p-home",
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1790897932033,
+          "endedAt": 1790898163219,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1790898163219,
+          "endedAt": 1790898996237,
+          "latitude": 33.5834,
+          "longitude": 130.3899,
+          "placeId": "p-home",
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1790898996237,
+          "endedAt": 1790899216237,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1790899216237,
+          "endedAt": 1790900074252,
+          "latitude": 33.5808,
+          "longitude": 130.3881,
+          "placeId": "p-home",
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1790900074252,
+          "endedAt": 1790900819269,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1790900819269,
+          "endedAt": 1790901166277,
+          "latitude": 33.58171,
+          "longitude": 130.38965,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1790901166277,
+          "endedAt": 1790901582285,
+          "untrackedMs": 0,
+          "photoCount": 1
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1790901582285,
+          "endedAt": 1790905746045,
+          "latitude": 33.58378,
+          "longitude": 130.39253,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1790905746045,
+          "endedAt": 1790906316471,
+          "untrackedMs": 0,
+          "photoCount": 1
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1790906316471,
+          "endedAt": 1790906938393,
+          "latitude": 33.5808,
+          "longitude": 130.3881,
+          "placeId": "p-home",
+          "corrected": false,
+          "photoCount": 0
+        }
+      ],
+      "outliers": []
+    },
+    {
+      "name": "outlier-run",
+      "activities": [
+        {
+          "kind": "stay",
+          "startedAt": 1791847826650,
+          "endedAt": 1791850023071,
+          "latitude": 33.58089,
+          "longitude": 130.38821,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1791850023071,
+          "endedAt": 1791852681127,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1791852681127,
+          "endedAt": 1791854908082,
+          "latitude": 33.58083,
+          "longitude": 130.38811,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        }
+      ],
+      "outliers": [
+        {
+          "startedAt": 1791851398000,
+          "endedAt": 1791851406104,
+          "eventIds": [
+            "spike-1",
+            "spike-2",
+            "spike-3",
+            "20ae230f-cd2e-4a35-88b8-16adbc55ccf2"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "outlier-run-excluded",
+      "activities": [
+        {
+          "kind": "stay",
+          "startedAt": 1791847826650,
+          "endedAt": 1791850023071,
+          "latitude": 33.58089,
+          "longitude": 130.38821,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        },
+        {
+          "kind": "movement",
+          "startedAt": 1791850023071,
+          "endedAt": 1791852681127,
+          "untrackedMs": 0,
+          "photoCount": 0
+        },
+        {
+          "kind": "stay",
+          "startedAt": 1791852681127,
+          "endedAt": 1791854908082,
+          "latitude": 33.58083,
+          "longitude": 130.38811,
+          "placeId": null,
+          "corrected": false,
+          "photoCount": 0
+        }
+      ],
+      "outliers": []
+    }
+  ],
+  "allPlaces": [
+    {
+      "placeId": "p-home",
+      "latitude": 33.5808,
+      "longitude": 130.3881,
+      "visitCount": 10,
+      "dayCount": 5,
+      "totalDurationMs": 52997187
+    },
+    {
+      "placeId": null,
+      "latitude": 33.58378,
+      "longitude": 130.39253,
+      "visitCount": 1,
+      "dayCount": 1,
+      "totalDurationMs": 4163760
+    },
+    {
+      "placeId": null,
+      "latitude": 33.58186,
+      "longitude": 130.38655,
+      "visitCount": 1,
+      "dayCount": 1,
+      "totalDurationMs": 2447066
+    },
+    {
+      "placeId": null,
+      "latitude": 33.58542,
+      "longitude": 130.39067,
+      "visitCount": 1,
+      "dayCount": 1,
+      "totalDurationMs": 1956586
+    },
+    {
+      "placeId": null,
+      "latitude": 33.5905,
+      "longitude": 130.39982,
+      "visitCount": 1,
+      "dayCount": 1,
+      "totalDurationMs": 796669
+    },
+    {
+      "placeId": null,
+      "latitude": 33.603,
+      "longitude": 130.40158,
+      "visitCount": 1,
+      "dayCount": 1,
+      "totalDurationMs": 717890
+    },
+    {
+      "placeId": null,
+      "latitude": 33.58105,
+      "longitude": 130.39142,
+      "visitCount": 1,
+      "dayCount": 1,
+      "totalDurationMs": 365432
+    },
+    {
+      "placeId": null,
+      "latitude": 33.58171,
+      "longitude": 130.38965,
+      "visitCount": 1,
+      "dayCount": 1,
+      "totalDurationMs": 347008
+    },
+    {
+      "placeId": null,
+      "latitude": 33.58395,
+      "longitude": 130.38815,
+      "visitCount": 1,
+      "dayCount": 1,
+      "totalDurationMs": 248009
+    }
+  ]
+}
