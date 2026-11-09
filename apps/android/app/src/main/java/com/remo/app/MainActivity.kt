@@ -161,6 +161,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     var status by remember { mutableStateOf<String?>(null) }
     var confirmDelete by remember { mutableStateOf(false) }
     var showAccountDeletion by remember { mutableStateOf(false) }
+    var showApiTokens by remember { mutableStateOf(false) }
     var showExportDialog by remember { mutableStateOf(false) }
     var exportStartDate by remember { mutableStateOf(selectedDate) }
     var exportEndDate by remember { mutableStateOf(selectedDate) }
@@ -318,11 +319,13 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                     context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
                         ?: error("ファイルを開けませんでした")
                 }
-                val imported = withContext(Dispatchers.Default) { decodeTimelineImport(payload) }
-                store.importAll(imported)
-                imported.maxByOrNull(LogEntry::startedAt)?.let { selectedDate = dayKey(it.startedAt) }
+                val archive = withContext(Dispatchers.Default) { decodeTimelineArchive(payload) }
+                store.importAll(archive.entries)
+                store.importPlaces(archive.places)
+                store.importCorrections(archive.corrections)
+                archive.entries.maxByOrNull(LogEntry::startedAt)?.let { selectedDate = dayKey(it.startedAt) }
                 sync()
-                imported.size
+                archive.entries.size
             }.onSuccess { count -> status = "${count}件の記録を読み込みました" }
                 .onFailure { error -> status = error.message ?: "インポートに失敗しました" }
         }
@@ -417,6 +420,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
         start.timeInMillis until end.timeInMillis
     }
     // null while the selected day is still being prepared.
+    var corrections by remember { mutableStateOf<List<TimelineCorrection>>(emptyList()) }
     var timeline by remember(selectedDate) { mutableStateOf<TimelineRenderSnapshot?>(null) }
     LaunchedEffect(dayRange, lifecycleOwner, showSettings) {
         if (showSettings) return@LaunchedEffect
@@ -424,7 +428,15 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
             // Only the selected day is read into memory; it is read again whenever the stored records change.
             snapshotFlow { store.revision }.collectLatest {
                 val visible = store.entriesBetween(dayRange.first, dayRange.last + 1)
-                timeline = withContext(Dispatchers.Default) { prepareTimeline(visible) }
+                // Corrections and places change the timeline, so they are read
+                // with the records instead of from a state that may lag behind.
+                val dayCorrections = store.corrections()
+                val namedPlaces = store.places()
+                corrections = dayCorrections
+                NamedPlaces.places = namedPlaces
+                timeline = withContext(Dispatchers.Default) {
+                    prepareTimeline(visible, TimelineAdjustments(dayCorrections, namedPlaces))
+                }
             }
         }
     }
@@ -445,7 +457,6 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     val sleep = remember(sleepAround, dayRange) { sleepAround.filter { it.endedAt in dayRange } }
     val sleepMoments = remember(sleepAround, dayRange) { sleepMoments(sleepAround, dayRange) }
     val stayIndex = rememberStayIndex(context, store)
-    LaunchedEffect(store.revision) { NamedPlaces.places = store.places() }
     // Location samples around the photo being corrected: the suggestion reads the track near it.
     val nearbyLogs by produceState(emptyList<LogEntry>(), selectedLog?.id, selectedLog?.startedAt, store.revision) {
         val entry = selectedLog
@@ -459,8 +470,65 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
         }
     }
     val periodStays = remember(stayIndex.stays, placePeriod) { stayIndex.stays?.let { staysInPeriod(it, placePeriod) } }
-    val allPlaces by produceState<List<AllTimeStayPlace>?>(null, periodStays) {
-        value = periodStays?.let { stays -> withContext(Dispatchers.Default) { buildAllTimeStayPlaces(stays) } }
+    val allPlaces by produceState<List<AllTimeStayPlace>?>(null, periodStays, NamedPlaces.places) {
+        value = periodStays?.let { stays -> withContext(Dispatchers.Default) { buildAllTimeStayPlaces(stays, NamedPlaces.places) } }
+    }
+    fun addCorrection(kind: TimelineCorrectionKind, startedAt: Long, endedAt: Long) {
+        val start = minOf(startedAt, endedAt)
+        val end = maxOf(startedAt, endedAt).coerceAtMost(start + MAX_CORRECTION_SPAN_MS)
+        scope.launch {
+            store.putCorrection(TimelineCorrection(
+                id = java.util.UUID.randomUUID().toString(),
+                kind = kind,
+                startedAt = start,
+                endedAt = end,
+                createdAt = System.currentTimeMillis(),
+                source = CorrectionSource.APP,
+            ))
+            sync()
+        }
+    }
+    fun excludeOutliers(candidates: List<OutlierCandidate>) {
+        if (candidates.isEmpty()) return
+        scope.launch {
+            val createdAt = System.currentTimeMillis()
+            candidates.forEachIndexed { index, candidate ->
+                store.putCorrection(TimelineCorrection(
+                    id = java.util.UUID.randomUUID().toString(),
+                    kind = TimelineCorrectionKind.EXCLUDE,
+                    startedAt = candidate.startedAt,
+                    endedAt = candidate.endedAt,
+                    createdAt = createdAt + index,
+                    source = CorrectionSource.APP,
+                ))
+            }
+            sync()
+        }
+    }
+    fun undoCorrection(correction: TimelineCorrection) {
+        if (correction.deleted) return
+        scope.launch {
+            store.putCorrection(correction.copy(deleted = true))
+            sync()
+        }
+    }
+    fun savePlace(place: NamedPlace) {
+        scope.launch {
+            store.putPlace(place.copy(updatedAt = System.currentTimeMillis()))
+            sync(force = true)
+        }
+    }
+    fun mergePlace(target: NamedPlace, other: NamedPlace) {
+        if (target.id == other.id) return
+        scope.launch {
+            val now = System.currentTimeMillis()
+            store.putPlace(target.copy(
+                anchors = (target.anchors + placeAnchors(other)).take(MAX_PLACE_ANCHORS),
+                updatedAt = now,
+            ))
+            store.putPlace(other.copy(deleted = true, mergedInto = target.id, updatedAt = now))
+            sync(force = true)
+        }
     }
     fun updateLog(updated: LogEntry) {
         selectedLog = updated
@@ -496,6 +564,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                     onOpenAuth = onOpenAuth,
                     onSignOut = onSignOut,
                     onDeleteAccount = { showAccountDeletion = true },
+                    onApiTokens = { showApiTokens = true },
                 ),
             )
         } else {
@@ -520,10 +589,15 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                 sleepMoments = sleepMoments,
                 autoCapture = autoCapture,
                 focus = mapFocusTarget,
+                corrections = corrections,
                 onDateChange = { selectedDate = it; mapFocusTarget = null },
                 onFocus = { activity -> mapFocusTarget = if (mapFocusTarget?.activityId == activity.id) null else timelineMapFocus(activity) },
                 onSelectPhotos = { selectedPhotos = it },
                 onOpenHistory = { historyTarget = it },
+                onJoinStay = { startedAt, endedAt -> addCorrection(TimelineCorrectionKind.JOIN_STAY, startedAt, endedAt) },
+                onNotStay = { startedAt, endedAt -> addCorrection(TimelineCorrectionKind.NOT_STAY, startedAt, endedAt) },
+                onExcludeOutliers = ::excludeOutliers,
+                onUndoCorrection = ::undoCorrection,
                 onOpenSettings = { showSettings = true },
             )
         }
@@ -534,13 +608,14 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
 
     historyTarget?.let { target ->
         // Read from the stay index once it is ready, so the history matches the all-places map.
-        val history by produceState<StayVisitHistory?>(null, target, stayIndex.stays) {
+        val history by produceState<StayVisitHistory?>(null, target, stayIndex.stays, NamedPlaces.places) {
             // Until the index is ready the sheet shows that it is being prepared.
-            value = target.visits?.let(::historyOf)
-                ?: stayIndex.stays?.let { stayVisitHistoryFromStays(it, target.coordinate) }
+            value = stayIndex.stays?.let { stayVisitHistoryFromStays(it, target.coordinate, NamedPlaces.places) }
+                ?: target.visits?.let(::historyOf)
         }
         PlaceHistorySheet(
             history, target,
+            allPlaces = allPlaces,
             onDismiss = { historyTarget = null },
             onRename = { current, name ->
                 scope.launch {
@@ -550,10 +625,15 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                         latitude = current?.latitude ?: target.coordinate.latitude,
                         longitude = current?.longitude ?: target.coordinate.longitude,
                         deleted = name.isEmpty(),
+                        radiusMeters = current?.radiusMeters,
+                        anchors = current?.anchors.orEmpty(),
+                        mergedInto = current?.mergedInto,
                     ))
                     sync(force = true)
                 }
             },
+            onUpdatePlace = ::savePlace,
+            onMergePlaces = ::mergePlace,
         ) { day ->
             historyTarget = null
             selectedDate = day
@@ -567,9 +647,26 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     selectedLog?.let { entry ->
         DetailDialog(entry, nearbyLogs, { selectedLog = null }, ::updateLog) {
             selectedLog = null
-            scope.launch { store.delete(entry); sync() }
+            scope.launch {
+                store.delete(entry)
+                // The tombstone stops this scan from recreating the record;
+                // forgetting the archive stops a later scan from resurrecting it.
+                if (entry.source == EventSource.PHOTO) withContext(Dispatchers.IO) { PhotoIndexStore.get(context).deleteArchived(entry.id) }
+                sync()
+            }
             status = "記録を削除しました"
         }
+    }
+    if (showApiTokens && user != null) {
+        ApiTokenDialog(
+            onDismiss = { showApiTokens = false },
+            onSessionExpired = {
+                showApiTokens = false
+                syncStatus = "再ログインが必要です"
+                status = "ログインの有効期限が切れました。設定からもう一度ログインしてください"
+                onSessionExpired()
+            },
+        )
     }
     if (showAccountDeletion) {
         AccountDeletionDialog(
@@ -672,10 +769,15 @@ private fun TimelineHome(
     sleepMoments: List<SleepMoment>,
     autoCapture: Boolean,
     focus: TimelineMapFocus?,
+    corrections: List<TimelineCorrection>,
     onDateChange: (String) -> Unit,
     onFocus: (TimelineActivity) -> Unit,
     onSelectPhotos: (List<LogEntry>) -> Unit,
     onOpenHistory: (PlaceHistoryTarget) -> Unit,
+    onJoinStay: (startedAt: Long, endedAt: Long) -> Unit,
+    onNotStay: (startedAt: Long, endedAt: Long) -> Unit,
+    onExcludeOutliers: (List<OutlierCandidate>) -> Unit,
+    onUndoCorrection: (TimelineCorrection) -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     val density = LocalDensity.current
@@ -736,6 +838,7 @@ private fun TimelineHome(
                         sleep = sleep,
                         autoCapture = autoCapture,
                         selectedActivityId = focus?.activityId,
+                        corrections = corrections,
                         listState = listState,
                         bottomPadding = navigationBottom + 24.dp,
                         modifier = sheetModifier,
@@ -743,6 +846,10 @@ private fun TimelineHome(
                         onFocus = onFocus,
                         onSelectPhotos = onSelectPhotos,
                         onOpenHistory = onOpenHistory,
+                        onJoinStay = onJoinStay,
+                        onNotStay = onNotStay,
+                        onExcludeOutliers = onExcludeOutliers,
+                        onUndoCorrection = onUndoCorrection,
                     )
                 }
             },
@@ -874,6 +981,44 @@ internal suspend fun writeTimelineExport(
             writer.endObject()
         }
         day = shiftDay(day, 1)
+    }
+    writer.endArray()
+    writer.name("places").beginArray()
+    for (place in store.places().filterNot(NamedPlace::deleted)) {
+        writer.beginObject()
+            .name("id").value(place.id)
+            .name("name").value(place.name)
+            .name("latitude").value(place.latitude)
+            .name("longitude").value(place.longitude)
+            .name("updatedAt").value(place.updatedAt)
+        place.radiusMeters?.let { writer.name("radiusMeters").value(it) }
+        if (place.anchors.isNotEmpty()) {
+            writer.name("anchors").beginArray()
+            for (anchor in place.anchors) {
+                writer.beginObject()
+                    .name("latitude").value(anchor.latitude)
+                    .name("longitude").value(anchor.longitude)
+                    .name("radiusMeters").value(anchor.radiusMeters)
+                    .endObject()
+            }
+            writer.endArray()
+        }
+        writer.endObject()
+    }
+    writer.endArray()
+    val exportStart = parseDate(from).timeInMillis
+    val exportEnd = parseDate(shiftDay(to, 1)).timeInMillis
+    writer.name("corrections").beginArray()
+    for (correction in store.corrections().filterNot(TimelineCorrection::deleted)) {
+        if (correction.endedAt < exportStart || correction.startedAt >= exportEnd) continue
+        writer.beginObject()
+            .name("id").value(correction.id)
+            .name("kind").value(correction.kind.wireValue)
+            .name("startedAt").value(correction.startedAt)
+            .name("endedAt").value(correction.endedAt)
+            .name("createdAt").value(correction.createdAt)
+            .name("source").value(correction.source.wireValue)
+            .endObject()
     }
     writer.endArray()
     writer.name("summary").beginObject()

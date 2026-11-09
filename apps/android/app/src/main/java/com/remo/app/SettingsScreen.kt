@@ -27,6 +27,7 @@ import androidx.compose.material.icons.outlined.CloudUpload
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.FileOpen
 import androidx.compose.material.icons.outlined.IosShare
+import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.LocationOn
 import androidx.compose.material.icons.outlined.MyLocation
 import androidx.compose.material.icons.outlined.Person
@@ -90,6 +91,7 @@ internal class SettingsActions(
     val onOpenAuth: () -> Unit,
     val onSignOut: () -> Unit,
     val onDeleteAccount: () -> Unit,
+    val onApiTokens: () -> Unit,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -169,7 +171,7 @@ internal fun SettingsScreen(state: SettingsState, actions: SettingsActions) {
                         ActionRow(
                             Icons.Outlined.Bedtime,
                             "睡眠",
-                            subtitle = if (sleepAccess) "ヘルスコネクトの睡眠をタイムラインに表示しています" else "ヘルスコネクトの睡眠をタイムラインに表示します。バックアップはしません",
+                            subtitle = if (sleepAccess) "ヘルスコネクトの睡眠をタイムラインに表示し、ログイン中はバックアップしています" else "ヘルスコネクトの睡眠をタイムラインに表示します。許可するとログイン中はバックアップも行います",
                             trailing = { TrailingLabel(if (sleepAccess) "許可済み" else "許可する", emphasized = !sleepAccess) },
                             onClick = actions.onSleep,
                         )
@@ -188,6 +190,8 @@ internal fun SettingsScreen(state: SettingsState, actions: SettingsActions) {
                     )
                     GroupDivider()
                     ActionRow(Icons.Outlined.Person, state.user.email.ifBlank { "アカウント" }, subtitle = "ログイン中", onClick = null)
+                    GroupDivider()
+                    ActionRow(Icons.Outlined.Key, "AIツールとの接続（MCP）", subtitle = "バックアップした滞在や移動をAIツールから読み取れるようにします", trailing = { Chevron() }, onClick = actions.onApiTokens)
                     GroupDivider()
                     ActionRow(Icons.AutoMirrored.Outlined.Logout, "ログアウト", onClick = actions.onSignOut)
                 }
