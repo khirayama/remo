@@ -2,10 +2,13 @@ package com.remo.app
 
 import org.json.JSONArray
 import org.json.JSONObject
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.util.TimeZone
 
 /**
  * Runs the shared corrections fixture: every platform lays the same
@@ -15,6 +18,19 @@ import java.io.File
  * apps/web/src/corrections-golden.test.ts).
  */
 class CorrectionsFixtureTest {
+    // The samples were recorded in Japan Standard Time and days are counted in
+    // local time, so pin the zone like the web golden test does.
+    private var originalTimeZone: TimeZone? = null
+
+    @Before fun useJapanDays() {
+        originalTimeZone = TimeZone.getDefault()
+        TimeZone.setDefault(TimeZone.getTimeZone("Asia/Tokyo"))
+    }
+
+    @After fun restoreTimeZone() {
+        originalTimeZone?.let(TimeZone::setDefault)
+    }
+
     private fun fixture(name: String): File {
         var directory: File? = File("").absoluteFile
         while (directory != null) {
