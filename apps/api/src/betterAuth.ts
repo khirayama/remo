@@ -88,6 +88,7 @@ function createBetterAuth(env: Env) {
             env.DB.prepare("DELETE FROM life_event WHERE user_id = ?1").bind(user.id),
             env.DB.prepare("DELETE FROM location_chunk WHERE user_id = ?1").bind(user.id),
             env.DB.prepare("DELETE FROM place WHERE user_id = ?1").bind(user.id),
+            env.DB.prepare("DELETE FROM timeline_correction WHERE user_id = ?1").bind(user.id),
             env.DB.prepare("DELETE FROM user_sync_state WHERE user_id = ?1").bind(user.id),
           ]);
         },

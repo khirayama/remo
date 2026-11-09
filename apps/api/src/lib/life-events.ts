@@ -45,7 +45,7 @@ const ID_LOOKUP_SIZE = 90;
 // Server timestamps are taken inside SQLite rather than from the Worker clock.
 // D1 executes writes serially on one primary, so the sync cursor order follows
 // commit order instead of the order in which Workers happened to read clocks.
-const DB_NOW_MS = "CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER)";
+export const DB_NOW_MS = "CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER)";
 
 // Every row written takes its updated_at from the user's sync sequence
 // (user_sync_state.seq), inside the transaction that writes it. A request
@@ -55,7 +55,7 @@ const DB_NOW_MS = "CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTE
 // never misses a committed write, even when two transactions share a
 // millisecond or the clock steps backwards. ?1 is the user id in every
 // statement that uses it.
-const seqAt = (offsetParameter: string) =>
+export const seqAt = (offsetParameter: string) =>
   `((SELECT seq FROM user_sync_state WHERE user_id = ?1) - ${offsetParameter})`;
 
 // A tombstone only needs its key and timestamps for last-writer-wins; the
@@ -69,7 +69,7 @@ export const TOMBSTONE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 const PURGE_BATCH_SIZE = 1_000;
 const PURGE_MAX_BATCHES = 50;
 
-const EVENT_COLUMNS = `id, started_at, latitude, longitude, original_latitude, original_longitude,
+export const EVENT_COLUMNS = `id, started_at, latitude, longitude, original_latitude, original_longitude,
   location_source, photo_location_auto_placement_disabled, accuracy_meters, media_type,
   photo_count, source, updated_at, client_updated_at`;
 
@@ -196,7 +196,7 @@ export function normalizeEvent(input: EventInput, now = Date.now()): { data?: Ti
 }
 
 
-function mapEvent(row: Record<string, unknown>): TimelineEvent {
+export function mapEvent(row: Record<string, unknown>): TimelineEvent {
   const latitude = coordinate(row.latitude, -90, 90);
   const longitude = coordinate(row.longitude, -180, 180);
   const originalLatitude = coordinate(row.original_latitude, -90, 90);
@@ -239,7 +239,7 @@ export function chunkBucket(startedAt: number): number {
   return Math.floor(startedAt / CHUNK_MS);
 }
 
-function parseChunk(payload: unknown): Sample[] {
+export function parseChunk(payload: unknown): Sample[] {
   try {
     const value: unknown = JSON.parse(String(payload));
     return Array.isArray(value)
@@ -255,7 +255,7 @@ function encodeSample(sample: Sample, fresh: boolean): string {
   return `${fields.slice(0, -1)},${fresh ? SEQ_TOKEN : Math.round(finiteNumber(sample[6]) ?? 0)}]`;
 }
 
-function sampleEvent(sample: Sample): TimelineEvent {
+export function sampleEvent(sample: Sample): TimelineEvent {
   const latitude = coordinate(sample[2], -90, 90);
   const longitude = coordinate(sample[3], -180, 180);
   const accuracyMeters = finiteNumber(sample[4]);
@@ -391,7 +391,7 @@ function groupsOf<T>(items: T[], size: number): T[][] {
 // ---- Statements ----------------------------------------------------------------
 
 // Advances the user's sequence by the rows this request may write.
-function advanceSequenceStatement(db: D1Database, userId: string, rows: number, newChunks: number) {
+export function advanceSequenceStatement(db: D1Database, userId: string, rows: number, newChunks: number) {
   return db.prepare(
     `INSERT INTO user_sync_state (user_id, seq, chunk_count)
      VALUES (?1, MAX(${DB_NOW_MS}, 1) + ?2 - 1, ?3)
@@ -954,6 +954,8 @@ lifeEventRoutes.delete("/data", async (c) => {
     db.prepare("DELETE FROM life_event WHERE user_id = ?1").bind(user.id),
     db.prepare("DELETE FROM location_chunk WHERE user_id = ?1").bind(user.id),
     db.prepare("DELETE FROM place WHERE user_id = ?1").bind(user.id),
+    db.prepare("DELETE FROM timeline_correction WHERE user_id = ?1").bind(user.id),
+    db.prepare("DELETE FROM sleep_session WHERE user_id = ?1").bind(user.id),
     db.prepare("UPDATE user_sync_state SET chunk_count = 0, preview_count = 0 WHERE user_id = ?1").bind(user.id),
   ]);
   return c.body(null, 204);

@@ -3,11 +3,15 @@ import { cors } from "hono/cors";
 import { getBetterAuth } from "./betterAuth";
 import type { Env } from "./env";
 import { accountRoutes } from "./lib/account";
+import { apiTokenRoutes } from "./lib/api-tokens";
 import { requireUser, type AppContext } from "./lib/auth";
+import { correctionRoutes } from "./lib/corrections";
 import { lifeEventRoutes } from "./lib/life-events";
 import { runMaintenance } from "./lib/maintenance";
+import { handleMcp } from "./lib/mcp";
 import { photoRoutes } from "./lib/photos";
 import { placeRoutes } from "./lib/places";
+import { sleepRoutes } from "./lib/sleep";
 
 export const app = new Hono<{ Bindings: Env }>();
 
@@ -60,7 +64,7 @@ const limitCredentialRequests: MiddlewareHandler<{ Bindings: Env }> = async (c, 
 // Native clients authenticate with a bearer token, which a browser never
 // attaches on its own, so they are not restricted by origin.
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
-const JSON_BODY_PATHS = new Set(["/api/v1/events/batch", "/api/v1/account/delete", "/api/v1/places"]);
+const JSON_BODY_PATHS = new Set(["/api/v1/events/batch", "/api/v1/account/delete", "/api/v1/places", "/api/v1/corrections", "/api/v1/api-tokens"]);
 export const guardCookieWrites: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
   if (SAFE_METHODS.has(c.req.method)) return next();
   if (JSON_BODY_PATHS.has(c.req.path) && c.req.header("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
@@ -115,7 +119,14 @@ authed.get("/me", (c) => c.json({ data: c.get("user") }));
 authed.route("/", lifeEventRoutes);
 authed.route("/", photoRoutes);
 authed.route("/", placeRoutes);
+authed.route("/", sleepRoutes);
+authed.route("/", correctionRoutes);
+authed.route("/", apiTokenRoutes);
 app.route("/api/v1", authed);
+
+// The external API (MCP). It authenticates with an API token, not a session
+// (see lib/mcp.ts), so it sits outside /api/v1 and its cookie guard.
+app.on(["GET", "POST", "DELETE"], "/api/mcp", handleMcp);
 
 app.notFound((c) => c.json({ error: { code: "not_found", message: "Resource not found" } }, 404));
 

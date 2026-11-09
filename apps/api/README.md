@@ -25,6 +25,8 @@ npm run dev
 - `POST /api/v1/events/batch`（`events` の作成・更新と `deletions` の削除を合計最大500件まで一括処理。`deletions` は `startedAt`・`source` を添えると保存先を検索せずに済む。不正な項目があっても他の項目は処理し、不正な項目は `data.rejected` で返すので、1件の不正データで端末の送信キューが止まらない。リクエスト全体の形式が不正な場合だけ400。同じ時間帯への同時書き込みに負け続けた場合は503を返し、クライアントは同じbatchを再送する）
 - `DELETE /api/v1/data`（認証ユーザーの全recordを物理削除）
 - `GET /api/v1/places` / `PUT /api/v1/places`（ユーザーが付けた場所名。新しい`updatedAt`が勝つ）
+- `GET /api/v1/sleep?from=<ms>&to=<ms>`（その区間に起床した睡眠を返す。`from`と`to`は両方指定するか両方省略する。並びは就寝時刻順）
+- `POST /api/v1/sleep/batch`（`sessions` を最大500件まで一括upsert。新しい`updatedAt`が勝つ。不正な項目は他の項目を止めず `data.rejected` で返す）
 - `GET /api/v1/photos/:eventId`（写真イベントのサムネイルID一覧。D1の `photo_preview` から読む）
 - `GET /api/v1/photos/:eventId/:digest`（認証済みユーザーのJPEGを取得）
 - `PUT /api/v1/photos/:eventId/:digest`（160 KB以下のJPEGを保存。digestはSHA-256）
@@ -65,6 +67,7 @@ R2には`remo-photo-previews-dev`と`remo-photo-previews`のプライベート�
 | 位置チャンク数（アカウントごと） | 40,000（約27年分） |
 | プレビュー | 1記録1,000枚、1アカウント100,000枚 |
 | 場所名 | 2,000件 |
+| 睡眠 | 20,000セッション |
 
 `REQUIRE_EMAIL_VERIFICATION=true` を設定すると、メールアドレスを確認するまでログインできなくなります（確認メールの送信に `RESEND_API_KEY` と `MAIL_FROM` が必要。`WEB_APP_URL` は確認後の戻り先）。有効にすると既存のアカウントも次回ログイン時に確認が必要になるため、既定はオフです。
 
