@@ -101,7 +101,7 @@ dependencies {
     implementation(libs.androidx.health.connect)
     testImplementation(libs.junit)
     // android.jar only has org.json stubs; the golden test parses the shared fixture.
-    testImplementation("org.json:json:20250517")
+    testImplementation("org.json:json:20260814")
     testImplementation("org.robolectric:robolectric:4.14.1")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
