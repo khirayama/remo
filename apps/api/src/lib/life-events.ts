@@ -35,6 +35,10 @@ export const CHUNK_MS = 6 * 60 * 60 * 1000;
 export const MAX_CHUNK_BYTES = 1_500_000;
 // About 27 years of windows.
 export const MAX_CHUNKS = 40_000;
+// Photo records are one row each. The preview storage cap is 100,000 images;
+// 20,000 records leaves room for a few previews per record without allowing an
+// open account to create an unbounded number of rows.
+export const MAX_PHOTO_EVENTS_PER_USER = 20_000;
 // A chunk is read, merged in the Worker and written back only if it is still
 // the version that was read. A concurrent write to the same window makes the
 // write a no-op and the merge is repeated.
@@ -500,6 +504,30 @@ function chunkWriteStatement(db: D1Database, userId: string, bucket: number, pay
     ).bind(userId, bucket, payload, count, offset, readVersion);
 }
 
+// Kept in the same batch as the chunk write and conditional on that write
+// having committed. An optimistic version conflict therefore cannot leave an
+// index entry for a chunk change that did not happen.
+function indexedSampleStatement(
+  db: D1Database,
+  userId: string,
+  eventId: string,
+  bucket: number,
+  offset: number,
+  remove: boolean,
+) {
+  const written = `EXISTS (SELECT 1 FROM location_chunk WHERE user_id = ?1 AND bucket = ?3 AND updated_at = ${seqAt("?4")})`;
+  return remove
+    ? db.prepare(
+      `DELETE FROM location_sample_index
+       WHERE user_id = ?1 AND event_id = ?2 AND bucket = ?3 AND ${written}`,
+    ).bind(userId, eventId, bucket, offset)
+    : db.prepare(
+      `INSERT INTO location_sample_index (user_id, event_id, bucket)
+       SELECT ?1, ?2, ?3 WHERE ${written}
+       ON CONFLICT(user_id, event_id, bucket) DO NOTHING`,
+    ).bind(userId, eventId, bucket, offset);
+}
+
 // Removes tombstones past the retention window in bounded batches. A device
 // that later uploads an older copy of a purged record simply backs it up
 // again, which matches the device-as-source-of-truth model. Returns the number
@@ -696,6 +724,7 @@ type ChunkPlan = {
   payload: string;
   count: number;
   changed: number;
+  indexed: string[];
   removed: EventDeletion[];
 };
 
@@ -744,7 +773,15 @@ function planChunk(
     if (!removed.length) return undefined;
     payload = encode();
   }
-  return { bucket, readVersion: row ? row.updated_at : null, payload, count: byId.size, changed, removed };
+  return {
+    bucket,
+    readVersion: row ? row.updated_at : null,
+    payload,
+    count: byId.size,
+    changed,
+    indexed: [...fresh],
+    removed,
+  };
 }
 
 function addTo<K, V>(map: Map<K, V[]>, key: K, value: V) {
@@ -786,12 +823,50 @@ lifeEventRoutes.post("/events/batch", async (c) => {
   }
 
   const db = c.env.DB;
-  const photoEvents = events.filter((event) => event.source === "photo");
+  let photoEvents = events.filter((event) => event.source === "photo");
   let accepted = events.length;
   const rejectEvent = (event: TimelineEvent, message: string) => {
     accepted -= 1;
     rejected.push({ kind: "event", index: eventIndexes.get(event) ?? -1, id: event.id, message });
   };
+  if (photoEvents.length) {
+    // Kept by triggers on life_event (migration 0023), which also enforce the
+    // limit when two uploads race past this check.
+    const row = await db.prepare("SELECT photo_count FROM user_sync_state WHERE user_id = ?1")
+      .bind(user.id).first<{ photo_count: number }>();
+    let remaining = Math.max(0, MAX_PHOTO_EVENTS_PER_USER - (finiteNumber(row?.photo_count) ?? 0));
+    if (remaining < photoEvents.length) {
+      // Records that take no new capacity: already live photos, and uploads
+      // older than the stored row (the upsert leaves those unchanged).
+      const stored = new Map<string, { live: boolean; clientUpdatedAt: number }>();
+      for (const group of groupsOf(photoEvents, ID_LOOKUP_SIZE)) {
+        const { results } = await db.prepare(
+          `SELECT id, source = 'photo' AND deleted_at IS NULL AS live, client_updated_at FROM life_event
+           WHERE user_id = ?1 AND id IN (${group.map((_, index) => `?${index + 2}`).join(", ")})`,
+        ).bind(user.id, ...group.map((event) => event.id))
+          .all<{ id: string; live: number; client_updated_at: number }>();
+        results.forEach((current) => stored.set(current.id, {
+          live: current.live === 1,
+          clientUpdatedAt: finiteNumber(current.client_updated_at) ?? 0,
+        }));
+      }
+      const takesNoCapacity = (event: TimelineEvent) => {
+        const current = stored.get(event.id);
+        return current !== undefined && (current.live || event.updatedAt < current.clientUpdatedAt);
+      };
+      const withinQuota: TimelineEvent[] = [];
+      const counted = new Set<string>();
+      for (const event of photoEvents) {
+        if (takesNoCapacity(event) || counted.has(event.id)) withinQuota.push(event);
+        else if (remaining > 0) {
+          counted.add(event.id);
+          withinQuota.push(event);
+          remaining -= 1;
+        } else rejectEvent(event, "the account has reached its photo record limit");
+      }
+      photoEvents = withinQuota;
+    }
+  }
 
   // Location samples and their removals, by time window.
   const pendingUpserts = new Map<number, TimelineEvent[]>();
@@ -823,13 +898,12 @@ lifeEventRoutes.post("/events/batch", async (c) => {
     }
     for (const group of groupsOf([...missing.values()], ID_LOOKUP_SIZE)) {
       const { results } = await db.prepare(
-        `SELECT bucket, payload FROM location_chunk WHERE user_id = ?1 AND (${group.map((_, index) => `instr(payload, ?${index + 2}) > 0`).join(" OR ")})`,
-      ).bind(user.id, ...group.map((deletion) => `[${JSON.stringify(deletion.id)},`)).all<ChunkRow>();
+        `SELECT event_id, bucket FROM location_sample_index
+         WHERE user_id = ?1 AND event_id IN (${group.map((_, index) => `?${index + 2}`).join(", ")})`,
+      ).bind(user.id, ...group.map((deletion) => deletion.id)).all<{ event_id: string; bucket: number }>();
       for (const row of results) {
-        for (const sample of parseChunk(row.payload)) {
-          const deletion = missing.get(sample[0]);
-          if (deletion) addTo(pendingRemovals, row.bucket, deletion);
-        }
+        const deletion = missing.get(row.event_id);
+        if (deletion) addTo(pendingRemovals, row.bucket, deletion);
       }
     }
   }
@@ -875,6 +949,7 @@ lifeEventRoutes.post("/events/batch", async (c) => {
 
     // Statements that take a sequence value, in the order they run.
     const sequenced: Array<(offset: number) => D1PreparedStatement> = [];
+    const planSequenceIndex = new Map<number, number>();
     const trailing: D1PreparedStatement[] = [];
     const photoCount = recordStatementsPending ? photoEvents.length : 0;
     const eventDeletionCount = recordStatementsPending ? eventDeletions.length : 0;
@@ -897,16 +972,37 @@ lifeEventRoutes.post("/events/batch", async (c) => {
       }
     }
     for (const plan of plans) {
+      planSequenceIndex.set(plan.bucket, sequenced.length);
       sequenced.push((offset) => chunkWriteStatement(db, user.id, plan.bucket, plan.payload, plan.count, plan.readVersion, offset));
       plan.removed.forEach((removal) => sequenced.push((offset) => sampleTombstoneStatement(db, user.id, removal, offset)));
     }
     if (!sequenced.length) break;
 
-    const results = await db.batch([
-      advanceSequenceStatement(db, user.id, sequenced.length, newChunks),
-      ...sequenced.map((build, index) => build(sequenced.length - 1 - index)),
-      ...trailing,
-    ]);
+    const indexStatements: D1PreparedStatement[] = [];
+    for (const plan of plans) {
+      const offset = sequenced.length - 1 - planSequenceIndex.get(plan.bucket)!;
+      for (const eventId of plan.indexed) {
+        indexStatements.push(indexedSampleStatement(db, user.id, eventId, plan.bucket, offset, false));
+      }
+      for (const removal of plan.removed) {
+        indexStatements.push(indexedSampleStatement(db, user.id, removal.id, plan.bucket, offset, true));
+      }
+    }
+
+    let results;
+    try {
+      results = await db.batch([
+        advanceSequenceStatement(db, user.id, sequenced.length, newChunks),
+        ...sequenced.map((build, index) => build(sequenced.length - 1 - index)),
+        ...indexStatements,
+        ...trailing,
+      ]);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("photo_event_limit")) {
+        return c.json({ error: { code: "photo_event_limit", message: "The account has reached its photo record limit" } }, 409);
+      }
+      throw error;
+    }
     const changedAt = (index: number) => (results[index + 1]?.meta.changes ?? 0) > 0;
     if (recordStatementsPending) {
       for (let index = 0; index < photoCount; index += 1) if (changedAt(index)) changed += 1;
@@ -952,11 +1048,12 @@ lifeEventRoutes.delete("/data", async (c) => {
     ).bind(user.id),
     db.prepare("DELETE FROM photo_preview WHERE user_id = ?1").bind(user.id),
     db.prepare("DELETE FROM life_event WHERE user_id = ?1").bind(user.id),
+    db.prepare("DELETE FROM location_sample_index WHERE user_id = ?1").bind(user.id),
     db.prepare("DELETE FROM location_chunk WHERE user_id = ?1").bind(user.id),
     db.prepare("DELETE FROM place WHERE user_id = ?1").bind(user.id),
     db.prepare("DELETE FROM timeline_correction WHERE user_id = ?1").bind(user.id),
     db.prepare("DELETE FROM sleep_session WHERE user_id = ?1").bind(user.id),
-    db.prepare("UPDATE user_sync_state SET chunk_count = 0, preview_count = 0 WHERE user_id = ?1").bind(user.id),
+    db.prepare("UPDATE user_sync_state SET chunk_count = 0, preview_count = 0, photo_count = 0 WHERE user_id = ?1").bind(user.id),
   ]);
   return c.body(null, 204);
 });

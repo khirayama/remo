@@ -3,7 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
 import type { AppContext } from "../src/lib/auth";
-import { lifeEventRoutes, MAX_BATCH_ITEMS, MAX_CHUNK_BYTES, MAX_CLIENT_CLOCK_SKEW_MS, TOMBSTONE_RETENTION_MS } from "../src/lib/life-events";
+import { lifeEventRoutes, MAX_BATCH_ITEMS, MAX_CHUNK_BYTES, MAX_CLIENT_CLOCK_SKEW_MS, MAX_PHOTO_EVENTS_PER_USER, TOMBSTONE_RETENTION_MS } from "../src/lib/life-events";
 import { placeRoutes } from "../src/lib/places";
 import { runMaintenance } from "../src/lib/maintenance";
 import { photoRoutes } from "../src/lib/photos";
@@ -83,6 +83,9 @@ describe("timeline sync against SQLite", () => {
     expect(result.body.data).toEqual({ accepted: 3, changed: 3, deleted: 0 });
 
     expect(database.prepare("SELECT sample_count FROM location_chunk ORDER BY bucket").all()).toEqual([{ sample_count: 2 }, { sample_count: 1 }]);
+    expect(database.prepare("SELECT event_id FROM location_sample_index ORDER BY event_id").all()).toEqual([
+      { event_id: "a" }, { event_id: "b" }, { event_id: "c" },
+    ]);
     expect(database.prepare("SELECT COUNT(*) AS count FROM life_event").get()).toEqual({ count: 0 });
     expect(database.prepare("SELECT chunk_count FROM user_sync_state").get()).toEqual({ chunk_count: 2 });
     expect((await user.sync()).ids.sort()).toEqual(["a", "b", "c"]);
@@ -160,7 +163,7 @@ describe("timeline sync against SQLite", () => {
     expect((await user.sync()).deletions.map((item) => item.id)).toEqual(["loc-old"]);
   });
 
-  it("finds a location sample to delete from the hints or by searching the chunks", async () => {
+  it("finds a location sample to delete from the hints or the sample index", async () => {
     const statements: string[] = [];
     const { as } = setup((sql) => statements.push(sql));
     const user = as("user-1");
@@ -170,7 +173,10 @@ describe("timeline sync against SQLite", () => {
     expect((await user.batch({ deletions: [{ id: "hinted", deletedAt: 20, startedAt: T0, source: "location" }] })).body.data.deleted).toBe(1);
     expect(statements.some((sql) => sql.includes("instr("))).toBe(false);
 
+    statements.length = 0;
     expect((await user.batch({ deletions: [{ id: "searched", deletedAt: 20 }] })).body.data.deleted).toBe(1);
+    expect(statements.some((sql) => sql.includes("location_sample_index"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("instr("))).toBe(false);
     expect((await user.sync()).ids).toEqual([]);
     // A photo hint never searches the chunks.
     statements.length = 0;
@@ -310,6 +316,29 @@ describe("timeline sync against SQLite", () => {
     expect((await user.get("/events")).body.data).toMatchObject([{ id: "p", latitude: 35.6, photoCount: 2, mediaType: "photo" }]);
   });
 
+  it("turns away new photo records past the account limit, but not updates or stale uploads", async () => {
+    const { as, database } = setup();
+    const user = as("user-1");
+    await user.batch({ events: [photo("live", 10), photo("gone", 10)] });
+    await user.batch({ deletions: [{ id: "gone", deletedAt: 20 }] });
+    expect(database.prepare("SELECT photo_count FROM user_sync_state WHERE user_id = 'user-1'").get()).toEqual({ photo_count: 1 });
+    // Pretend the account is one record short of the limit.
+    database.exec(`UPDATE user_sync_state SET photo_count = ${MAX_PHOTO_EVENTS_PER_USER - 1} WHERE user_id = 'user-1'`);
+
+    const response = await user.batch({
+      events: [photo("live", 30), photo("gone", 15), photo("new-1", 10), photo("new-1", 11), photo("new-2", 10), event("sample", 10)],
+    });
+    expect(response.status).toBe(200);
+    expect(response.body.data.rejected).toEqual([
+      { kind: "event", index: 4, id: "new-2", message: "the account has reached its photo record limit" },
+    ]);
+    expect(database.prepare("SELECT id FROM life_event WHERE user_id = 'user-1' AND deleted_at IS NULL ORDER BY id").all())
+      .toEqual([{ id: "live" }, { id: "new-1" }]);
+    expect(database.prepare("SELECT photo_count FROM user_sync_state WHERE user_id = 'user-1'").get())
+      .toEqual({ photo_count: MAX_PHOTO_EVENTS_PER_USER });
+    expect((await user.sync()).ids.sort()).toEqual(["live", "new-1", "sample"]);
+  });
+
   it("removes every row on delete-all without telling other devices to delete theirs", async () => {
     const { as, database } = setup();
     const user = as("user-1");
@@ -325,6 +354,7 @@ describe("timeline sync against SQLite", () => {
       expect(database.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE user_id = 'user-1'`).get()).toEqual({ count: 0 });
     }
     expect(database.prepare("SELECT prefix FROM photo_cleanup").all()).toEqual([{ prefix: "user-1/p/" }]);
+    expect(database.prepare("SELECT photo_count FROM user_sync_state WHERE user_id = 'user-1'").get()).toEqual({ photo_count: 0 });
     // The other device keeps its copy: nothing is announced as deleted.
     const changed = await user.sync(cursor);
     expect(changed).toMatchObject({ ids: [], deletedIds: [], deletions: [] });
@@ -335,7 +365,7 @@ describe("timeline sync against SQLite", () => {
     expect((await as("user-2").sync()).ids).toEqual(["other"]);
   });
 
-  it("purges tombstones, sessions and verifications past their retention", async () => {
+  it("purges tombstones, sessions, verifications and tokens past their retention", async () => {
     const { as, database, env } = setup();
     const user = as("user-1");
     await user.batch({ events: [photo("old", 10), photo("recent", 10), photo("active", 10)] });
@@ -346,10 +376,14 @@ describe("timeline sync against SQLite", () => {
       VALUES ('expired', ${now - 1}, 't1', 0, 0, 'user-1'), ('valid', ${now + 60_000}, 't2', 0, 0, 'user-1')`);
     database.exec(`INSERT INTO verification (id, identifier, value, expires_at, created_at, updated_at)
       VALUES ('expired', 'reset', 'v', ${now - 1}, 0, 0)`);
+    database.exec(`INSERT INTO api_token (token_hash, id, user_id, name, created_at, expires_at)
+      VALUES ('hash-expired', 'expired', 'user-1', '', 0, ${now - 1}),
+             ('hash-valid', 'valid', 'user-1', '', 0, ${now + 60_000})`);
 
-    expect(await runMaintenance(env.DB, now)).toEqual({ tombstones: 1, corrections: 0, sessions: 1, verifications: 1 });
+    expect(await runMaintenance(env.DB, now)).toEqual({ tombstones: 1, corrections: 0, sessions: 1, verifications: 1, apiTokens: 1 });
     expect(database.prepare("SELECT id FROM life_event ORDER BY id").all()).toEqual([{ id: "active" }, { id: "recent" }]);
     expect(database.prepare("SELECT id FROM session").all()).toEqual([{ id: "valid" }]);
+    expect(database.prepare("SELECT id FROM api_token").all()).toEqual([{ id: "valid" }]);
   });
 
   it("reads through indexes", () => {
@@ -368,7 +402,8 @@ describe("timeline sync against SQLite", () => {
     database.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5001)
       INSERT INTO life_event (user_id, id, started_at, source, updated_at, client_updated_at)
       SELECT 'user-1', printf('e%05d', i), i, 'photo', i, i FROM n`);
-    database.exec("INSERT INTO user_sync_state (user_id, seq) VALUES ('user-1', 5001)");
+    // The photo-count trigger has already created the row.
+    database.exec("INSERT INTO user_sync_state (user_id, seq) VALUES ('user-1', 5001) ON CONFLICT(user_id) DO UPDATE SET seq = excluded.seq");
     // 30 windows of one sample each: more than one page of chunks.
     await user.batch({ events: Array.from({ length: 30 }, (_, index) => event(`s${index}`, 10, { startedAt: T0 + index * 6 * HOUR })) });
     const snapshot = (await user.get("/events/head")).body.data.cursor as string;
