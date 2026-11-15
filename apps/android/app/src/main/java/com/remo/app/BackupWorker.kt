@@ -316,7 +316,13 @@ object BackupCoordinator {
 
     suspend fun deleteAll(context: Context) = mutex.withLock {
         // Without an account there is no cloud backup: only this device is cleared.
-        val token = SecureTokenStore.get()
+        // A token that exists but cannot be read right now must not be taken
+        // for "no account": that would clear this device and leave the cloud copy.
+        val token = when (val stored = SecureTokenStore.read()) {
+            is TokenResult.Available -> stored.token
+            TokenResult.Missing -> null
+            TokenResult.Unavailable -> throw TokenUnavailableException()
+        }
         if (token != null && !belongsToOtherAccount(context)) {
             ApiClient.deleteAllData()
             preferences(context).edit { remove(cursorKey(token)); remove(fullPageKey(token)); remove(correctionCursorKey(token)); remove(sleepCursorKey(token)) }

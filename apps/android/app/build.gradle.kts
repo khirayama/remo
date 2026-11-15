@@ -22,13 +22,25 @@ val mapsApiKey = providers.gradleProperty("mapsApiKey")
 
 // Release signing comes from gradle properties, environment variables or
 // local.properties (releaseStoreFile, releaseStorePassword, releaseKeyAlias,
-// releaseKeyPassword). Without them, release builds fall back to the debug key
-// so they stay installable for local verification only.
+// releaseKeyPassword). Without them, release builds fail fast. Pass
+// -PallowDebugSigning=true to explicitly sign with the debug key for local
+// verification only (never for distribution).
 fun signingValue(name: String): String? = providers.gradleProperty(name)
     .orElse(providers.environmentVariable("REMO_" + name.replace(Regex("([A-Z])"), "_$1").uppercase()))
     .orElse(providers.provider { localProperties.getProperty(name) ?: "" })
     .get().takeIf(String::isNotBlank)
 val releaseStoreFile = signingValue("releaseStoreFile")
+val allowDebugSigning = providers.gradleProperty("allowDebugSigning").orNull == "true"
+val releaseSigningFields = listOf("releaseStoreFile", "releaseStorePassword", "releaseKeyAlias", "releaseKeyPassword")
+val missingReleaseSigningFields = releaseSigningFields.filter { signingValue(it) == null }
+// Android Studio's Generate Signed Bundle passes these properties to Gradle.
+val hasInjectedReleaseSigning = listOf(
+    "android.injected.signing.store.file",
+    "android.injected.signing.store.password",
+    "android.injected.signing.key.alias",
+    "android.injected.signing.key.password",
+).all { providers.gradleProperty(it).isPresent }
+val releaseSigningConfigured = hasInjectedReleaseSigning || missingReleaseSigningFields.isEmpty()
 
 fun buildConfigString(value: String): String =
     "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
@@ -60,15 +72,33 @@ android {
         }
     }
 
+    // Fail fast (only when a release build is requested) instead of silently
+    // producing a debug-signed release.
+    if (!releaseSigningConfigured && !allowDebugSigning) {
+        gradle.taskGraph.whenReady {
+            if (allTasks.any { it.project == project && it.name.contains("Release", ignoreCase = true) && (it.name.startsWith("assemble") || it.name.startsWith("bundle") || it.name.startsWith("package") || it.name.startsWith("sign")) }) {
+                throw GradleException(
+                    "Release signing is not configured (missing: ${missingReleaseSigningFields.joinToString()}). Set releaseStoreFile, releaseStorePassword, releaseKeyAlias and " +
+                        "releaseKeyPassword (gradle property, REMO_* environment variable or local.properties), or pass " +
+                        "-PallowDebugSigning=true for local-only verification builds.",
+                )
+            }
+        }
+    }
+
     buildTypes {
         debug { buildConfigField("String", "API_BASE_URL", buildConfigString(debugApiBaseUrl)) }
         release {
             buildConfigField("String", "API_BASE_URL", buildConfigString(releaseApiBaseUrl))
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = if (releaseStoreFile != null) signingConfigs.getByName("release") else {
-                logger.warn("Release signing is not configured; signing the release build with the debug key (not for distribution).")
-                signingConfigs.getByName("debug")
+            signingConfig = when {
+                releaseStoreFile != null -> signingConfigs.getByName("release")
+                allowDebugSigning -> {
+                    logger.warn("allowDebugSigning=true: signing the release build with the debug key (not for distribution).")
+                    signingConfigs.getByName("debug")
+                }
+                else -> null
             }
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }

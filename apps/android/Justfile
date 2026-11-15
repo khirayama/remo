@@ -9,8 +9,15 @@ test:
 build:
     ./gradlew assembleDebug
 
+# Distribution build: fails fast unless real signing config is provided
+# (releaseStoreFile etc. via gradle property, REMO_* env or local.properties).
 build-release api_base_url='https://remo-api.just-do-it-my-life.workers.dev':
     ./gradlew assembleRelease -PapiBaseUrl="{{ api_base_url }}"
+    test -f app/build/outputs/apk/release/app-release.apk
+
+# Local-only verification build signed with the debug key (NOT for distribution).
+build-release-local api_base_url='https://remo-api.just-do-it-my-life.workers.dev':
+    ./gradlew assembleRelease -PapiBaseUrl="{{ api_base_url }}" -PallowDebugSigning=true
     test -f app/build/outputs/apk/release/app-release.apk
 
 run:

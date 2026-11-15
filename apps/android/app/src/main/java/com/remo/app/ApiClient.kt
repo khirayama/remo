@@ -1,6 +1,7 @@
 package com.remo.app
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -10,7 +11,10 @@ import java.net.URLEncoder
 
 data class RemoUser(val id: String, val email: String, val name: String)
 
-data class ApiToken(val id: String, val name: String, val createdAt: Long, val scope: String = "read") {
+/** The session token exists but the Keystore is temporarily unreadable; do not treat this as a 401. */
+class TokenUnavailableException : Exception("端末の保存領域を一時的に読み取れません。もう一度お試しください")
+
+data class ApiToken(val id: String, val name: String, val createdAt: Long, val expiresAt: Long? = null, val scope: String = "read") {
     val canWrite: Boolean get() = scope == "write"
 }
 
@@ -76,8 +80,8 @@ object ApiClient {
             )
     }
 
-    suspend fun currentUser(): RemoUser = withContext(Dispatchers.IO) {
-        val response = request("GET", "/api/v1/me", token = SecureTokenStore.get())
+    suspend fun currentUser(token: String? = null): RemoUser = withContext(Dispatchers.IO) {
+        val response = request("GET", "/api/v1/me", token = token ?: requireToken())
         requireSuccess(response)
         val user = JSONObject(response.body).getJSONObject("data")
         RemoUser(user.getString("id"), user.getString("email"), user.getString("name"))
@@ -85,7 +89,18 @@ object ApiClient {
 
     suspend fun signOut() {
         withContext(Dispatchers.IO) {
-            runCatching { request("POST", "/api/auth/sign-out", "{}", SecureTokenStore.get()) }
+            // The local sign-out goes ahead regardless. A transient Keystore
+            // failure would leave the server session alive, so retry the read
+            // briefly before giving up on revoking it.
+            var stored = SecureTokenStore.read()
+            repeat(2) {
+                if (stored == TokenResult.Unavailable) {
+                    delay(300)
+                    stored = SecureTokenStore.read()
+                }
+            }
+            val token = (stored as? TokenResult.Available)?.token ?: return@withContext
+            runCatching { request("POST", "/api/auth/sign-out", "{}", token) }
         }
     }
 
@@ -299,13 +314,13 @@ object ApiClient {
     }
 
     suspend fun deleteAllData() = withContext(Dispatchers.IO) {
-        requireSuccess(request("DELETE", "/api/v1/data", token = SecureTokenStore.get()))
+        requireSuccess(request("DELETE", "/api/v1/data", token = requireToken()))
     }
 
     /** Deletes the account and its cloud backup. The server always requires the current password. */
     suspend fun deleteAccount(password: String) = withContext(Dispatchers.IO) {
         val body = JSONObject().put("password", password).toString()
-        val response = request("POST", "/api/v1/account/delete", body, SecureTokenStore.get())
+        val response = request("POST", "/api/v1/account/delete", body, requireToken())
         if (response.statusCode !in 200..299) {
             val code = runCatching { JSONObject(response.body).optJSONObject("error")?.optString("code") }.getOrNull()
             val message = when {
@@ -319,27 +334,34 @@ object ApiClient {
 
     /** Tokens for the external API (MCP). The plain token is only returned when it is issued. */
     suspend fun listApiTokens(): List<ApiToken> = withContext(Dispatchers.IO) {
-        val response = request("GET", "/api/v1/api-tokens", token = SecureTokenStore.get())
+        val response = request("GET", "/api/v1/api-tokens", token = requireToken())
         requireSuccess(response)
         val values = JSONObject(response.body).optJSONArray("data") ?: JSONArray()
         List(values.length()) { decodeApiToken(values.getJSONObject(it)) }
     }
 
     suspend fun createApiToken(name: String): CreatedApiToken = withContext(Dispatchers.IO) {
-        val response = request("POST", "/api/v1/api-tokens", JSONObject().put("name", name).toString(), SecureTokenStore.get())
+        val response = request("POST", "/api/v1/api-tokens", JSONObject().put("name", name).toString(), requireToken())
         requireSuccess(response)
         val data = JSONObject(response.body).getJSONObject("data")
         CreatedApiToken(decodeApiToken(data), data.getString("token"))
     }
 
     suspend fun deleteApiToken(id: String) = withContext(Dispatchers.IO) {
-        requireSuccess(request("DELETE", "/api/v1/api-tokens/${URLEncoder.encode(id, Charsets.UTF_8.name())}", token = SecureTokenStore.get()))
+        requireSuccess(request("DELETE", "/api/v1/api-tokens/${URLEncoder.encode(id, Charsets.UTF_8.name())}", token = requireToken()))
+    }
+
+    private fun requireToken(): String = when (val stored = SecureTokenStore.read()) {
+        is TokenResult.Available -> stored.token
+        TokenResult.Missing -> throw ApiException(401, "ログインが必要です", "missing_token")
+        TokenResult.Unavailable -> throw TokenUnavailableException()
     }
 
     private fun decodeApiToken(value: JSONObject) = ApiToken(
         value.getString("id"),
         value.optString("name"),
         value.optLong("createdAt"),
+        value.optLong("expiresAt").takeIf { value.has("expiresAt") && !value.isNull("expiresAt") },
         value.optString("scope", "read").ifBlank { "read" },
     )
 

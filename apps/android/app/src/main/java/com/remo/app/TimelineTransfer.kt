@@ -8,6 +8,7 @@ import java.util.TimeZone
 import kotlin.math.abs
 
 private const val TIMELINE_SCHEMA_VERSION = 1
+internal const val MAX_IMPORT_EVENTS = 200_000
 
 /** Everything a Remo JSON document carries. */
 data class TimelineArchive(
@@ -28,6 +29,7 @@ fun decodeTimelineArchive(payload: String, importedAt: Long = System.currentTime
     }
     val events = document.optJSONArray("events")
         ?: throw IllegalArgumentException("RemoのJSONファイルではありません")
+    validateImportEventCount(events.length())
     val imported = buildList {
         for (index in 0 until events.length()) {
             decodeTimelineEvent(events.optJSONObject(index), importedAt)?.let(::add)
@@ -48,6 +50,10 @@ fun decodeTimelineArchive(payload: String, importedAt: Long = System.currentTime
 /** Decode the records of a Remo timeline export from any client. Invalid records are skipped. */
 fun decodeTimelineImport(payload: String, importedAt: Long = System.currentTimeMillis()): List<LogEntry> =
     decodeTimelineArchive(payload, importedAt).entries
+
+internal fun validateImportEventCount(count: Int) {
+    if (count > MAX_IMPORT_EVENTS) throw IllegalArgumentException("JSON内の記録が多すぎます（上限${MAX_IMPORT_EVENTS}件）")
+}
 
 private fun decodeTimelineEvent(value: JSONObject?, importedAt: Long): LogEntry? {
     if (value == null) return null

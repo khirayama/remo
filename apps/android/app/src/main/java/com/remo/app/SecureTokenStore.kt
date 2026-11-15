@@ -4,11 +4,23 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.core.content.edit
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import java.security.KeyStore
+import java.security.UnrecoverableKeyException
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+
+/** Outcome of reading the stored session token. */
+sealed interface TokenResult {
+    data class Available(val token: String) : TokenResult
+    /** No token is stored (never signed in, or permanently unreadable data was cleared). */
+    data object Missing : TokenResult
+    /** The token exists but cannot be read right now (transient Keystore/crypto failure); it is kept. */
+    data object Unavailable : TokenResult
+}
 
 object SecureTokenStore {
     private const val preferences = "rem_auth"
@@ -35,18 +47,52 @@ object SecureTokenStore {
         }.generateKey()
     }
 
-    fun get(): String? {
-        val encoded = RemoApplication.context.getSharedPreferences(preferences, 0).getString(tokenKey, null) ?: return null
+    /**
+     * Reads the token. Only permanent damage (undecodable/truncated data, an
+     * authentication-tag mismatch, or a permanently invalidated/missing key)
+     * clears the stored token; any other failure is reported as [TokenResult.Unavailable]
+     * and leaves the token in place.
+     */
+    fun read(): TokenResult {
+        val encoded = RemoApplication.context.getSharedPreferences(preferences, 0).getString(tokenKey, null)
+            ?: return TokenResult.Missing
         return try {
             val bytes = Base64.decode(encoded, Base64.NO_WRAP)
-            Cipher.getInstance("AES/GCM/NoPadding").run {
-                init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
-                String(doFinal(bytes.copyOfRange(12, bytes.size)), Charsets.UTF_8)
+            if (bytes.size <= 12) throw PermanentTokenFailure()
+            val key = existingKey() ?: throw PermanentTokenFailure()
+            TokenResult.Available(
+                Cipher.getInstance("AES/GCM/NoPadding").run {
+                    init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
+                    String(doFinal(bytes.copyOfRange(12, bytes.size)), Charsets.UTF_8)
+                },
+            )
+        } catch (error: Exception) {
+            if (isPermanent(error)) {
+                clear()
+                TokenResult.Missing
+            } else {
+                TokenResult.Unavailable
             }
-        } catch (_: Exception) {
-            clear()
-            null
         }
+    }
+
+    /** The token, or null when absent or temporarily unreadable (see [read]). */
+    fun get(): String? = (read() as? TokenResult.Available)?.token
+
+    private class PermanentTokenFailure : Exception()
+
+    private fun existingKey(): SecretKey? {
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        return keyStore.getKey(keyAlias, null) as? SecretKey
+    }
+
+    private fun isPermanent(error: Throwable): Boolean = generateSequence(error) { it.cause }.any {
+        it is PermanentTokenFailure ||
+            it is IllegalArgumentException || // malformed Base64 or invalid cipher parameters
+            it is IndexOutOfBoundsException ||
+            it is AEADBadTagException ||
+            it is KeyPermanentlyInvalidatedException ||
+            it is UnrecoverableKeyException
     }
 
     fun set(value: String) {

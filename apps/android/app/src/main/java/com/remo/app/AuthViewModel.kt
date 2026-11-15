@@ -26,19 +26,28 @@ class AuthViewModel : ViewModel() {
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
-            val user = if (SecureTokenStore.get() == null) null else try {
-                ApiClient.currentUser()
-            } catch (error: Exception) {
-                // Only the server rejecting the session signs the user out. Starting
-                // offline (or during an outage) keeps the session and its backup.
-                if (isSessionRejected(error)) null else SecureTokenStore.cachedAccount()
+            val stored = SecureTokenStore.read()
+            var clearStoredSession = stored == TokenResult.Missing
+            val user = when (stored) {
+                TokenResult.Missing -> null
+                // A transient Keystore failure must not delete a valid token or sign the user out.
+                TokenResult.Unavailable -> SecureTokenStore.cachedAccount()
+                is TokenResult.Available -> try {
+                    ApiClient.currentUser(stored.token)
+                } catch (error: Exception) {
+                    // Only the server rejecting the session signs the user out. Starting
+                    // offline (or during an outage) keeps the session and its backup.
+                    if (isSessionRejected(error)) {
+                        clearStoredSession = true
+                        null
+                    } else SecureTokenStore.cachedAccount()
+                }
             }
-            if (user == null) {
+            if (clearStoredSession) {
                 SecureTokenStore.clear()
                 SecureTokenStore.clearAccountId()
-            } else {
-                SecureTokenStore.setAccount(user)
             }
+            if (user != null) SecureTokenStore.setAccount(user)
             mutableState.update { it.copy(initialized = true, signedIn = user != null, user = user) }
         }
     }
@@ -68,7 +77,7 @@ class AuthViewModel : ViewModel() {
             runCatching {
                 val token = ApiClient.authenticate(current.email.trim(), current.password, current.signUp)
                 withContext(Dispatchers.IO) { SecureTokenStore.set(token) }
-                ApiClient.currentUser().also(SecureTokenStore::setAccount)
+                ApiClient.currentUser(token).also(SecureTokenStore::setAccount)
             }.onSuccess { user ->
                 mutableState.update { it.copy(isSubmitting = false, signedIn = true, user = user, password = "") }
             }.onFailure { error ->

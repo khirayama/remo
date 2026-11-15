@@ -316,7 +316,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
             status = "JSONを読み込み中…"
             runCatching {
                 val payload = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                    context.contentResolver.openInputStream(uri)?.use { readBoundedUtf8(it, MAX_IMPORT_BYTES) }
                         ?: error("ファイルを開けませんでした")
                 }
                 val archive = withContext(Dispatchers.Default) { decodeTimelineArchive(payload) }
@@ -693,7 +693,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                 scope.launch {
                     runCatching { BackupCoordinator.deleteAll(context) }
                         .onSuccess { autoCapture = false; status = "すべての記録を削除し、位置情報の記録を停止しました" }
-                        .onFailure { status = "クラウドに接続できないため削除できませんでした" }
+                        .onFailure { error -> status = if (error is TokenUnavailableException) error.message.orEmpty() else "クラウドに接続できないため削除できませんでした" }
                 }
             },
             confirmLabel = "すべて削除",
@@ -1095,3 +1095,21 @@ private fun LocationIntroDialog(onStart: () -> Unit, onLater: () -> Unit) {
 private fun isoTimestamp(value: Long): String = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
     timeZone = TimeZone.getTimeZone("UTC")
 }.format(Date(value))
+
+/** Largest JSON import accepted (25 MiB); larger files are rejected instead of exhausting memory. */
+internal const val MAX_IMPORT_BYTES = 25 * 1024 * 1024
+
+/** Reads at most [limit] bytes as UTF-8 and fails with a clear message when the stream is larger. */
+internal fun readBoundedUtf8(input: java.io.InputStream, limit: Int): String {
+    val out = java.io.ByteArrayOutputStream()
+    val buffer = ByteArray(8192)
+    var total = 0
+    while (true) {
+        val n = input.read(buffer)
+        if (n < 0) break
+        total += n
+        if (total > limit) error("ファイルが大きすぎます（上限 ${limit / (1024 * 1024)} MiB）")
+        out.write(buffer, 0, n)
+    }
+    return out.toString(Charsets.UTF_8.name())
+}

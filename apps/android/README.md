@@ -29,6 +29,14 @@ Jetpack Compose製のタイムラインアプリです。認証トークンはAn
 - 写真バックアップは、写真ライブラリと写真記録が前回の完了時から変わっていなければライブラリを走査しません。ライブラリから消えた写真のプレビューは、記録に残っているプレビューの一覧を送ってクラウドから削除します。
 - 写真は更新日時・サイズ・権限・MediaStoreの世代に応じてEXIFキャッシュを無効化します。写真グループは完成した集計だけを保存し、内容が変わらなければDB更新しません。サムネイルと住所は上限付きでキャッシュします。写真グループのIDや既存の補正単位は維持します。
 
+## クラウドバックアップ
+
+`AndroidManifest.xml` は `allowBackup="true"` で、ローカルの `rem_logs.db`（精密な位置情報履歴を含むタイムライン）は意図的に Android のクラウドバックアップ／端末間移行の対象です。新しい端末で記録を復元するための仕様であり、変更していません。除外しているのはセッショントークン（`rem_auth.xml`）、同期状態、写真インデックス、診断ファイルのみです（`backup_rules.xml` / `data_extraction_rules.xml`）。
+
+## リリース署名
+
+`assembleRelease` は署名設定（`releaseStoreFile` など）が無いと失敗します。ローカル検証だけは `just build-release-local`（`-PallowDebugSigning=true`、デバッグ鍵で署名・配布不可）を使います。配布ビルドは `just build-release` で、実署名設定が必須です。
+
 ## 検証
 
 JDK 21 と Android SDK 36 を使用します。Gradle Wrapper は、現在の Android Gradle Plugin 8.13.2 と互換性がある[セキュリティ修正版 8.14.6](https://docs.gradle.org/8.14.6/release-notes.html)に固定し、配布 ZIP の SHA-256 も検証します。Gradle 9.6 以降は AGP 8.x が使用する内部 API が削除されているため、AGP の移行と合わせて更新してください。

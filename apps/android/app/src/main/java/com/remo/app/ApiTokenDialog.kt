@@ -158,7 +158,12 @@ internal fun ApiTokenDialog(onDismiss: () -> Unit, onSessionExpired: () -> Unit)
                                             )
                                         }
                                     }
-                                    Text("${formatDate(dayKey(token.createdAt))}に発行", style = MaterialTheme.typography.bodySmall, color = AppColors.inkTertiary)
+                                    Text(
+                                        "${formatDate(dayKey(token.createdAt))}に発行" +
+                                            (token.expiresAt?.let { " · ${formatDate(dayKey(it))}まで有効" } ?: ""),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = AppColors.inkTertiary,
+                                    )
                                 }
                                 IconButton(enabled = !busy, onClick = {
                                     scope.launch {
