@@ -15,14 +15,14 @@ AI ツールから、クラウドにバックアップした記録を読み取�
 - `Authorization: Bearer <token>` だけを受け付ける。OAuth は提供しないため、Bearer token をヘッダーで渡せるクライアント（Claude Code、Cursor など）が対象で、OAuth 前提のリモートコネクタ（claude.ai のカスタムコネクタなど）は使えない。
 - トークンは `rm_` + 32 bytes の乱数の base64url（43 文字）。形式が違うトークンは D1 を読まずに `401`（`WWW-Authenticate: Bearer`）を返す。
 - 検証は `api_token` の主キー（`token_hash` = SHA-256 の小文字 hex）の読み取り 1 回で `user_id` を解決する。平文はどこにも保存せず、ログにも出さない。
-- 権限（`api_token.scope`）は `read`（バックアップ全体の読み取り）と `write`（読み取りに加えて、補正と場所の作成・変更・削除。記録そのものは変えない）。`0021` より前に発行したトークンは `read`。有効期限はなく、失効はトークンの削除だけ。アカウント削除で `ON DELETE CASCADE` により消える。「すべての記録を削除」ではトークンは残る。
+- 権限（`api_token.scope`）は `read`（バックアップ全体の読み取り）と `write`（読み取りに加えて、補正と場所の作成・変更・削除。記録そのものは変えない）。`0021` より前に発行したトークンは `read`。発行から180日で失効し、期限切れは認証で拒否され、一覧取得時と定期メンテナンスで削除される。それより早く失効させる場合はトークンを削除する。アカウント削除で `ON DELETE CASCADE` により消える。「すべての記録を削除」ではトークンは残る。パスワードリセットでは既存セッションを失効させるが、APIトークンは別credentialとして残るため、必要なら一覧から削除する。
 - リクエストはユーザーごとに `API_RATE_LIMITER`（60 秒 600 回、キー `mcp:<userId>`）で制限する。
 
 ## トークンの発行と失効
 
 - Web / Android / iOS の設定 →「バックアップ」→「AI ツールとの接続（MCP）」から開く（ログイン中のみ。Web と Android はダイアログ、iOS はシート）。
 - 発行・一覧・削除は `/api/v1/api-tokens`（`GET` / `POST {name, scope}` / `DELETE /:id`）。`scope` は `read`（既定）か `write`。一覧は各トークンの `scope` を返す。書き込みできるトークンは Web の「場所と補正の編集を許可」から発行し、Android / iOS は一覧に「編集可」と表示する（発行は読み取りのみ）。セッション（Cookie またはネイティブの Bearer セッション）で認証し、API トークン自身ではトークンを管理できない。
-- 名前は任意で、前後の空白を除いて 50 文字以内。1 ユーザー 20 個まで（超えると `409 token_limit`）。上限の確認と挿入は 1 文で行い、同時発行でも超えない。
+- 名前は任意で、前後の空白を除いて 50 文字以内。1 ユーザー 20 個まで（期限切れを除く。超えると `409 token_limit`）。上限の確認と挿入は 1 文で行い、同時発行でも超えない。一覧の `expiresAt` は Unix ミリ秒。
 - 平文は発行時の応答で 1 回だけ返す。画面は平文・接続先 URL・AI ツールの設定例（Claude Code / Codex / Cursor / VS Code / Gemini CLI。Web `mcp-clients.ts` / Android `McpClientExamples.kt` / iOS `McpClientExamples.swift`）をコピーできる形で表示し、閉じると再表示できない。
 - 表示する接続先は、Web が `apiOrigin` + `/api/mcp`、Android / iOS がビルドの API の URL + `/api/mcp`（Android の Debug ビルドはエミュレーター用の `10.0.2.2` を `localhost` に置き換える）。
 - 平文のコピーは、Android 13 以降はクリップボードのプレビューに出さない（`EXTRA_IS_SENSITIVE`）、iOS は端末内だけ・10 分で消える（`localOnly` / `expirationDate`）。
