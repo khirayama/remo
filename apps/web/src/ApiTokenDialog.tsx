@@ -43,7 +43,7 @@ export function ApiTokenDialog({ onDismiss, onUnauthorized }: { onDismiss: () =>
       const result = await createApiToken(name.trim(), scope);
       if ("created" in result) {
         setCreated(result.created);
-        setTokens((current) => [result.created, ...(current ?? [])].map(({ id, name, scope, createdAt }) => ({ id, name, scope, createdAt })));
+        setTokens((current) => [result.created, ...(current ?? [])].map(({ id, name, scope, createdAt, expiresAt }) => ({ id, name, scope, createdAt, expiresAt })));
         setName("");
         setScope("read");
       } else {
@@ -104,7 +104,7 @@ export function ApiTokenDialog({ onDismiss, onUnauthorized }: { onDismiss: () =>
       : tokens.length === 0
         ? <p>発行済みのトークンはありません。</p>
         : <ul className="token-list">{tokens.map((token) => <li key={token.id}>
-          <span><strong>{token.name || "名前なし"}{token.scope === "write" && <span className="token-badge">編集可</span>}</strong><small>{formatDate(new Date(token.createdAt))}に発行</small></span>
+          <span><strong>{token.name || "名前なし"}{token.scope === "write" && <span className="token-badge">編集可</span>}</strong><small>{formatDate(new Date(token.createdAt))}に発行{token.expiresAt ? ` · ${formatDate(new Date(token.expiresAt))}まで有効` : ""}</small></span>
           <IconButton icon="deleteOutline" label={`${token.name || "名前なし"}のトークンを削除`} disabled={busy} onClick={() => void revoke(token)}/>
         </li>)}</ul>}
   </Dialog>;

@@ -275,7 +275,8 @@ export async function deleteAccount(password: string): Promise<AccountDeletionRe
 
 /** `write` tokens may also change named places and corrections. */
 export type ApiTokenScope = "read" | "write";
-export type ApiToken = { id: string; name: string; scope: ApiTokenScope; createdAt: number };
+/** `expiresAt` is missing from an API that predates token expiry. */
+export type ApiToken = { id: string; name: string; scope: ApiTokenScope; createdAt: number; expiresAt?: number };
 
 /** Tokens for the external API (MCP). The plain token is only returned when it is issued. */
 export async function listApiTokens(): Promise<ApiToken[]> {
