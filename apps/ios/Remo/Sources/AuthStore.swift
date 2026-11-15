@@ -67,8 +67,10 @@ final class AuthStore: ObservableObject {
                     ? "確認メールを送信しました。メール内のリンクを開いてからログインしてください"
                     : "認証トークンを取得できませんでした")
             }
+            guard KeychainToken.save(value) else {
+                throw AuthError.server("ログイン情報を端末に安全に保存できませんでした。もう一度お試しください")
+            }
             token = value
-            KeychainToken.save(value)
             let currentUser = try await fetchCurrentUser(token: value)
             user = currentUser
             Self.storeUser(currentUser)
@@ -92,6 +94,7 @@ final class AuthStore: ObservableObject {
         token = nil
         user = nil
         KeychainToken.remove()
+        PhotoBackup.clearRemoteCache()
         Self.clearStoredUserID()
         phase = .signedOut
     }
@@ -121,6 +124,7 @@ final class AuthStore: ObservableObject {
         self.token = nil
         user = nil
         KeychainToken.remove()
+        PhotoBackup.clearRemoteCache()
         Self.clearStoredUserID()
         phase = .signedOut
         return nil
@@ -287,7 +291,8 @@ enum KeychainToken {
         return String(data: data, encoding: .utf8)
     }
 
-    static func save(_ value: String) {
+    @discardableResult
+    static func save(_ value: String) -> Bool {
         remove()
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -295,7 +300,7 @@ enum KeychainToken {
             kSecValueData as String: Data(value.utf8),
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
-        SecItemAdd(query as CFDictionary, nil)
+        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
     }
 
     static func remove() {

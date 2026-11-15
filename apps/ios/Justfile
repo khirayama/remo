@@ -51,7 +51,8 @@ simulator target='iPhone 17':
       exit 1
     fi
 
-    open -a Simulator
+    # Xcode 27 replaced Simulator.app with DeviceHub; fall back for older Xcode.
+    open -a DeviceHub 2>/dev/null || open -a Simulator
 
     device_json=$(
       xcrun simctl list devices available --json \

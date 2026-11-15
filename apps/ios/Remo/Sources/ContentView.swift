@@ -667,7 +667,13 @@ private struct TrackerHomeView: View {
         let hasSecurityScope = url.startAccessingSecurityScopedResource()
         defer { if hasSecurityScope { url.stopAccessingSecurityScopedResource() } }
         do {
-            let imported = try await Task.detached(priority: .userInitiated) { try TimelineImport.decodeDocument(data: Data(contentsOf: url)) }.value
+            if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+               size > TimelineImport.maximumFileBytes {
+                throw TimelineImportError.fileTooLarge
+            }
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            guard data.count <= TimelineImport.maximumFileBytes else { throw TimelineImportError.fileTooLarge }
+            let imported = try await Task.detached(priority: .userInitiated) { try TimelineImport.decodeDocument(data: data) }.value
             store.importAll(imported.entries)
             store.database.importPlaces(imported.places)
             store.database.importCorrections(imported.corrections)
@@ -891,12 +897,16 @@ private enum TimelineImportError: LocalizedError {
     case invalidDocument
     case unsupportedVersion
     case noReadableEvents
+    case fileTooLarge
+    case tooManyEvents
 
     var errorDescription: String? {
         switch self {
         case .invalidDocument: return "RemoのJSONファイルではありません"
         case .unsupportedVersion: return "RemoのJSONバージョンが対応していません"
         case .noReadableEvents: return "読み込めるタイムライン記録がありません"
+        case .fileTooLarge: return "JSONファイルが大きすぎます（上限25 MiB）"
+        case .tooManyEvents: return "JSON内の記録が多すぎます（上限200,000件）"
         }
     }
 }
@@ -910,6 +920,8 @@ struct TimelineImportResult {
 }
 
 enum TimelineImport {
+    static let maximumFileBytes = 25 * 1024 * 1024
+    static let maximumEvents = 200_000
     private static let fractionalISO8601: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -931,6 +943,7 @@ enum TimelineImport {
         guard let rawEvents = document["events"] as? [[String: Any]] else {
             throw TimelineImportError.invalidDocument
         }
+        guard rawEvents.count <= maximumEvents else { throw TimelineImportError.tooManyEvents }
 
         let events = rawEvents.compactMap { decodeEvent($0, importedAt: importedAt) }
         if events.isEmpty && !rawEvents.isEmpty { throw TimelineImportError.noReadableEvents }

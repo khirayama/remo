@@ -694,3 +694,35 @@ final class RemoTests: XCTestCase {
         XCTAssertEqual(history.totalDuration, 3 * 20 * 60, accuracy: 0.001)
     }
 }
+
+final class PrivacyHardeningTests: XCTestCase {
+    func testRemotePhotoCacheKeyIsScopedByAccount() {
+        XCTAssertNotEqual(
+            remotePhotoCacheKey(accountID: "a", eventID: "e", digest: "d"),
+            remotePhotoCacheKey(accountID: "b", eventID: "e", digest: "d")
+        )
+    }
+
+    func testPrivacyManifestDeclaresUploadedData() throws {
+        let url = try XCTUnwrap(Bundle(for: PrivacyHardeningTests.self).url(forResource: "PrivacyInfo", withExtension: "xcprivacy")
+            ?? Bundle.main.url(forResource: "PrivacyInfo", withExtension: "xcprivacy"))
+        let plist = try XCTUnwrap(NSDictionary(contentsOf: url))
+        let types = (plist["NSPrivacyCollectedDataTypes"] as? [[String: Any]] ?? []).compactMap { $0["NSPrivacyCollectedDataType"] as? String }
+        for t in ["Health", "Name", "UserID", "OtherUserContent", "PreciseLocation", "PhotosorVideos", "EmailAddress"] {
+            XCTAssertTrue(types.contains("NSPrivacyCollectedDataType\(t)"), t)
+        }
+    }
+
+    func testApiTokenDecodesExpiry() throws {
+        let data = try XCTUnwrap(#"{"id":"t","name":"CLI","createdAt":1,"expiresAt":2,"scope":"read"}"#.data(using: .utf8))
+        let token = try JSONDecoder().decode(ApiToken.self, from: data)
+        XCTAssertEqual(token.expiresAt, 2)
+    }
+
+    func testApiTokenDecodesWithoutExpiryFromAnOlderApi() throws {
+        let data = try XCTUnwrap(#"{"id":"t","name":"CLI","createdAt":1,"scope":"read"}"#.data(using: .utf8))
+        let token = try JSONDecoder().decode(ApiToken.self, from: data)
+        XCTAssertNil(token.expiresAt)
+        XCTAssertFalse(token.issuedAndExpiryText.contains("まで有効"))
+    }
+}

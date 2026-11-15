@@ -6,21 +6,29 @@ struct ApiToken: Decodable, Identifiable, Equatable {
     let id: String
     let name: String
     let createdAt: Int64
+    /// Missing from an API that predates token expiry.
+    let expiresAt: Int64?
     /// "read" or "write": only a write token can change places and corrections.
     let scope: String?
 
     var displayName: String { name.isEmpty ? "名前なし" : name }
     var canWrite: Bool { scope == "write" }
+    var issuedAndExpiryText: String {
+        let issued = "\(formatDate(Date(timeIntervalSince1970: TimeInterval(createdAt) / 1000)))に発行"
+        guard let expiresAt, expiresAt > 0 else { return issued }
+        return issued + " · \(formatDate(Date(timeIntervalSince1970: TimeInterval(expiresAt) / 1000)))まで有効"
+    }
 }
 
 private struct IssuedApiToken: Decodable {
     let id: String
     let name: String
     let createdAt: Int64
+    let expiresAt: Int64?
     let token: String
     let scope: String?
 
-    var summary: ApiToken { ApiToken(id: id, name: name, createdAt: createdAt, scope: scope ?? "read") }
+    var summary: ApiToken { ApiToken(id: id, name: name, createdAt: createdAt, expiresAt: expiresAt, scope: scope ?? "read") }
 }
 
 private struct DataEnvelope<T: Decodable>: Decodable { let data: T }
@@ -137,7 +145,7 @@ struct ApiTokenSheet: View {
                             HStack(spacing: 8) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(token.displayName).font(RemoFont.bodyLarge).foregroundStyle(RemoStyle.ink).lineLimit(1)
-                                    Text("\(formatDate(Date(timeIntervalSince1970: TimeInterval(token.createdAt) / 1000)))に発行")
+                                    Text(token.issuedAndExpiryText)
                                         .font(RemoFont.bodySmall).foregroundStyle(RemoStyle.inkTertiary)
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)

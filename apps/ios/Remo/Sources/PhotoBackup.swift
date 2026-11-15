@@ -5,8 +5,15 @@ import UIKit
 
 private let remotePhotoCache = NSCache<NSString, UIImage>()
 
+/// The cache is scoped by account so one account's photos are never served to another.
+func remotePhotoCacheKey(accountID: String, eventID: String, digest: String) -> NSString {
+    "\(accountID):\(eventID):\(digest)" as NSString
+}
+
 @MainActor
 enum PhotoBackup {
+    static func clearRemoteCache() { remotePhotoCache.removeAllObjects() }
+
     private static func url(_ eventID: String, digest: String? = nil) -> URL {
         var result = AppConfig.apiBaseURL.appendingPathComponent("api/v1/photos").appendingPathComponent(eventID)
         if let digest { result.appendPathComponent(digest) }
@@ -166,7 +173,8 @@ enum PhotoBackup {
     }
 
     static func remoteImage(eventID: String, digest: String) async -> UIImage? {
-        let cacheKey = "\(eventID):\(digest)" as NSString
+        guard let accountID = AuthStore.storedUserID() else { return nil }
+        let cacheKey = remotePhotoCacheKey(accountID: accountID, eventID: eventID, digest: digest)
         if let cached = remotePhotoCache.object(forKey: cacheKey) { return cached }
         guard let token = KeychainToken.load() else { return nil }
         do {
