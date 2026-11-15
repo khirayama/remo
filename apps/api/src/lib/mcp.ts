@@ -923,7 +923,11 @@ export async function handleMcp(c: Context<{ Bindings: Env }>): Promise<Response
     return c.json({ error: "invalid_token" }, 401, { "WWW-Authenticate": "Bearer" });
   }
   const limiter = c.env.API_RATE_LIMITER;
-  if (limiter) {
+  if (!limiter) {
+    if (c.env.APP_ENV === "production") {
+      return c.json({ error: "rate_limiter_unavailable" }, 503);
+    }
+  } else {
     const { success } = await limiter.limit({ key: `mcp:${token.userId}` });
     if (!success) return c.json({ error: "rate_limited" }, 429);
   }

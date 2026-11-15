@@ -71,7 +71,7 @@ function setup() {
     const result = body.result;
     return { isError: result.isError === true, text: result.content[0].text as string, data: result.isError ? null : JSON.parse(result.content[0].text) };
   };
-  return { as, mcp, callTool };
+  return { as, mcp, callTool, database };
 }
 
 const uploadable = <T extends { startedAt: string; updatedAt: string }>(events: T[]) => events.map((event) => ({
@@ -101,7 +101,13 @@ describe("API tokens", () => {
     const issued = await user.issueToken("  Claude  ");
     expect(issued.token).toMatch(/^rm_[A-Za-z0-9_-]{43}$/);
     const list = await user.json("/api-tokens", "GET");
-    expect(list.body.data).toEqual([{ id: issued.id, name: "Claude", scope: "read", createdAt: expect.any(Number) }]);
+    expect(list.body.data).toEqual([{
+      id: issued.id,
+      name: "Claude",
+      scope: "read",
+      createdAt: expect.any(Number),
+      expiresAt: expect.any(Number),
+    }]);
     expect(JSON.stringify(list.body)).not.toContain(issued.token);
     expect((await as("user-2").json("/api-tokens", "GET")).body.data).toEqual([]);
 
@@ -113,13 +119,17 @@ describe("API tokens", () => {
 
 describe("MCP endpoint", () => {
   it("rejects missing, malformed, unknown and revoked tokens", async () => {
-    const { as, mcp } = setup();
+    const { as, mcp, database } = setup();
     expect((await mcp(undefined, "tools/list")).status).toBe(401);
     expect((await mcp("not-a-token", "tools/list")).headers.get("WWW-Authenticate")).toBe("Bearer");
     expect((await mcp(`rm_${"a".repeat(43)}`, "tools/list")).status).toBe(401);
 
     const user = as("user-1");
     const issued = await user.issueToken();
+    expect((await mcp(issued.token, "tools/list")).status).toBe(200);
+    database.exec("UPDATE api_token SET expires_at = 0");
+    expect((await mcp(issued.token, "tools/list")).status).toBe(401);
+    database.exec(`UPDATE api_token SET expires_at = ${Date.now() + 60_000}`);
     expect((await mcp(issued.token, "tools/list")).status).toBe(200);
     // Another user cannot revoke it.
     await as("user-2").json(`/api-tokens/${issued.id}`, "DELETE");

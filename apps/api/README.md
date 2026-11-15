@@ -63,18 +63,25 @@ R2には`remo-photo-previews-dev`と`remo-photo-previews`のプライベート�
 | --- | --- |
 | 認証系のPOST（IPごと） | 60秒10回 |
 | ログイン後の書き込み（アカウントごと） | 60秒600回 |
+| ログイン後の読み取り（GET、アカウントごと。同期のページ・写真プレビューなど） | 60秒3,000回 |
+| API・認証リクエスト本文 | 2 MiB（超えると `413 payload_too_large`） |
 | 位置チャンク1行 | 1.5 MB（超える分のサンプルは `rejected`） |
 | 位置チャンク数（アカウントごと） | 40,000（約27年分） |
+| 写真記録（アカウントごと） | 20,000件 |
 | プレビュー | 1記録1,000枚、1アカウント100,000枚 |
 | 場所名 | 2,000件 |
 | 睡眠 | 20,000セッション |
+| MCP APIトークン | 1ユーザー20個、発行から180日で失効 |
 
 `REQUIRE_EMAIL_VERIFICATION=true` を設定すると、メールアドレスを確認するまでログインできなくなります（確認メールの送信に `RESEND_API_KEY` と `MAIL_FROM` が必要。`WEB_APP_URL` は確認後の戻り先）。有効にすると既存のアカウントも次回ログイン時に確認が必要になるため、既定はオフです。
 
+`DISABLE_SIGNUP=true` を設定すると、新しいメール/パスワードアカウントの作成だけを停止します（既存アカウントのログインは継続）。非公開の個人運用向けです。パスワードリセット時は、そのアカウントの既存セッションをすべて失効させます（APIトークンは残るため、必要に応じてMCPのトークン一覧から削除してください）。本番で `AUTH_RATE_LIMITER`・`API_RATE_LIMITER`・`API_READ_RATE_LIMITER` のいずれかが欠けている場合、APIはレート制限なしで通さず `503` を返します。期限切れのAPIトークンは毎時のメンテナンスでも削除されます。
+
 ## 運用
 
-- **デプロイ**: `npm run deploy:production`（または `just api-deploy`）は、未適用のD1マイグレーションを本番DBへ適用してからWorkerをデプロイします。マイグレーションだけを先に適用する場合は `npm run db:migrate:remote`。
+- **デプロイ**: `npm run deploy:production`（または `just api-deploy`）は、未適用のD1マイグレーションを本番DBへ適用し、Workerをデプロイしてから `scripts/post-deploy.sql` を流します。マイグレーションだけを先に適用する場合は `npm run db:migrate:remote`。
 - **テーブルを作り直すマイグレーションの前**（`0019_location_chunks.sql` など）は、`just api-backup` で本番DBをSQLに書き出しておいてください。D1のTime Travel（30日）でも復元できます。`0019` は位置の行をチャンクへコピーし、`life_event` を残す行だけで作り直して旧テーブルを破棄します（行ごとの削除はしないので、書き込み行数は位置の行数に比例しません）。
+- **`0023_timeline_hardening.sql` は位置チャンク全体を走査して検索インデックスを作り直します。** 本番では履歴量に応じて時間と書き込みがかかるため、先に `just api-backup` を実行し、アクセスが少ない時間帯に `npm run db:migrate:remote` を単独で流してください。`0024_api_token_expiry.sql` は既存トークンへ180日の期限を付与します。マイグレーションからWorkerのデプロイまでの間に旧Workerが書いた位置チャンクと発行したトークンは、`deploy:production` の最後に流れる `scripts/post-deploy.sql`（`npm run db:post-deploy:remote`）が索引付け・期限付与します。マイグレーションだけを先に適用した場合も、Workerのデプロイ後にこれを実行してください（何度実行しても安全です）。
 - **新旧クライアントの混在**: APIの形は旧クライアントとも互換ですが、旧クライアントは「すべて削除」の後に全件同期（カーソルが無い状態でのログイン）をすると、端末に残っている古い記録を再アップロードします。3クライアントを更新してからAPIをデプロイするのが安全です。
 - **ログ**: 未処理の例外とCronの失敗は1行のJSON（`level`, `event`, `message`）で出力します。Workers Logs（`observability.enabled`）で `level:"error"` を条件に通知を設定してください。
 - **ステージング**: `wrangler.jsonc` には `development`（ローカル）と `production` だけがあります。本番データを使わずに確認したい場合は、D1・R2・レート制限のnamespaceを別に作り、`env.staging` を追加してください。

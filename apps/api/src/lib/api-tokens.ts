@@ -11,6 +11,7 @@ export const apiTokenRoutes = new Hono<AppContext>();
 export const API_TOKEN_PATTERN = /^rm_[A-Za-z0-9_-]{43}$/;
 export const MAX_API_TOKENS = 20;
 export const MAX_API_TOKEN_NAME_LENGTH = 50;
+export const API_TOKEN_TTL_MS = 180 * 24 * 60 * 60 * 1000;
 
 function base64url(bytes: Uint8Array): string {
   let binary = "";
@@ -38,25 +39,28 @@ export async function resolveApiToken(db: D1Database, authorization: string | un
   const match = /^Bearer (\S+)$/.exec(authorization ?? "");
   const token = match?.[1];
   if (!token || !API_TOKEN_PATTERN.test(token)) return null;
-  const row = await db.prepare("SELECT user_id, scope FROM api_token WHERE token_hash = ?1")
-    .bind(await hashApiToken(token))
+  const row = await db.prepare("SELECT user_id, scope FROM api_token WHERE token_hash = ?1 AND expires_at > ?2")
+    .bind(await hashApiToken(token), Date.now())
     .first<{ user_id: string; scope: string }>();
   if (typeof row?.user_id !== "string" || !row.user_id) return null;
   return { userId: row.user_id, scope: row.scope === "write" ? "write" : "read" };
 }
 
-type TokenRow = { id: string; name: string; scope: string; created_at: number };
+type TokenRow = { id: string; name: string; scope: string; created_at: number; expires_at: number };
 
 const toOutput = (row: TokenRow) => ({
   id: String(row.id),
   name: String(row.name),
   scope: row.scope === "write" ? "write" : "read",
   createdAt: Number(row.created_at),
+  expiresAt: Number(row.expires_at),
 });
 
 apiTokenRoutes.get("/api-tokens", async (c) => {
+  await c.env.DB.prepare("DELETE FROM api_token WHERE user_id = ?1 AND expires_at <= ?2")
+    .bind(c.get("user").id, Date.now()).run();
   const { results } = await c.env.DB.prepare(
-    "SELECT id, name, scope, created_at FROM api_token WHERE user_id = ?1 ORDER BY created_at DESC, id LIMIT ?2",
+    "SELECT id, name, scope, created_at, expires_at FROM api_token WHERE user_id = ?1 ORDER BY created_at DESC, id LIMIT ?2",
   ).bind(c.get("user").id, MAX_API_TOKENS).all<TokenRow>();
   const response = c.json({ data: results.map(toOutput) });
   response.headers.set("Cache-Control", "no-store");
@@ -77,14 +81,23 @@ apiTokenRoutes.post("/api-tokens", async (c) => {
   }
   const userId = c.get("user").id;
   const token = generateApiToken();
-  const row: TokenRow = { id: crypto.randomUUID(), name, scope: body.scope === "write" ? "write" : "read", created_at: Date.now() };
+  const now = Date.now();
+  const row: TokenRow = {
+    id: crypto.randomUUID(),
+    name,
+    scope: body.scope === "write" ? "write" : "read",
+    created_at: now,
+    expires_at: now + API_TOKEN_TTL_MS,
+  };
+  await c.env.DB.prepare("DELETE FROM api_token WHERE user_id = ?1 AND expires_at <= ?2")
+    .bind(userId, now).run();
   // The count check and the insert are one statement, so concurrent requests
   // cannot pass the limit together.
   const result = await c.env.DB.prepare(
-    `INSERT INTO api_token (token_hash, id, user_id, name, scope, created_at)
-     SELECT ?2, ?3, ?1, ?4, ?7, ?5
-     WHERE (SELECT COUNT(*) FROM api_token WHERE user_id = ?1) < ?6`,
-  ).bind(userId, await hashApiToken(token), row.id, row.name, row.created_at, MAX_API_TOKENS, row.scope).run();
+    `INSERT INTO api_token (token_hash, id, user_id, name, scope, created_at, expires_at)
+     SELECT ?2, ?3, ?1, ?4, ?7, ?5, ?8
+     WHERE (SELECT COUNT(*) FROM api_token WHERE user_id = ?1 AND expires_at > ?9) < ?6`,
+  ).bind(userId, await hashApiToken(token), row.id, row.name, row.created_at, MAX_API_TOKENS, row.scope, row.expires_at, now).run();
   if (!result.meta.changes) {
     return c.json({ error: { code: "token_limit", message: `At most ${MAX_API_TOKENS} tokens can be issued` } }, 409);
   }

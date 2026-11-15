@@ -11,7 +11,8 @@
     "dev": "npm run db:migrate:local && wrangler dev --env development",
     "db:migrate:local": "wrangler d1 migrations apply remo-db --local --env development",
     "db:migrate:remote": "wrangler d1 migrations apply remo-db --remote --env production",
-    "deploy:production": "npm run db:migrate:remote && wrangler deploy --env production",
+    "db:post-deploy:remote": "wrangler d1 execute remo-db --remote --env production --file scripts/post-deploy.sql --yes",
+    "deploy:production": "npm run db:migrate:remote && wrangler deploy --env production && npm run db:post-deploy:remote",
     "build": "wrangler deploy --dry-run --env production",
     "check": "npm run typecheck && npm test",
     "typecheck": "tsc --noEmit",
@@ -22,7 +23,7 @@
     "@modelcontextprotocol/server": "^2.4.0",
     "better-auth": "^1.7.15",
     "drizzle-orm": "^0.45.2",
-    "hono": "^4.13.12",
+    "hono": "^4.13.18",
     "zod": "^4.6.7"
   },
   "devDependencies": {

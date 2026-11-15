@@ -68,6 +68,7 @@ function createBetterAuth(env: Env) {
   );
 
   const requireVerification = env.REQUIRE_EMAIL_VERIFICATION === "true";
+  const disableSignUp = env.DISABLE_SIGNUP === "true";
 
   return betterAuth({
     secret,
@@ -86,6 +87,7 @@ function createBetterAuth(env: Env) {
             env.DB.prepare("INSERT OR IGNORE INTO photo_cleanup(prefix) VALUES (?1)").bind(`${user.id}/`),
             env.DB.prepare("DELETE FROM photo_preview WHERE user_id = ?1").bind(user.id),
             env.DB.prepare("DELETE FROM life_event WHERE user_id = ?1").bind(user.id),
+            env.DB.prepare("DELETE FROM location_sample_index WHERE user_id = ?1").bind(user.id),
             env.DB.prepare("DELETE FROM location_chunk WHERE user_id = ?1").bind(user.id),
             env.DB.prepare("DELETE FROM place WHERE user_id = ?1").bind(user.id),
             env.DB.prepare("DELETE FROM timeline_correction WHERE user_id = ?1").bind(user.id),
@@ -112,6 +114,12 @@ function createBetterAuth(env: Env) {
     },
     emailAndPassword: {
       enabled: true,
+      // Useful for a private deployment. Public deployments can leave this off
+      // and rely on the per-IP auth limiter plus the per-account storage quotas.
+      disableSignUp,
+      // A reset proves control of the mailbox, not that existing sessions are
+      // trustworthy. Expire them together with the old password.
+      revokeSessionsOnPasswordReset: true,
       // Off by default: turning it on needs working mail delivery, and it
       // makes existing accounts confirm their address at the next sign-in.
       requireEmailVerification: requireVerification,

@@ -6,5 +6,6 @@ MAIL_FROM=
 
 # Optional: sign-in waits for a confirmed email address (needs RESEND_API_KEY and MAIL_FROM)
 REQUIRE_EMAIL_VERIFICATION=
+DISABLE_SIGNUP=
 # Where the browser lands after confirming an email address
 WEB_APP_URL=http://localhost:5173

@@ -1,4 +1,5 @@
 import { Hono, type MiddlewareHandler } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { getBetterAuth } from "./betterAuth";
 import type { Env } from "./env";
@@ -38,21 +39,38 @@ app.use(
   }),
 );
 
+const requestBodyLimit = bodyLimit({
+  maxSize: 2 * 1024 * 1024,
+  onError: (c) => c.json({ error: { code: "payload_too_large", message: "Request body is too large" } }, 413),
+});
+app.use("/api/v1/*", requestBodyLimit);
+app.use("/api/mcp", requestBodyLimit);
+app.use("/api/auth/*", requestBodyLimit);
+
 app.get("/api/v1/health", (c) =>
   c.json({ data: { status: "ok", environment: c.env.APP_ENV } }),
 );
+
+function clientAddress(c: { req: { header(name: string): string | undefined } }): string {
+  return c.req.header("CF-Connecting-IP")
+    ?? c.req.header("X-Forwarded-For")?.split(",")[0]?.trim()
+    ?? "unknown";
+}
 
 // Credential endpoints (sign-in, sign-up, password reset, account deletion)
 // are limited per client IP. Better Auth's built-in limiter keeps its counters
 // in isolate memory, which does not hold across Workers isolates.
 const limitCredentialRequests: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
   const limiter = c.env.AUTH_RATE_LIMITER;
-  if (limiter) {
-    const ip = c.req.header("CF-Connecting-IP") ?? "unknown";
-    const { success } = await limiter.limit({ key: `auth:${ip}` });
-    if (!success) {
-      return c.json({ error: { code: "rate_limited", message: "Too many requests. Try again later." } }, 429);
+  if (!limiter) {
+    if (c.env.APP_ENV === "production") {
+      return c.json({ error: { code: "rate_limiter_unavailable", message: "Service temporarily unavailable" } }, 503);
     }
+    return next();
+  }
+  const { success } = await limiter.limit({ key: `auth:${clientAddress(c)}` });
+  if (!success) {
+    return c.json({ error: { code: "rate_limited", message: "Too many requests. Try again later." } }, 429);
   }
   await next();
 };
@@ -98,23 +116,29 @@ app.on(["GET", "POST"], "/api/auth/*", async (c) => {
 // after the account (and its session) has been deleted.
 app.route("/api/v1", accountRoutes);
 
-// Writes are limited per account: a backup sends a batch a minute and a photo
-// scan up to a few hundred previews, far below the limit, while a runaway or
-// abusive client cannot write without bound.
-export const limitUserWrites: MiddlewareHandler<AppContext> = async (c, next) => {
-  const limiter = c.env.API_RATE_LIMITER;
-  if (limiter && !SAFE_METHODS.has(c.req.method)) {
-    const { success } = await limiter.limit({ key: `user:${c.get("user").id}` });
-    if (!success) {
-      return c.json({ error: { code: "rate_limited", message: "Too many requests. Try again later." } }, 429);
+// Authenticated reads and writes are limited per account, each with its own
+// budget: a full restore of a long history (up to ~1,700 pages) and a screen of
+// photo previews are reads, and must not use up the write budget or each
+// other's. A runaway or abusive client still cannot hammer D1.
+export const limitUserRequests: MiddlewareHandler<AppContext> = async (c, next) => {
+  const read = SAFE_METHODS.has(c.req.method);
+  const limiter = read ? c.env.API_READ_RATE_LIMITER : c.env.API_RATE_LIMITER;
+  if (!limiter) {
+    if (c.env.APP_ENV === "production") {
+      return c.json({ error: { code: "rate_limiter_unavailable", message: "Service temporarily unavailable" } }, 503);
     }
+    return next();
+  }
+  const { success } = await limiter.limit({ key: `${read ? "user-read" : "user"}:${c.get("user").id}` });
+  if (!success) {
+    return c.json({ error: { code: "rate_limited", message: "Too many requests. Try again later." } }, 429);
   }
   await next();
 };
 
 const authed = new Hono<AppContext>();
 authed.use("*", requireUser);
-authed.use("*", limitUserWrites);
+authed.use("*", limitUserRequests);
 authed.get("/me", (c) => c.json({ data: c.get("user") }));
 authed.route("/", lifeEventRoutes);
 authed.route("/", photoRoutes);

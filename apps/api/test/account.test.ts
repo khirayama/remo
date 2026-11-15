@@ -35,17 +35,35 @@ describe("account routes", () => {
     expect((await app.request("/api/v1/health", {}, limited)).status).toBe(200);
   });
 
-  it("limits writes per signed-in user", async () => {
-    const { limitUserWrites } = await import("../src/index");
+  it("fails closed when credential limiting is not configured in production", async () => {
+    const bindings = { APP_ENV: "production", CORS_ALLOWED_ORIGINS: "" } as never;
+    expect((await post("/api/auth/sign-in/email", { email: "a@example.com", password: "x" }, bindings)).status).toBe(503);
+  });
+
+  it("rejects oversized request bodies", async () => {
+    const long = "x".repeat(2 * 1024 * 1024);
+    expect((await post("/api/auth/sign-in/email", { email: "a@example.com", password: long }, env(false))).status).toBe(413);
+    expect((await post("/api/v1/events/batch", { events: [{ id: "a", padding: long }] }, env())).status).toBe(413);
+  });
+
+  it("limits authenticated requests per signed-in user", async () => {
+    const { limitUserRequests } = await import("../src/index");
     const seen: string[] = [];
     const limited = new Hono<AppContext>();
     limited.use("*", async (c, next) => { c.set("user", { id: "user-1", email: "", name: "" }); await next(); });
-    limited.use("*", limitUserWrites);
+    limited.use("*", limitUserRequests);
     limited.all("*", (c) => c.body(null, 204));
-    const bindings = { API_RATE_LIMITER: { limit: async ({ key }: { key: string }) => { seen.push(key); return { success: false }; } } } as never;
+    const limiter = (success: boolean) => ({ limit: async ({ key }: { key: string }) => { seen.push(key); return { success }; } });
+    // Writes and reads have separate budgets: exhausted writes leave reads available.
+    const bindings = { API_RATE_LIMITER: limiter(false), API_READ_RATE_LIMITER: limiter(true) } as never;
     expect((await limited.request("/events/batch", { method: "POST" }, bindings)).status).toBe(429);
     expect((await limited.request("/events", {}, bindings)).status).toBe(204);
-    expect(seen).toEqual(["user:user-1"]);
+    const readsExhausted = { API_RATE_LIMITER: limiter(true), API_READ_RATE_LIMITER: limiter(false) } as never;
+    expect((await limited.request("/events", {}, readsExhausted)).status).toBe(429);
+    expect(seen).toEqual(["user:user-1", "user-read:user-1", "user-read:user-1"]);
+    // Production without a binding fails closed instead of running unlimited.
+    const production = { APP_ENV: "production", API_RATE_LIMITER: limiter(true) } as never;
+    expect((await limited.request("/events", {}, production)).status).toBe(503);
   });
 
   it("rejects cookie-authenticated writes from other origins or as non-JSON", async () => {
