@@ -153,4 +153,23 @@ final class PhotoArchiveTests: XCTestCase {
         XCTAssertTrue(index.archivedEventIDs().isEmpty)
         XCTAssertTrue(index.assignments().isEmpty)
     }
+
+    func testRewritingAssignmentsKeepsUnchangedRowsAndTheirDigests() {
+        let index = PhotoIndexDatabase(path: directory.appendingPathComponent("rewrite.sqlite").path)
+        let first = GroupablePhoto(id: "first", takenAt: start, mediaType: .photo, coordinate: home, previousEventID: record)
+        let second = GroupablePhoto(id: "second", takenAt: start.addingTimeInterval(120), mediaType: .photo, coordinate: home, previousEventID: "other-record")
+        index.replaceAssignments(["first": record, "second": "other-record"], photos: [first, second])
+        index.setAssetDigest("first", eventID: record, digest: "digest-first")
+        index.setAssetDigest("second", eventID: "other-record", digest: "digest-second")
+
+        // Only the second asset moves; both digests survive the rewrite.
+        index.replaceAssignments(["first": record, "second": record], photos: [first, second])
+        XCTAssertEqual(index.assignments(), ["first": record, "second": record])
+        XCTAssertEqual(index.assignedPhotos()["first"]?.digest, "digest-first")
+        XCTAssertEqual(index.assignedPhotos()["second"]?.digest, "digest-second")
+
+        // An asset no longer assigned disappears.
+        index.replaceAssignments(["first": record], photos: [first])
+        XCTAssertEqual(Set(index.assignments().keys), ["first"])
+    }
 }

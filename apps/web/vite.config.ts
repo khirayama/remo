@@ -58,12 +58,22 @@ function securityHeaders(tileUrl: string, apiBaseUrl: string): Plugin {
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, __dirname, "");
   // Empty means the API is served from the same origin through the Worker's
-  // /api proxy, which is the production setup.
+  // /api proxy, which is the production setup. An unset value falls back to
+  // the local development API (api-base.ts), so a production build has to say
+  // which one it means.
+  if (mode === "production" && env.VITE_API_BASE_URL === undefined) {
+    throw new Error("Production builds require VITE_API_BASE_URL: set it empty for the same-origin API, or to its https origin.");
+  }
   const apiBaseUrl = env.VITE_API_BASE_URL ?? "";
   if (mode === "production" && apiBaseUrl !== "" && !apiBaseUrl.startsWith("https://")) {
     throw new Error("Production builds require an empty (same-origin) or https VITE_API_BASE_URL.");
   }
   const tileUrl = env.VITE_MAP_TILE_URL || DEFAULT_TILE_URL;
+  // The tile origin goes into the content security policy; a URL this cannot
+  // read would silently block the map in production.
+  if (mode === "production" && env.VITE_MAP_TILE_URL && originOf(env.VITE_MAP_TILE_URL) === undefined) {
+    throw new Error("Production builds require VITE_MAP_TILE_URL to be an absolute URL.");
+  }
   if (mode === "production" && !env.VITE_MAP_TILE_URL) {
     console.warn("\n[remo] VITE_MAP_TILE_URL is not set: the map uses OpenStreetMap's own tile servers, which are for light use only. Set a tile provider (and VITE_MAP_TILE_ATTRIBUTION) for production.\n");
   }

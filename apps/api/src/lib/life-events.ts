@@ -69,7 +69,11 @@ const ERASE_PAYLOAD = `started_at = 0, latitude = NULL, longitude = NULL,
   photo_location_auto_placement_disabled = 0, accuracy_meters = NULL,
   media_type = NULL, photo_count = 0`;
 
-export const TOMBSTONE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+// A device that has not synced for longer than this never learns about the
+// records deleted meanwhile (the deletion record is all it would receive), so
+// a deletion has to outlive a long offline period. The rows are tiny: the
+// payload is erased when the record is deleted.
+export const TOMBSTONE_RETENTION_MS = 400 * 24 * 60 * 60 * 1000;
 const PURGE_BATCH_SIZE = 1_000;
 const PURGE_MAX_BATCHES = 50;
 
@@ -386,7 +390,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function groupsOf<T>(items: T[], size: number): T[][] {
+export function groupsOf<T>(items: T[], size: number): T[][] {
   const groups: T[][] = [];
   for (let index = 0; index < items.length; index += size) groups.push(items.slice(index, index + size));
   return groups;
@@ -610,18 +614,25 @@ lifeEventRoutes.get("/events", async (c) => {
     // A page token this version did not issue (an older client resuming) starts over.
     const page = parseFullPageCursor(rawPage);
     const readsEvents = page?.phase !== "chunks";
-    const [state, eventResult, chunkResult] = await db.batch<Record<string, unknown>>([
+    const [state, eventResult] = await db.batch<Record<string, unknown>>([
       stateStatement,
       db.prepare(eventRowQuery("id > ?2", "id")).bind(user.id, page?.phase === "events" ? page.position : "", readsEvents ? SYNC_PAGE_SIZE : 0),
-      db.prepare("SELECT bucket, payload, updated_at FROM location_chunk WHERE user_id = ?1 AND bucket > ?2 ORDER BY bucket LIMIT ?3")
-        .bind(user.id, page?.phase === "chunks" ? Number(page.position) : -Number.MAX_SAFE_INTEGER, SYNC_CHUNK_PAGE),
     ]);
     const snapshotAt = page?.snapshotAt ?? finiteNumber(state?.results[0]?.seq) ?? 0;
     const eventRows = eventResult?.results ?? [];
-    const chunkRows = (chunkResult?.results ?? []) as unknown as ChunkRow[];
+    const recordsFinished = !readsEvents || eventRows.length < SYNC_PAGE_SIZE;
+    // A window row holds up to a megabyte of samples, and a record page that is
+    // full would deliver none of them: the windows are read only on the page
+    // where the records are finished (or on a chunks page), and the next page
+    // reads them again from the start.
+    const chunkRows = recordsFinished
+      ? (await db.prepare("SELECT bucket, payload, updated_at FROM location_chunk WHERE user_id = ?1 AND bucket > ?2 ORDER BY bucket LIMIT ?3")
+        .bind(user.id, page?.phase === "chunks" ? Number(page.position) : -Number.MAX_SAFE_INTEGER, SYNC_CHUNK_PAGE)
+        .all<Record<string, unknown>>()).results as unknown as ChunkRow[]
+      : [];
     eventRows.forEach((row) => addEventRow(payload, row));
     let nextPage: FullPageCursor | undefined;
-    if (readsEvents && eventRows.length === SYNC_PAGE_SIZE) {
+    if (!recordsFinished) {
       nextPage = { snapshotAt, phase: "events", position: String(eventRows.at(-1)!.id) };
     } else {
       chunkRows.forEach((row) => parseChunk(row.payload).forEach((sample) => payload.events.push(sampleEvent(sample))));

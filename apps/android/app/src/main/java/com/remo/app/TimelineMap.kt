@@ -178,8 +178,7 @@ internal fun TimelineMap(
             // local thumbnail first so a large cluster cannot delay the map.
             photoClusters.mapNotNull { it.entries.firstOrNull() }.forEach { log ->
                 val photo = nearestLibraryPhoto(log, photos)
-                put(log.id, withContext(Dispatchers.IO) { photo?.let { PhotoLibrary.loadThumbnail(context, it, 128) } }
-                    ?: runCatching { PhotoBackup.remoteThumbnail(log.id) }.getOrNull())
+                put(log.id, runCatching { loadPhotoThumbnail(context, log, photo, 128) }.getOrNull())
             }
         }
     }

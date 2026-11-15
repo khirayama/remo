@@ -14,6 +14,28 @@ func remotePhotoCacheKey(accountID: String, eventID: String, digest: String) -> 
 enum PhotoBackup {
     static func clearRemoteCache() { remotePhotoCache.removeAllObjects() }
 
+    /// What a preview upload means for the rest of the pass.
+    enum Disposition: Equatable {
+        case uploaded
+        case unauthorized
+        /// Rate limited or the server is unavailable: stop and retry later.
+        case stopPass
+        /// This record alone cannot be uploaded now: skip it and continue.
+        case skip
+    }
+
+    /// Classifies an upload result. 507 is checked before the 5xx range: it
+    /// means this record is too large for the backup, not that the API is down.
+    static func disposition(for status: Int?) -> Disposition {
+        guard let status else { return .stopPass }
+        if status == 401 { return .unauthorized }
+        if (200..<300).contains(status) { return .uploaded }
+        if status == 507 { return .skip }
+        if status == 429 || (500..<600).contains(status) { return .stopPass }
+        if (400..<500).contains(status) { return .skip }
+        return .stopPass
+    }
+
     private static func url(_ eventID: String, digest: String? = nil) -> URL {
         var result = AppConfig.apiBaseURL.appendingPathComponent("api/v1/photos").appendingPathComponent(eventID)
         if let digest { result.appendPathComponent(digest) }
@@ -44,6 +66,8 @@ enum PhotoBackup {
         let account: String
         let indexGeneration: Int
         let photoRecords: Set<String>
+        /// An edit that clears a rejection makes its previews worth trying again.
+        let rejectedRecords: Set<String>
         let assetCount: Int
     }
     private static var completedPass: CompletedPass?
@@ -54,7 +78,10 @@ enum PhotoBackup {
     static func uploadPending(assets: [PHAsset], database: LogDatabase) async throws -> (pending: Bool, more: Bool) {
         guard let token = KeychainToken.load(), let account = AuthStore.storedUserID() else { return (false, false) }
         let active = Set(database.photoEntries().map(\.id))
-        let pass = CompletedPass(account: account, indexGeneration: PhotoTimelineIndexer.generation, photoRecords: active, assetCount: assets.count)
+        // A record the server refused cannot hold a preview; uploading one
+        // would only be refused too.
+        let rejected = database.rejectedEntryIDs()
+        let pass = CompletedPass(account: account, indexGeneration: PhotoTimelineIndexer.generation, photoRecords: active, rejectedRecords: rejected, assetCount: assets.count)
         // Walking the whole library on every backup is wasted work when neither
         // the library nor the records changed since everything was uploaded.
         if completedPass == pass { return (false, false) }
@@ -73,12 +100,14 @@ enum PhotoBackup {
         var incomplete = Set<String>()
         var uploaded = 0
         var unavailable = false
+        /// A preview this record cannot upload now; the pass still tries it again later.
+        var skipped = false
         // Videos upload their poster frame the same way: PHImageManager
         // returns a thumbnail for a video asset, so only the image filter is
         // gone here.
         for asset in assets {
             if uploaded >= 200 || Task.isCancelled { return (true, true) }
-            guard let eventID = PhotoTimelineIndexer.eventID(for: asset), active.contains(eventID) else { continue }
+            guard let eventID = PhotoTimelineIndexer.eventID(for: asset), active.contains(eventID), !rejected.contains(eventID) else { continue }
             let marker = "remo.photo-uploaded.\(account).\(asset.localIdentifier).\(asset.modificationDate?.timeIntervalSince1970 ?? 0).\(eventID)"
             // Markers were one UserDefaults key per photo before the photo index kept them.
             if markers[marker] == nil, UserDefaults.standard.bool(forKey: marker) {
@@ -112,9 +141,24 @@ enum PhotoBackup {
             upload.httpMethod = "PUT"
             upload.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
             upload.httpBody = data
-            guard let (_, response) = try? await AppConfig.session.data(for: upload), let http = response as? HTTPURLResponse else { return (true, false) }
-            if http.statusCode == 401 { throw SyncError.unauthorized }
-            guard http.statusCode == 204 else { return (true, false) }
+            guard let (_, response) = try? await AppConfig.session.data(for: upload), let http = response as? HTTPURLResponse else {
+                // A network failure stops this pass; the next one retries.
+                return (true, false)
+            }
+            switch disposition(for: http.statusCode) {
+            case .uploaded:
+                break
+            case .unauthorized:
+                throw SyncError.unauthorized
+            case .stopPass:
+                // Rate limited or the server is unavailable: stop and retry later.
+                return (true, false)
+            case .skip:
+                // This one record cannot be uploaded now (too large, unknown,
+                // out of quota); the rest of the pass, and the manifests, go on.
+                skipped = true
+                continue
+            }
             index.markUploaded(marker, digest: digest)
             index.setAssetDigest(asset.localIdentifier, eventID: eventID, digest: digest)
             markers[marker] = digest
@@ -141,8 +185,8 @@ enum PhotoBackup {
             if try await sendManifest(eventID: eventID, digests: current, token: token) { index.clearPendingManifest(eventID) }
             else { manifestsPending = true }
         }
-        if !unavailable && !manifestsPending { completedPass = pass }
-        return (unavailable || manifestsPending, false)
+        if !unavailable && !skipped && !manifestsPending { completedPass = pass }
+        return (unavailable || skipped || manifestsPending, false)
     }
 
     /// Tells the server which previews a record still has; it removes the others.

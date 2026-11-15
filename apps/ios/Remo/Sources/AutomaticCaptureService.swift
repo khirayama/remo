@@ -252,8 +252,12 @@ final class AutomaticCaptureService: NSObject, ObservableObject, CLLocationManag
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        guard let location = locations.last else { return }
-        Task { @MainActor in handleLocation(location) }
+        // After a background pause or a significant-change relaunch the system
+        // can hand over several fixes at once; keep every one that passes the
+        // same freshness and duplicate checks, oldest first.
+        Task { @MainActor in
+            for location in locations { handleLocation(location) }
+        }
     }
 
     private func handleLocation(_ location: CLLocation) {

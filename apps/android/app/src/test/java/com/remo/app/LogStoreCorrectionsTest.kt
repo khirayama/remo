@@ -24,6 +24,10 @@ class LogStoreCorrectionsTest {
     private val context: Context get() = RuntimeEnvironment.getApplication()
     private var originalTimeZone: TimeZone? = null
 
+    private companion object {
+        const val DAY_MS = 24 * 60 * 60 * 1000L
+    }
+
     @Before fun useUtcDays() {
         originalTimeZone = TimeZone.getDefault()
         TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
@@ -89,6 +93,19 @@ class LogStoreCorrectionsTest {
         store.putCorrection(correction)
         val days = store.dirtyDays().map(DirtyDay::day).sorted()
         assertEquals(listOf("2026-10-11", "2026-10-12"), days)
+    }
+
+    @Test fun aCorrectionInTheFutureDoesNotMarkFutureDays() = runBlocking {
+        val store = store()
+        val now = System.currentTimeMillis()
+        val future = correction(startedAt = now + 10 * DAY_MS, endedAt = now + 11 * DAY_MS)
+
+        store.putCorrection(future)
+
+        // The stay index only recomputes today and earlier, so a future day
+        // would stay dirty forever.
+        val today = dayKey(now)
+        assertTrue(store.dirtyDays().none { it.day > today })
     }
 
     @Test fun downloadedCorrectionIsAddedWithoutBeingSentBack() = runBlocking {

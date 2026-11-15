@@ -11,7 +11,7 @@ private struct ViewedPhoto: Identifiable {
 /// Grid of the photos and videos in one timeline row or map marker.
 struct PhotoListSheet: View {
     let entries: [LogEntry]
-    let assets: [PHAsset]
+    let assetIndex: PhotoAssetIndex<PHAsset>
     let onClose: () -> Void
     let onEditLocation: (LogEntry) -> Void
     @State private var viewing: ViewedPhoto?
@@ -48,7 +48,7 @@ struct PhotoListSheet: View {
                             }
                         } else {
                             Button { viewing = ViewedPhoto(entry: entry, digest: nil) } label: {
-                                PhotoGridTile(entry: entry, asset: nearestPhotoAsset(entry, assets: assets))
+                                PhotoGridTile(entry: entry, asset: assetIndex.nearest(to: entry))
                             }.buttonStyle(.plain)
                         }
                     }
@@ -68,7 +68,7 @@ struct PhotoListSheet: View {
             }
         }
         .fullScreenCover(item: $viewing) { selected in
-            PhotoViewer(entry: selected.entry, asset: selected.digest == nil ? nearestPhotoAsset(selected.entry, assets: assets) : nil, remoteDigest: selected.digest, onClose: { viewing = nil }) {
+            PhotoViewer(entry: selected.entry, asset: selected.digest == nil ? assetIndex.nearest(to: selected.entry) : nil, remoteDigest: selected.digest, onClose: { viewing = nil }) {
                 viewing = nil
                 onEditLocation(selected.entry)
             }

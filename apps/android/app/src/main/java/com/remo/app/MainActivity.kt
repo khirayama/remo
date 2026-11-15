@@ -67,6 +67,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -137,14 +138,15 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     val scope = rememberCoroutineScope()
     val store = remember { LogStore.get(context) }
     val snackbar = remember { SnackbarHostState() }
-    var showSettings by remember { mutableStateOf(false) }
-    var selectedDate by remember { mutableStateOf(dayKey(System.currentTimeMillis())) }
+    // These survive a rotation or size change with the rest of the screen.
+    var showSettings by rememberSaveable { mutableStateOf(false) }
+    var selectedDate by rememberSaveable { mutableStateOf(dayKey(System.currentTimeMillis())) }
     var selectedLog by remember { mutableStateOf<LogEntry?>(null) }
     var selectedPhotos by remember { mutableStateOf<List<LogEntry>?>(null) }
     var mapFocusTarget by remember { mutableStateOf<TimelineMapFocus?>(null) }
     var historyTarget by remember { mutableStateOf<PlaceHistoryTarget?>(null) }
-    var homeMode by remember { mutableStateOf(HomeMode.DAY) }
-    var placePeriod by remember { mutableStateOf(PlacePeriod.ALL) }
+    var homeMode by rememberSaveable { mutableStateOf(HomeMode.DAY) }
+    var placePeriod by rememberSaveable { mutableStateOf(PlacePeriod.ALL) }
     var selectedPlaceId by remember { mutableStateOf<String?>(null) }
     val savedAllPlacesCamera = remember { SavedCamera() }
     var autoCapture by remember { mutableStateOf(AutomaticCaptureService.isEnabled(context)) }
@@ -158,6 +160,8 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     var sleepRevision by remember { mutableIntStateOf(0) }
     var syncStatus by remember { mutableStateOf(if (user == null) "端末に保存済み" else "バックアップ待ち") }
     var lastBackupAt by remember { mutableStateOf<Long?>(BackupCoordinator.lastSuccessAt(context)) }
+    // Read again after a sync, which is when the server can refuse a record.
+    val rejectedCount by produceState(0, store.revision, syncStatus) { value = store.rejectedCount() }
     var status by remember { mutableStateOf<String?>(null) }
     var confirmDelete by remember { mutableStateOf(false) }
     var showAccountDeletion by remember { mutableStateOf(false) }
@@ -384,7 +388,8 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
         syncStatus = if (user == null) "端末に保存済み" else "バックアップ待ち"
         lastBackupAt = BackupCoordinator.lastSuccessAt(context)
         store.reload()
-        BackupWorker.schedule(context)
+        // The periodic backup only has work while signed in.
+        if (user != null) BackupWorker.schedule(context) else BackupWorker.cancel(context)
         if (autoCapture && !hasLocationPermission(context)) {
             // Explain what is recorded before the system asks; the prompt alone has no context.
             if (introPreferences.getBoolean("location_intro_shown", false)) locationPermission.launch(requiredLocationPermissions(context))
@@ -399,7 +404,9 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     LaunchedEffect(Unit) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (isActive) {
-                delay(60_000)
+                // Uploads from the foreground are batched: the records are the
+                // source of truth, so a few minutes is enough unless the user acts.
+                delay(5 * 60_000)
                 sync()
             }
         }
@@ -422,20 +429,33 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     // null while the selected day is still being prepared.
     var corrections by remember { mutableStateOf<List<TimelineCorrection>>(emptyList()) }
     var timeline by remember(selectedDate) { mutableStateOf<TimelineRenderSnapshot?>(null) }
+    var readFailed by remember { mutableStateOf(false) }
     LaunchedEffect(dayRange, lifecycleOwner, showSettings) {
         if (showSettings) return@LaunchedEffect
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             // Only the selected day is read into memory; it is read again whenever the stored records change.
             snapshotFlow { store.revision }.collectLatest {
-                val visible = store.entriesBetween(dayRange.first, dayRange.last + 1)
-                // Corrections and places change the timeline, so they are read
-                // with the records instead of from a state that may lag behind.
-                val dayCorrections = store.corrections()
-                val namedPlaces = store.places()
-                corrections = dayCorrections
-                NamedPlaces.places = namedPlaces
-                timeline = withContext(Dispatchers.Default) {
-                    prepareTimeline(visible, TimelineAdjustments(dayCorrections, namedPlaces))
+                try {
+                    val visible = store.entriesBetween(dayRange.first, dayRange.last + 1)
+                    // Corrections and places change the timeline, so they are read
+                    // with the records instead of from a state that may lag behind.
+                    val dayCorrections = store.corrections()
+                    val namedPlaces = store.places()
+                    corrections = dayCorrections
+                    NamedPlaces.places = namedPlaces
+                    timeline = withContext(Dispatchers.Default) {
+                        prepareTimeline(visible, TimelineAdjustments(dayCorrections, namedPlaces))
+                    }
+                    readFailed = false
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // A database that cannot be read must not take the app down;
+                    // say so once and keep the screen it had.
+                    if (!readFailed) {
+                        readFailed = true
+                        status = "記録を読み込めませんでした。端末の空き容量を確認してください"
+                    }
                 }
             }
         }
@@ -550,7 +570,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
     Box(Modifier.fillMaxSize()) {
         if (showSettings) {
             SettingsScreen(
-                SettingsState(autoCapture, locationAccess, photoAccess, photoLocationAccess, sleepAccess.takeIf { sleepAvailable }, syncStatus, lastBackupAt, user),
+                SettingsState(autoCapture, locationAccess, photoAccess, photoLocationAccess, sleepAccess.takeIf { sleepAvailable }, syncStatus, lastBackupAt, rejectedCount, user),
                 SettingsActions(
                     onBack = { showSettings = false },
                     onCapture = ::requestLocation,
@@ -573,6 +593,7 @@ internal fun TrackerHome(user: RemoUser?, onSignOut: () -> Unit, onDeleteAccount
                 allPlaces = allPlaces,
                 periodStays = periodStays,
                 stayIndexProgress = stayIndex.progress,
+                stayIndexFailed = stayIndex.error,
                 placePeriod = placePeriod,
                 selectedPlaceId = selectedPlaceId,
                 savedAllPlacesCamera = savedAllPlacesCamera,
@@ -756,6 +777,7 @@ private fun TimelineHome(
     allPlaces: List<AllTimeStayPlace>?,
     periodStays: List<StaySummary>?,
     stayIndexProgress: StayIndexProgress?,
+    stayIndexFailed: Boolean,
     placePeriod: PlacePeriod,
     selectedPlaceId: String?,
     savedAllPlacesCamera: SavedCamera,
@@ -817,6 +839,7 @@ private fun TimelineHome(
                         places = allPlaces,
                         stays = periodStays,
                         progress = stayIndexProgress,
+                        failed = stayIndexFailed,
                         period = placePeriod,
                         selectedPlaceId = selectedPlaceId,
                         listState = placesListState,

@@ -85,8 +85,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.google.android.gms.maps.model.LatLng
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 /** Collapsed sheet: handle + day header + summary chips. */
 internal val SheetPeekContentHeight = 124.dp
@@ -649,8 +647,7 @@ internal fun PhotoThumbnail(entry: LogEntry, libraryPhoto: LibraryPhoto?, modifi
     val context = LocalContext.current
     var thumbnail by remember(entry.id, libraryPhoto?.id) { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(entry.id, libraryPhoto) {
-        thumbnail = withContext(Dispatchers.IO) { libraryPhoto?.let { PhotoLibrary.loadThumbnail(context, it, requestSize) } }
-            ?: runCatching { PhotoBackup.remoteThumbnail(entry.id) }.getOrNull()
+        thumbnail = runCatching { loadPhotoThumbnail(context, entry, libraryPhoto, requestSize) }.getOrNull()
     }
     val isVideo = entry.mediaType == MediaType.VIDEO
     Box(modifier.clip(MaterialTheme.shapes.small).background(AppColors.amberContainer).clickable(onClick = onClick), contentAlignment = Alignment.Center) {

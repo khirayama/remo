@@ -112,10 +112,10 @@ export function TextField({ label, leading, trailing, supporting, error, classNa
 }
 
 /** Material 3 AlertDialog: 28px corners, optional icon, text actions. */
-export function Dialog({ icon, iconTone = "neutral", title, children, actions, onDismiss, label }: { icon?: IconName; iconTone?: "danger" | "neutral"; title: string; children?: ReactNode; actions: ReactNode; onDismiss: () => void; label?: string }) {
+export function Dialog({ icon, iconTone = "neutral", title, children, actions, onDismiss, dismissable = true, label }: { icon?: IconName; iconTone?: "danger" | "neutral"; title: string; children?: ReactNode; actions: ReactNode; onDismiss: () => void; /** False when only the actions may close it (content that cannot be shown again). */ dismissable?: boolean; label?: string }) {
   const cardRef = useModalFocus<HTMLElement>();
-  useEscape(onDismiss);
-  return <div className="scrim dialog-scrim" onMouseDown={(event) => event.target === event.currentTarget && onDismiss()}>
+  useEscape(dismissable ? onDismiss : () => undefined);
+  return <div className="scrim dialog-scrim" onMouseDown={(event) => { if (dismissable && event.target === event.currentTarget) onDismiss(); }}>
     <section ref={cardRef} data-modal tabIndex={-1} className={`alert-dialog${icon ? " with-icon" : ""}`} role="dialog" aria-modal="true" aria-label={label ?? title}>
       {icon && <Icon name={icon} className={`alert-dialog-icon ${iconTone}`}/>}
       <h2>{title}</h2>

@@ -34,7 +34,8 @@ struct TimelineHomeView: View {
     let logs: [LogEntry]
     /// The day `logs` belong to; it trails `date` while a day is being read.
     let logsDate: Date?
-    let assets: [PHAsset]
+    /// The library organized once per change; rows and markers look up their photo here.
+    let assetIndex: PhotoAssetIndex<PHAsset>
     /// Sleep that ended on `date`, read from HealthKit.
     let sleep: [SleepSession]
     /// Bedtimes and wake-ups on `date`, including tonight's bedtime.
@@ -117,7 +118,7 @@ struct TimelineHomeView: View {
                         snapshotRevision: snapshotRevision,
                         loaded: loaded,
                         viewKey: date,
-                        assets: assets,
+                        assetIndex: assetIndex,
                         stayLabels: placeResolver.labels,
                         focus: focus,
                         insets: insets,
@@ -173,7 +174,7 @@ struct TimelineHomeView: View {
         .task(id: replayPhoto?.id) {
             // The marker's thumbnail is too small for the pop, so a larger one is loaded for it.
             guard let cluster = replayPhoto, let first = cluster.entries.first else { return }
-            let image: UIImage? = if let asset = nearestPhotoAsset(first, assets: assets) {
+            let image: UIImage? = if let asset = assetIndex.nearest(to: first) {
                 await PhotoLibraryStore.thumbnail(for: asset, size: CGSize(width: 480, height: 480))
             } else {
                 await PhotoBackup.remoteThumbnail(eventID: first.id)
@@ -242,7 +243,7 @@ struct TimelineHomeView: View {
             if let pendingEdit { onEditPhoto(pendingEdit) }
             pendingEdit = nil
         }) { selection in
-            PhotoListSheet(entries: selection.entries, assets: assets, onClose: { photoSelection = nil }) { entry in
+            PhotoListSheet(entries: selection.entries, assetIndex: assetIndex, onClose: { photoSelection = nil }) { entry in
                 pendingEdit = entry
                 photoSelection = nil
             }
@@ -365,7 +366,7 @@ struct TimelineHomeView: View {
                 date: date,
                 snapshot: snapshot,
                 loaded: loaded,
-                assets: assets,
+                assetIndex: assetIndex,
                 sleep: sleep,
                 isCapturing: isCapturing,
                 labels: placeResolver.labels,
@@ -720,7 +721,7 @@ private struct TimelineSheetList: View {
     let date: Date
     let snapshot: TimelineRenderSnapshot
     let loaded: Bool
-    let assets: [PHAsset]
+    let assetIndex: PhotoAssetIndex<PHAsset>
     let sleep: [SleepSession]
     let isCapturing: Bool
     let labels: [String: StayPlaceLabel]
@@ -768,7 +769,7 @@ private struct TimelineSheetList: View {
                                     isFirst: isFirst,
                                     isLast: isLast,
                                     selected: selectedActivityID == activity.id,
-                                    assets: assets,
+                                    assetIndex: assetIndex,
                                     canJoinPrevious: previousStays[activity.id] != nil,
                                     onClick: { onFocus(activity) },
                                     onSelectPhotos: onSelectPhotos,
@@ -781,7 +782,7 @@ private struct TimelineSheetList: View {
                                     if let coordinate = activity.coordinate { onOpenHistory(PlaceHistoryTarget(coordinate: coordinate, label: labels[activity.id])) }
                                 }
                             case let .photos(entries):
-                                PhotoGroupRow(entries: entries, isFirst: isFirst, isLast: isLast, assets: assets) { onSelectPhotos(entries) }
+                                PhotoGroupRow(entries: entries, isFirst: isFirst, isLast: isLast, assetIndex: assetIndex) { onSelectPhotos(entries) }
                             case let .sleep(session):
                                 SleepRow(session: session, isFirst: isFirst, isLast: isLast)
                             }
@@ -926,7 +927,7 @@ private struct ActivityRow: View {
     let isFirst: Bool
     let isLast: Bool
     let selected: Bool
-    let assets: [PHAsset]
+    let assetIndex: PhotoAssetIndex<PHAsset>
     /// Whether a stay earlier on the same day can be joined to this one.
     let canJoinPrevious: Bool
     let onClick: () -> Void
@@ -956,7 +957,7 @@ private struct ActivityRow: View {
                 }
                 ForEach(sleep, id: \.startedAt) { SleepLine(session: $0) }
                 if !activity.photos.isEmpty {
-                    PhotoStrip(entries: activity.photos, assets: assets) { onSelectPhotos(activity.photos) }
+                    PhotoStrip(entries: activity.photos, assetIndex: assetIndex) { onSelectPhotos(activity.photos) }
                 }
                 if isStay, selected {
                     Button(action: onOpenHistory) {
@@ -1099,7 +1100,7 @@ private struct PhotoGroupRow: View {
     let entries: [LogEntry]
     let isFirst: Bool
     let isLast: Bool
-    let assets: [PHAsset]
+    let assetIndex: PhotoAssetIndex<PHAsset>
     let onClick: () -> Void
 
     var body: some View {
@@ -1110,7 +1111,7 @@ private struct PhotoGroupRow: View {
             RowCard(selected: false, selectedColor: .clear, action: onClick) {
                 RowTitle(title: mediaSummary(entries), trailing: nil)
                 if entries.allSatisfy({ !hasUsableCoordinates($0.latitude, $0.longitude) }) { RowSubtitle(text: "位置情報なし") }
-                PhotoStrip(entries: entries, assets: assets, onOpen: onClick)
+                PhotoStrip(entries: entries, assetIndex: assetIndex, onOpen: onClick)
             }
         }
     }
@@ -1118,7 +1119,7 @@ private struct PhotoGroupRow: View {
 
 private struct PhotoStrip: View {
     let entries: [LogEntry]
-    let assets: [PHAsset]
+    let assetIndex: PhotoAssetIndex<PHAsset>
     let onOpen: () -> Void
 
     var body: some View {
@@ -1127,7 +1128,7 @@ private struct PhotoStrip: View {
         HStack(spacing: 6) {
             ForEach(Array(visible.enumerated()), id: \.element.id) { index, entry in
                 Button(action: onOpen) {
-                    PhotoThumbnail(entry: entry, asset: nearestPhotoAsset(entry, assets: assets), overlay: index == visible.count - 1 && hidden > 0 ? "+\(hidden)" : nil)
+                    PhotoThumbnail(entry: entry, asset: assetIndex.nearest(to: entry), overlay: index == visible.count - 1 && hidden > 0 ? "+\(hidden)" : nil)
                         .frame(width: 52, height: 52)
                 }
                 .buttonStyle(.plain)

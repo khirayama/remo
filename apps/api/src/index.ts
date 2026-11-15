@@ -136,8 +136,17 @@ export const limitUserRequests: MiddlewareHandler<AppContext> = async (c, next) 
   await next();
 };
 
+// Every response under /api/v1 holds the signed-in user's records. A shared
+// cache, or the browser's own, must not keep them: the routes that can set a
+// Cache-Control themselves (photo images: a private max-age) keep theirs.
+export const noStoreCache: MiddlewareHandler<AppContext> = async (c, next) => {
+  await next();
+  if (!c.res.headers.has("Cache-Control")) c.res.headers.set("Cache-Control", "no-store");
+};
+
 const authed = new Hono<AppContext>();
 authed.use("*", requireUser);
+authed.use("*", noStoreCache);
 authed.use("*", limitUserRequests);
 authed.get("/me", (c) => c.json({ data: c.get("user") }));
 authed.route("/", lifeEventRoutes);

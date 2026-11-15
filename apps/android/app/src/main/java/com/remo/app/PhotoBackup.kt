@@ -3,6 +3,7 @@ package com.remo.app
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.LruCache
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -19,6 +20,8 @@ object PhotoBackup {
             setRequestProperty("Authorization", "Bearer $token")
             connectTimeout = 15_000
             readTimeout = 30_000
+            // A redirect would carry the bearer token to another URL.
+            instanceFollowRedirects = false
         }
 
     private fun jpeg(bitmap: Bitmap): ByteArray? {
@@ -38,9 +41,30 @@ object PhotoBackup {
         return null
     }
 
-    /** What the last complete pass covered; nothing is scanned again until one of these changes. */
-    private data class CompletedPass(val account: String, val indexGeneration: Long, val photoRevision: Long)
+    /**
+     * What the last complete pass covered. Only the photo records matter: the
+     * rest of the timeline changes every few seconds while recording, and
+     * including it would walk the whole library on every backup. A change in
+     * which records the server refused does matter, so its count is part of it.
+     */
+    private data class CompletedPass(val account: String, val indexGeneration: Long, val photoCount: Int, val newestPhotoUpdate: Long, val rejectedCount: Int)
     @Volatile private var completedPass: CompletedPass? = null
+
+    // A preview never changes for its digest, so it is kept until the cache is
+    // full. Images are bounded by memory, not only by count: a decoded preview
+    // is a bitmap and a long photo sheet would otherwise hold hundreds.
+    private const val IMAGE_CACHE_BYTES = 32 * 1024 * 1024
+    private const val DIGEST_CACHE_ENTRIES = 200
+    private val images = object : LruCache<String, Bitmap>(IMAGE_CACHE_BYTES) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+    private val digestLists = LruCache<String, List<String>>(DIGEST_CACHE_ENTRIES)
+
+    /** After the records are deleted the cached previews no longer belong to anything. */
+    fun clearCache() {
+        images.evictAll()
+        digestLists.evictAll()
+    }
 
     private fun requireReachable(code: Int) {
         if (code == 401) throw ApiException(401, "Authentication required", "unauthorized")
@@ -54,11 +78,14 @@ object PhotoBackup {
         val account = SecureTokenStore.accountId() ?: return@withContext false
         val store = LogStore.get(context)
         val index = PhotoIndexStore.get(context)
-        val pass = CompletedPass(account, PhotoLibrary.indexGeneration, store.revision)
+        val photos = store.photoEntries()
+        // The server refused these records, so it has nowhere to put their previews.
+        val rejected = store.rejectedPhotoIds()
+        val pass = CompletedPass(account, PhotoLibrary.indexGeneration, photos.size, photos.maxOfOrNull(LogEntry::updatedAt) ?: 0L, rejected.size)
         // Walking the whole library on every backup is wasted work when neither
-        // the library nor the records changed since everything was uploaded.
+        // the library nor the photo records changed since everything was uploaded.
         if (completedPass == pass) return@withContext false
-        val active = store.photoEntries().mapTo(HashSet()) { it.id }
+        val active = photos.mapTo(HashSet(), LogEntry::id).apply { removeAll(rejected) }
         val markers = index.uploadedMarkers(account).toMutableMap()
         val manifests = index.pendingManifests()
         /** Digests of the previews each record waiting for a manifest still has; null once one is unknown. */
@@ -92,18 +119,32 @@ object PhotoBackup {
                 request.setFixedLengthStreamingMode(bytes.size)
                 request.doOutput = true
                 request.outputStream.use { it.write(bytes) }
-                requireReachable(request.responseCode)
-                if (request.responseCode !in 200..299) return@withContext true
-                index.markUploaded(account, marker, digest)
-                markers[marker] = digest
-                digests[eventId]?.add(digest)
-                uploaded++
+                val code = request.responseCode
+                requireReachable(code)
+                when {
+                    code in 200..299 -> {
+                        index.markUploaded(account, marker, digest)
+                        markers[marker] = digest
+                        digests[eventId]?.add(digest)
+                        uploaded++
+                    }
+                    // This one record cannot be uploaded now (the record is not
+                    // in the backup yet, the preview is too large, or the
+                    // account's previews are full): skip it and upload the rest,
+                    // but do not call the pass complete.
+                    code == 507 || (code in 400..499 && code != 429) -> unavailable = true
+                    // Rate limited or the server is unwell: stop this pass.
+                    else -> return@withContext true
+                }
             } finally { request.disconnect() }
         }
         var manifestsPending = false
         for (eventId in manifests) {
             val current = digests[eventId]
             when {
+                // The record itself could not be uploaded. Its preview list is
+                // sent once an edit gets the record into the backup.
+                eventId in rejected -> Unit
                 // The record is gone; deleting it removed its previews.
                 eventId !in active -> index.clearPendingManifest(eventId)
                 // A record always keeps at least one photo. An empty list means its
@@ -142,21 +183,39 @@ object PhotoBackup {
     }
 
     suspend fun remoteIDs(eventId: String): List<String> = withContext(Dispatchers.IO) {
+        digestLists.get(eventId)?.let { return@withContext it }
         val token = SecureTokenStore.get() ?: return@withContext emptyList()
         val list = connection(eventId, token)
         try {
             if (list.responseCode != 200) return@withContext emptyList()
             val array = JSONObject(list.inputStream.bufferedReader().use { it.readText() }).getJSONArray("data")
-            (0 until array.length()).map(array::getString)
+            val ids = (0 until array.length()).map(array::getString)
+            // An empty answer can mean the preview is not uploaded yet, so it
+            // is asked for again next time instead of remembered.
+            if (ids.isEmpty()) return@withContext emptyList()
+            digestLists.put(eventId, ids)
+            ids
         } finally { list.disconnect() }
     }
 
     suspend fun remoteImage(eventId: String, digest: String): Bitmap? = withContext(Dispatchers.IO) {
+        val key = "$eventId/$digest"
+        images.get(key)?.let { return@withContext it }
         val token = SecureTokenStore.get() ?: return@withContext null
         val image = connection("$eventId/$digest", token)
         try {
             if (image.responseCode != 200) return@withContext null
-            image.inputStream.use { BitmapFactory.decodeStream(it) }
+            image.inputStream.use { BitmapFactory.decodeStream(it) }?.also { images.put(key, it) }
         } finally { image.disconnect() }
     }
 }
+
+/**
+ * A photo's thumbnail for the screens: the asset on this device when the
+ * library still has it, otherwise the backed-up preview through the shared
+ * cache. Every caller goes through here so none of them fetches its own copy.
+ */
+internal suspend fun loadPhotoThumbnail(context: Context, entry: LogEntry, libraryPhoto: LibraryPhoto?, size: Int): Bitmap? =
+    withContext(Dispatchers.IO) {
+        libraryPhoto?.let { PhotoLibrary.loadThumbnail(context, it, size) } ?: PhotoBackup.remoteThumbnail(entry.id)
+    }

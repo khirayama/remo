@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { AppContext } from "./auth";
-import { MAX_CLIENT_CLOCK_SKEW_MS } from "./life-events";
+import { advanceSequenceStatement, MAX_CLIENT_CLOCK_SKEW_MS } from "./life-events";
 
 // Sleep sessions backed up from the device so the web app can show them. A
 // device reads its sessions from Health Connect / HealthKit and sends the ones
@@ -137,14 +137,26 @@ sleepRoutes.post("/sleep/batch", async (c) => {
         return c.json({ error: { code: "storage_limit", message: "The sleep session limit has been reached" } }, 507);
       }
     }
+    // A device resends the nights it read with every sync. An identical copy
+    // takes no write; an equal updatedAt with a different span is a real edit
+    // (a retry after the clock did not move) and is applied.
     const results = await db.batch(sessions.map((session) => db.prepare(
       `INSERT INTO sleep_session (user_id, id, started_at, ended_at, updated_at)
        VALUES (?1, ?2, ?3, ?4, ?5)
        ON CONFLICT(user_id, id) DO UPDATE SET
          started_at = excluded.started_at, ended_at = excluded.ended_at, updated_at = excluded.updated_at
-       WHERE excluded.updated_at >= sleep_session.updated_at`,
+       WHERE excluded.updated_at > sleep_session.updated_at
+         OR (excluded.updated_at = sleep_session.updated_at
+           AND (excluded.started_at IS NOT sleep_session.started_at
+             OR excluded.ended_at IS NOT sleep_session.ended_at))`,
     ).bind(userId, session.id, session.startedAt, session.endedAt, session.updatedAt)));
     changed = results.reduce((sum, result) => sum + (result.meta?.changes ?? 0), 0);
+    if (changed) {
+      // Sleep rows carry the client clock, not the sequence, but a write still
+      // moves the sync cursor so other devices read the list again; they skip
+      // that read while the cursor stands still.
+      await advanceSequenceStatement(db, userId, changed, 0).run();
+    }
   }
 
   return c.json({

@@ -88,7 +88,7 @@ internal object StayIndexStorage {
 
 internal data class StayIndexProgress(val done: Int, val total: Int)
 
-internal data class StayIndexState(val stays: List<StaySummary>? = null, val progress: StayIndexProgress? = null)
+internal data class StayIndexState(val stays: List<StaySummary>? = null, val progress: StayIndexProgress? = null, val error: Boolean = false)
 
 /** Continuous capture changes today's records every few seconds; batch those updates. */
 private const val STAY_INDEX_DEBOUNCE_MS = 1_000L
@@ -104,45 +104,53 @@ internal fun rememberStayIndex(context: Context, store: LogStore): StayIndexStat
     val holder = remember { StayIndexHolder() }
     LaunchedEffect(store.revision) {
         if (holder.cache != null) delay(STAY_INDEX_DEBOUNCE_MS)
-        // A superseded update may still be finishing a day; it stops before the next one.
-        holder.mutex.withLock {
-            val stays = withContext(Dispatchers.Default) {
-                val timeZone = TimeZone.getDefault().id
-                val cache = holder.cache?.takeIf { it.timeZone == timeZone }
-                    ?: StayIndexStorage.load(context, timeZone).also { holder.cache = it }
-                val today = dayKey(System.currentTimeMillis())
-                val dirty = store.dirtyDays()
-                // Places are left out of the cache; the views match them when shown.
-                val corrections = store.corrections()
-                // The first pass covers every recorded day; an interrupted pass
-                // continues with the days it has not reached.
-                val days = if (cache.complete) dirty.map(DirtyDay::day)
-                    else store.recordedDays().filter { it !in cache.days } + dirty.map(DirtyDay::day)
-                val tokens = dirty.associateBy(DirtyDay::day)
-                var unsaved = 0
-                try {
-                    val result = refreshStayIndex(
-                        cache, days, today,
-                        loadDay = { day -> store.entriesOfDay(day) },
-                        onDay = { day ->
-                            tokens[day]?.let { store.clearDirtyDays(listOf(it)) }
-                            unsaved += 1
-                        },
-                        onProgress = { done, total -> withContext(Dispatchers.Main) { state = state.copy(progress = StayIndexProgress(done, total)) } },
-                        corrections = corrections,
-                    )
-                    if (!cache.complete) cache.complete = true
-                    if (result.changed || unsaved > 0) StayIndexStorage.save(context, cache)
-                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                    // Keep the days that were finished before the update was superseded.
-                    if (unsaved > 0) StayIndexStorage.save(context, cache)
-                    throw cancelled
+        try {
+            // A superseded update may still be finishing a day; it stops before the next one.
+            holder.mutex.withLock {
+                val stays = withContext(Dispatchers.Default) {
+                    val timeZone = TimeZone.getDefault().id
+                    val cache = holder.cache?.takeIf { it.timeZone == timeZone }
+                        ?: StayIndexStorage.load(context, timeZone).also { holder.cache = it }
+                    val today = dayKey(System.currentTimeMillis())
+                    val dirty = store.dirtyDays()
+                    // Places are left out of the cache; the views match them when shown.
+                    val corrections = store.corrections()
+                    // The first pass covers every recorded day; an interrupted pass
+                    // continues with the days it has not reached.
+                    val days = if (cache.complete) dirty.map(DirtyDay::day)
+                        else store.recordedDays().filter { it !in cache.days } + dirty.map(DirtyDay::day)
+                    val tokens = dirty.associateBy(DirtyDay::day)
+                    var unsaved = 0
+                    try {
+                        val result = refreshStayIndex(
+                            cache, days, today,
+                            loadDay = { day -> store.entriesOfDay(day) },
+                            onDay = { day ->
+                                tokens[day]?.let { store.clearDirtyDays(listOf(it)) }
+                                unsaved += 1
+                            },
+                            onProgress = { done, total -> withContext(Dispatchers.Main) { state = state.copy(progress = StayIndexProgress(done, total)) } },
+                            corrections = corrections,
+                        )
+                        if (!cache.complete) cache.complete = true
+                        if (result.changed || unsaved > 0) StayIndexStorage.save(context, cache)
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        // Keep the days that were finished before the update was superseded.
+                        if (unsaved > 0) StayIndexStorage.save(context, cache)
+                        throw cancelled
+                    }
+                    // Today (and any record dated later) is detected on every update.
+                    val openDays = (listOf(today) + dirty.map(DirtyDay::day).filter { it > today }).distinct()
+                    allStays(cache, openDays.flatMap { day -> detectDayStays(store.entriesOfDay(day), corrections) })
                 }
-                // Today (and any record dated later) is detected on every update.
-                val openDays = (listOf(today) + dirty.map(DirtyDay::day).filter { it > today }).distinct()
-                allStays(cache, openDays.flatMap { day -> detectDayStays(store.entriesOfDay(day), corrections) })
+                state = StayIndexState(stays)
             }
-            state = StayIndexState(stays)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // A database that cannot be read must not take the app down; the
+            // sheet says the stays could not be worked out.
+            state = state.copy(progress = null, error = true)
         }
     }
     return state

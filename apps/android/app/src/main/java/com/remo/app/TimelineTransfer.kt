@@ -57,7 +57,9 @@ internal fun validateImportEventCount(count: Int) {
 
 private fun decodeTimelineEvent(value: JSONObject?, importedAt: Long): LogEntry? {
     if (value == null) return null
-    val id = value.optString("id").trim().takeIf { it.isNotEmpty() }?.take(120) ?: return null
+    // The server refuses an id longer than 120 characters; truncating it could
+    // merge two records into one, so such a record is skipped instead.
+    val id = value.optString("id").trim().takeIf { it.isNotEmpty() && it.length <= 120 } ?: return null
     val startedAt = parseTimelineTimestamp(value.opt("startedAt")) ?: return null
     val updatedAt = parseTimelineTimestamp(value.opt("updatedAt")) ?: startedAt
     val latitude = number(value, "latitude")?.toDouble()

@@ -73,7 +73,8 @@ final class LogDatabase: @unchecked Sendable {
 
     /// Called (on any thread) after stored records or places changed.
     var onChange: (@Sendable () -> Void)?
-    /// Called when a write could not be stored, for example on a full disk.
+    /// Called when a write could not be stored, for example on a full disk, or
+    /// when the database could not be opened at all and the write is dropped.
     var onWriteFailure: (@Sendable () -> Void)?
 
     /// [url] nil opens an in-memory database (tests).
@@ -167,7 +168,8 @@ final class LogDatabase: @unchecked Sendable {
 
     private func write(_ work: @escaping (SQLiteConnection) throws -> Bool) {
         queue.async { [self] in
-            guard let connection else { return }
+            // Without a connection every write is dropped; the caller shows why.
+            guard let connection else { onWriteFailure?(); return }
             do {
                 var changed = false
                 try connection.transaction { changed = try work(connection) }
@@ -242,9 +244,11 @@ final class LogDatabase: @unchecked Sendable {
 
     // MARK: Backup
 
-    /// Records that have not been backed up in the current epoch.
+    /// Records that have not been backed up in the current epoch. A record the
+    /// server refused ("upload rejected") stays out: retrying it would produce
+    /// the same answer, and an edit clears the mark.
     func dirtyEntries(limit: Int) -> [LogEntry] {
-        read([]) { try $0.query("SELECT \(Self.columns) FROM entries WHERE synced_epoch < ? LIMIT ?", [.integer(self.epoch), .integer(Int64(limit))], row: Self.entry) }
+        read([]) { try $0.query("SELECT \(Self.columns) FROM entries WHERE synced_epoch < ? AND upload_rejected = 0 LIMIT ?", [.integer(self.epoch), .integer(Int64(limit))], row: Self.entry) }
     }
 
     /// Marks sent records as backed up, unless they were edited while the request was in flight.
@@ -254,6 +258,30 @@ final class LogDatabase: @unchecked Sendable {
             try connection.run("UPDATE entries SET synced_epoch = ? WHERE id = ? AND updated_at = ?", sent.map { [.integer(self.epoch), .text($0.id), .real($0.updatedAt.timeIntervalSince1970)] })
             return false
         }
+    }
+
+    /// Remembers records the server refused with the message it gave. They are
+    /// not uploaded again until the record changes here; the settings screen
+    /// counts them so the backup does not look complete.
+    func markUploadRejected(_ rejected: [(entry: LogEntry, message: String)]) {
+        guard !rejected.isEmpty else { return }
+        write { connection in
+            try connection.run(
+                "UPDATE entries SET upload_rejected = 1, upload_error = ? WHERE id = ? AND updated_at = ?",
+                rejected.map { [.text($0.message), .text($0.entry.id), .real($0.entry.updatedAt.timeIntervalSince1970)] },
+            )
+            return false
+        }
+    }
+
+    /// Records the backup cannot hold.
+    func rejectedCount() -> Int {
+        read(0) { try $0.query("SELECT COUNT(*) FROM entries WHERE upload_rejected = 1") { $0.integer(0) }.first.map(Int.init) ?? 0 }
+    }
+
+    /// The ids of records the server refused; their previews are not uploaded.
+    func rejectedEntryIDs() -> Set<String> {
+        read([]) { Set(try $0.query("SELECT id FROM entries WHERE upload_rejected = 1") { $0.text(0) }.compactMap { $0 }) }
     }
 
     func pendingDeletions(limit: Int) -> [PendingDeletion] {
@@ -282,7 +310,7 @@ final class LogDatabase: @unchecked Sendable {
     func hasPendingChanges() -> Bool {
         read(false) { connection in
             try connection.query(
-                "SELECT EXISTS (SELECT 1 FROM entries WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM pending_deletes) OR EXISTS (SELECT 1 FROM places WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM corrections WHERE synced_epoch < ?1)",
+                "SELECT EXISTS (SELECT 1 FROM entries WHERE synced_epoch < ?1 AND upload_rejected = 0) OR EXISTS (SELECT 1 FROM pending_deletes) OR EXISTS (SELECT 1 FROM places WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM corrections WHERE synced_epoch < ?1)",
                 [.integer(self.epoch)],
             ) { $0.integer(0) }.first == 1
         }
@@ -539,7 +567,8 @@ final class LogDatabase: @unchecked Sendable {
     private func store(_ connection: SQLiteConnection, _ entry: LogEntry, syncedEpoch: Int64) throws {
         if let previous = try Self.entry(connection, id: entry.id), previous.startedAt != entry.startedAt { try markDay(connection, previous.startedAt) }
         try markDay(connection, entry.startedAt)
-        try connection.run("INSERT OR REPLACE INTO entries (\(Self.columns), synced_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", Self.values(entry) + [.integer(syncedEpoch)])
+        // A locally changed record is no longer "rejected": an edit retries it.
+        try connection.run("INSERT OR REPLACE INTO entries (\(Self.columns), synced_epoch, upload_rejected, upload_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)", Self.values(entry) + [.integer(syncedEpoch)])
     }
 
     private static let placeColumns = "id, name, latitude, longitude, updated_at, deleted, radius_meters, anchors, merged_into"
@@ -759,6 +788,18 @@ final class LogDatabase: @unchecked Sendable {
                     );
                     CREATE INDEX IF NOT EXISTS corrections_sync ON corrections(synced_epoch);
                     PRAGMA user_version = 3;
+                    """)
+            }
+        }
+        if version < 4 {
+            // A record the server refused is kept out of the upload queue until
+            // it is edited, and the message explains why in the settings.
+            try connection.transaction {
+                try connection.execute("""
+                    ALTER TABLE entries ADD COLUMN upload_rejected INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE entries ADD COLUMN upload_error TEXT;
+                    CREATE INDEX IF NOT EXISTS entries_rejected ON entries(upload_rejected);
+                    PRAGMA user_version = 4;
                     """)
             }
         }

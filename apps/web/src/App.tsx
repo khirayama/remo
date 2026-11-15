@@ -3,9 +3,9 @@ import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { ApiTokenDialog } from "./ApiTokenDialog";
 import { authClient } from "./auth-client";
-import { deleteAccount, deleteAllCloudData, synchronizeEvents } from "./life-api";
+import { deleteAccount, deleteAllCloudData, SyncFailure, synchronizeEvents, UnauthorizedError } from "./life-api";
 import { claimRecords, clearEvents, Correction, countUnsavedEvents, dateKey, downloadExport, ExportRange, ExportSummary, forgetAccount, lastBackupKey, LifeEvent, loadDayEvents, loadUploadedPhotos, localDeviceStorageId, migrateLegacyTimeline, newCorrection, Ownership, ownershipFor, Place, readImport, readImportExtras, rememberUploadedPhoto, replaceRecords, storeImported, storeImportExtras, summarizeRange } from "./life-log";
-import { clearDirtyDays, countEvents, deleteLocalEvents, listRecordedDays, loadCorrections, loadDirtyDays, loadEvent, loadEventsInRange, loadStoredPlaces, putLocalCorrections, putLocalEvents, putLocalPlace, requestPersistentStorage, storageUsage, StorageUsage } from "./timeline-db";
+import { clearDirtyDays, countEvents, deleteLocalEvents, listRecordedDays, loadCorrections, loadDirtyDays, loadEvent, loadEventsInRange, loadRejectedEventIds, loadStoredPlaces, putLocalCorrections, putLocalEvents, putLocalPlace, requestPersistentStorage, storageUsage, StorageUsage } from "./timeline-db";
 import { dayRange } from "./day";
 import { fetchSleepSessions, SleepSession } from "./sleep-api";
 import { buildSheetItems, daySummary, sleepStartedBefore } from "./timeline-sheet";
@@ -49,6 +49,26 @@ const TILE_URL = import.meta.env.VITE_MAP_TILE_URL || "https://{s}.tile.openstre
 const TILE_ATTRIBUTION = import.meta.env.VITE_MAP_TILE_ATTRIBUTION || "© OpenStreetMap";
 /** Remote previews are fetched a few at a time so a day with many photos does not flood the API. */
 const REMOTE_PREVIEW_CONCURRENCY = 4;
+/** Object URLs kept for previews: a few days' worth, so going back does not fetch them again. */
+const PREVIEW_URL_LIMIT = 300;
+
+/**
+ * Frees the URLs of previews that left the screen, oldest first, and forgets
+ * that they were loaded so a later visit loads them again. Returns whether any went.
+ */
+function trimPreviewUrls(urls: Map<string, string>, visible: Set<string>, attempted: Set<string>): boolean {
+  let removed = false;
+  for (const id of [...urls.keys()]) {
+    if (urls.size <= PREVIEW_URL_LIMIT) break;
+    if (visible.has(id)) continue;
+    const url = urls.get(id);
+    if (url) URL.revokeObjectURL(url);
+    urls.delete(id);
+    attempted.delete(id);
+    removed = true;
+  }
+  return removed;
+}
 
 /** Unassigned photos taken within this gap of each other share one timeline row. */
 const DESKTOP_QUERY = "(min-width: 721px)";
@@ -944,22 +964,31 @@ function PhotoListSheet({ photos, previews, signedIn, onClose, onEditLocation }:
   const [selectedPhoto, setSelectedPhoto] = useState<{ photo: LifeEvent; url?: string }>();
   const [remotePhotos, setRemotePhotos] = useState<Map<string, string[]>>(new Map());
   const sorted = useMemo(() => [...photos].sort((a, b) => a.startedAt.localeCompare(b.startedAt)), [photos]);
+  // The previews on screen arrive while the sheet is open; reading through a
+  // ref keeps them from restarting (and revoking) this load.
+  const previewsRef = useRef(previews);
+  previewsRef.current = previews;
   useEffect(() => {
     // Without an account there is no backup to read the other previews from.
     if (!signedIn) return;
     let cancelled = false;
     const urls: string[] = [];
+    // A record that already has a preview needs no request; only the others
+    // are read from the backup, a few at a time.
+    const missing = sorted.filter((photo) => !previewsRef.current.has(photo.id));
     void (async () => {
-      for (const photo of sorted) {
-        // Videos back up their poster-frame preview like photos.
-        const blobs = await loadRemotePhotoPreviews(photo.id).catch(() => []);
-        if (cancelled) break;
-        const images = blobs.map((blob) => URL.createObjectURL(blob));
-        urls.push(...images);
-        setRemotePhotos((current) => new Map(current).set(photo.id, images));
+      for (let index = 0; index < missing.length && !cancelled; index += REMOTE_PREVIEW_CONCURRENCY) {
+        await Promise.all(missing.slice(index, index + REMOTE_PREVIEW_CONCURRENCY).map(async (photo) => {
+          // Videos back up their poster-frame preview like photos.
+          const blobs = await loadRemotePhotoPreviews(photo.id).catch(() => []);
+          if (cancelled) return;
+          const images = blobs.map((blob) => URL.createObjectURL(blob));
+          urls.push(...images);
+          setRemotePhotos((current) => new Map(current).set(photo.id, images));
+        }));
       }
     })();
-    return () => { cancelled = true; urls.forEach(URL.revokeObjectURL); };
+    return () => { cancelled = true; urls.forEach((url) => URL.revokeObjectURL(url)); };
   }, [signedIn, sorted]);
   const first = formatTime(sorted[0].startedAt);
   const last = formatTime(sorted.at(-1)!.startedAt);
@@ -1183,11 +1212,12 @@ function storageSubtitle(usage: StorageUsage | undefined, eventCount: number) {
   return usage.persisted ? used : `${used}（ブラウザが容量不足時に削除する可能性があります。エクスポートかバックアップをおすすめします）`;
 }
 
-function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBackupAt, eventCount, storage, onBack, onToggleCapture, onAddPhotos, onExport, onImport, onDeleteAll, onBackup, onOpenAuth, onSignOut, onDeleteAccount, onOpenApiTokens }: {
+function SettingsScreen({ user, captureEnabled, captureIssue, syncState, rejectedCount, lastBackupAt, eventCount, storage, onBack, onToggleCapture, onAddPhotos, onExport, onImport, onDeleteAll, onBackup, onOpenAuth, onSignOut, onDeleteAccount, onOpenApiTokens }: {
   user?: { id: string; email: string };
   captureEnabled: boolean;
   captureIssue?: string;
   syncState: string;
+  rejectedCount: number;
   lastBackupAt?: string;
   eventCount: number;
   storage?: StorageUsage;
@@ -1214,6 +1244,7 @@ function SettingsScreen({ user, captureEnabled, captureIssue, syncState, lastBac
       </SettingsGroup>
       {user ? <SettingsGroup title="バックアップ">
         <ActionRow icon={lastBackupAt ? "cloudDone" : "cloudUpload"} title={syncState} subtitle={lastBackupAt ? `最終バックアップ ${formatBackupTime(lastBackupAt)}` : "まだバックアップされていません"} trailing={<button type="button" className="text-button" onClick={onBackup}>今すぐ</button>}/>
+        {rejectedCount > 0 && <ActionRow icon="errorOutline" title={`バックアップできない記録 ${rejectedCount}件`} subtitle="サーバーが受け付けなかった記録です。編集すると再送します" as="div"/>}
         <ActionRow icon="person" title={user.email} subtitle="ログイン中"/>
         <ActionRow icon="key" title="AIツールとの接続（MCP）" subtitle="バックアップした滞在や移動をAIツールから読み取れるようにします" trailing={<Chevron/>} onClick={onOpenApiTokens}/>
         <ActionRow icon="logout" title="ログアウト" onClick={onSignOut}/>
@@ -1299,6 +1330,8 @@ type StayIndexState = { stays?: StaySummary[]; progress?: StayIndexProgress };
 
 /** Continuous capture changes today's records every few seconds; batch those updates. */
 const STAY_INDEX_DEBOUNCE_MS = 1000;
+/** Today's stays are detected again at most this often (a sample arrives every 10 s). */
+const STAY_INDEX_TODAY_INTERVAL_MS = 30_000;
 
 function currentTimeZone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -1313,8 +1346,15 @@ function currentTimeZone() {
 function useStayIndex(storageId: string, revision: number): StayIndexState {
   const [state, setState] = useState<StayIndexState>({});
   const cacheRef = useRef<StayIndexCache | undefined>(undefined);
+  // Today's stays from the last detection, kept while a run skips it.
+  const openStaysRef = useRef<StaySummary[]>([]);
+  const todayDetectedAtRef = useRef(0);
+  // Bumped when a run skipped today, so the skipped change is still detected
+  // once the interval has passed even if no further record arrives.
+  const [catchUp, setCatchUp] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
+    let catchUpTimer: number | undefined;
     const timer = window.setTimeout(() => {
       void (async () => {
         const timeZone = currentTimeZone();
@@ -1348,20 +1388,36 @@ function useStayIndex(storageId: string, revision: number): StayIndexState {
         }
         if (changed) void saveStayIndexCache(storageId, JSON.stringify(cache));
         if (result.aborted || controller.signal.aborted) return;
-        // Today (and any record dated later) is detected on every update.
-        const openDays = [...new Set([today, ...dirty.map((entry) => entry.day).filter((day) => day > today)])];
-        const openStays = (await Promise.all(openDays.map(async (day) => detectDayStays(await loadDayEvents(storageId, day), corrections)))).flat();
-        if (!controller.signal.aborted) setState({ stays: allStays(cache, openStays) });
+        // Today (and any record dated later) is detected again on every update,
+        // but a sample arrives every 10 s: detecting it at most every 30 s
+        // keeps the map responsive. Past days come from the cache refreshed
+        // just above, so their results do not change.
+        const sinceToday = Date.now() - todayDetectedAtRef.current;
+        if (sinceToday >= STAY_INDEX_TODAY_INTERVAL_MS) {
+          todayDetectedAtRef.current = Date.now();
+          const openDays = [...new Set([today, ...dirty.map((entry) => entry.day).filter((day) => day > today)])];
+          openStaysRef.current = (await Promise.all(openDays.map(async (day) => detectDayStays(await loadDayEvents(storageId, day), corrections)))).flat();
+        } else if (!controller.signal.aborted) {
+          catchUpTimer = window.setTimeout(() => setCatchUp((value) => value + 1), STAY_INDEX_TODAY_INTERVAL_MS - sinceToday);
+        }
+        if (!controller.signal.aborted) setState({ stays: allStays(cache, openStaysRef.current) });
       })().catch(() => undefined);
     }, cacheRef.current ? STAY_INDEX_DEBOUNCE_MS : 0);
-    return () => { controller.abort(); window.clearTimeout(timer); };
-  }, [revision, storageId]);
+    return () => { controller.abort(); window.clearTimeout(timer); window.clearTimeout(catchUpTimer); };
+  }, [catchUp, revision, storageId]);
   return state;
 }
 
 // ---- Home -----------------------------------------------------------------
 
 const SYNC_SESSION_EXPIRED = "再ログインが必要です";
+// Why a sync stopped, in words that tell the user whether trying again helps.
+const SYNC_STATUS_TEXT: Record<SyncFailure | "offline", string> = {
+  rate_limited: "サーバーが混み合っています · 端末に保存済み",
+  server: "サーバーのエラーが続いています · 端末に保存済み",
+  permanent: "同期できない変更があります · 端末に保存済み",
+  offline: "オフライン · 端末に保存済み",
+};
 const CAPTURE_PREFERENCE_KEY = "remo:location-capture";
 
 function storedCapturePreference(): "on" | "off" | undefined {
@@ -1424,8 +1480,10 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
   const [revision, setRevision] = useState(0);
   // Sleep is never stored locally: it is read from the cloud for the shown day.
   const [daySleep, setDaySleep] = useState<{ date: string; sessions: SleepSession[] }>();
-  // Changes when a backup round-trip finishes, so sleep is read again.
-  const [backupRevision, setBackupRevision] = useState(0);
+  // Changes when a download ran (the head moved), so sleep is read again.
+  const [pullRevision, setPullRevision] = useState(0);
+  // Records the server refused: backed up is not the whole story while any remain.
+  const [rejectedCount, setRejectedCount] = useState(0);
   const [eventCount, setEventCount] = useState(0);
   const [placeNames, setPlaceNames] = useState<Place[]>([]);
   const [corrections, setCorrections] = useState<Correction[]>([]);
@@ -1508,7 +1566,9 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
     } catch {
       setStorageStatus("記録を保存できませんでした。保存容量がいっぱいの場合は、データを出力してから不要な記録を削除してください。");
       if (fromCapture) {
-        setCapturePreference("off");
+        // Stopping is persisted too: otherwise a reload resumes recording
+        // from the preference and fails to save again.
+        saveCapturePreference("off");
         setCaptureStatus("保存できないため停止中");
       }
       return false;
@@ -1529,8 +1589,9 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
       if (!cancelled) setDaySleep({ date: selectedDate, sessions: sessions ?? [] });
     });
     return () => { cancelled = true; };
-  // Local record changes do not affect sleep, which lives only in the cloud.
-  }, [accountId, backupRevision, selectedDate]);
+  // Local record changes do not affect sleep, which lives only in the cloud;
+  // only a download (which may bring a night from another device) does.
+  }, [accountId, pullRevision, selectedDate]);
 
   // The selected day.
   useEffect(() => {
@@ -1606,6 +1667,10 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
     let cancelled = false;
     if (previewAttemptsRef.current.accountId !== previewAccountId) previewAttemptsRef.current = { accountId: previewAccountId, ids: new Set() };
     const attempted = previewAttemptsRef.current.ids;
+    const visible = new Set(visiblePhotosRef.current.map((event) => event.id));
+    // Previews of days that are no longer shown stay for a while, then their
+    // URLs are freed; the ones on screen never are.
+    if (trimPreviewUrls(photoPreviewsRef.current, visible, attempted)) setPhotoPreviews(new Map(photoPreviewsRef.current));
     const missing = visiblePhotosRef.current.filter((event) => !photoPreviewsRef.current.has(event.id) && !attempted.has(event.id));
     if (!missing.length) return;
     missing.forEach((event) => attempted.add(event.id));
@@ -1617,6 +1682,7 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
         settled.add(id);
         if (blob && !next.has(id)) next.set(id, URL.createObjectURL(blob));
       });
+      trimPreviewUrls(next, visible, attempted);
       photoPreviewsRef.current = next;
       setPhotoPreviews(next);
     };
@@ -1649,15 +1715,22 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
     setPhotoPreviews(new Map(photoPreviewsRef.current));
   }
 
+  const sessionEnded = useCallback(() => {
+    // The session ended (expired, or signed out everywhere): say so instead
+    // of looking offline, and let the session state catch up.
+    setSyncState(SYNC_SESSION_EXPIRED);
+    setPhotoStatus("ログインの有効期限が切れました。設定からもう一度ログインしてください");
+    authClient.$store.notify("$sessionSignal");
+  }, []);
+
   const syncNow = useCallback(async (force = false) => {
     if (!accountId || ownership !== "owned") return;
     if (syncInFlightRef.current) return;
     const now = Date.now();
     const lastAttempt = lastSyncAttemptRef.current;
+    // A local change, "今すぐ" or the tab becoming visible syncs right away;
+    // the periodic check does not repeat an attempt inside the same minute.
     if (!force && lastAttempt?.accountId === accountId && now - lastAttempt.at < 60_000) return;
-    // The interval and visibilitychange listener can fire close together.
-    // Do not start another round-trip inside the same minute just because
-    // the tab became visible again.
     lastSyncAttemptRef.current = { accountId, at: now };
     syncInFlightRef.current = true;
     setSyncState("バックアップ中…");
@@ -1668,28 +1741,40 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
         || now - lastPull.at >= 2 * 60_000;
       const result = await synchronizeEvents(storageId, accountId, { pull });
       if (pull && result.online) lastPullAtRef.current = { accountId, at: Date.now() };
+      // The day's sleep comes from the cloud: read it again only when another
+      // device actually wrote something.
+      if (result.pulled) setPullRevision((value) => value + 1);
+      setRejectedCount(result.rejected);
       if (result.removedIds.length) forgetPreviews(result.removedIds);
       if (result.changed) recordsChanged();
       if (result.unauthorized) {
-        // The session ended (expired, or signed out everywhere): say so
-        // instead of looking offline, and let the session state catch up.
-        setSyncState(SYNC_SESSION_EXPIRED);
-        setPhotoStatus("ログインの有効期限が切れました。設定からもう一度ログインしてください");
-        authClient.$store.notify("$sessionSignal");
+        sessionEnded();
         return;
       }
       let photoBackupPending = false;
       if (result.online) {
         const localPhotos = await listLocalPhotoPreviewIds(storageId);
         const uploaded = await loadUploadedPhotos(accountId);
-        const waiting = [...localPhotos].filter((id) => !uploaded.has(id));
+        // A record the server refused gets no preview either; it would only be
+        // refused again.
+        const rejectedRecords = await loadRejectedEventIds(storageId);
+        const waiting = [...localPhotos].filter((id) => !uploaded.has(id) && !rejectedRecords.has(id));
         for (const id of waiting.slice(0, 20)) {
           const event = await loadEvent(storageId, id);
           // A preview without its record is never uploaded. Videos upload their
           // poster-frame preview (makeVideoThumbnail) just like photos.
           if (!event || event.source !== "photo") continue;
-          if (await uploadPhotoPreview(storageId, id).catch(() => false)) await rememberUploadedPhoto(accountId, id);
-          else photoBackupPending = true;
+          const uploadedNow = await uploadPhotoPreview(storageId, id).catch((error: unknown) => {
+            if (error instanceof UnauthorizedError) throw error;
+            return "retry" as const;
+          });
+          if (uploadedNow === "uploaded") await rememberUploadedPhoto(accountId, id);
+          else if (uploadedNow === "retry") {
+            // The whole pass is worth retrying later (rate limit, server fault,
+            // no connection); one record that cannot be uploaded is skipped.
+            photoBackupPending = true;
+            break;
+          }
         }
         photoBackupPending ||= waiting.length > 20;
       }
@@ -1697,24 +1782,30 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
         const completedAt = new Date().toISOString();
         try { localStorage.setItem(lastBackupKey(accountId), completedAt); } catch { /* shown in memory */ }
         setLastBackupAt(completedAt);
-        setSyncState("バックアップ済み");
+        setSyncState(result.rejected > 0 ? `バックアップ済み（${result.rejected}件は送信できません）` : "バックアップ済み");
       } else {
-        setSyncState(result.online ? "バックアップ待ち" : "オフライン · 端末に保存済み");
+        setSyncState(result.online ? "バックアップ待ち" : SYNC_STATUS_TEXT[result.failure ?? "offline"]);
       }
-    } catch {
+    } catch (error) {
       // The periodic and visibility-based retries handle temporary sync failures.
-      setSyncState("オフライン · 端末に保存済み");
+      if (error instanceof UnauthorizedError) {
+        sessionEnded();
+        return;
+      }
+      setSyncState(SYNC_STATUS_TEXT.offline);
     } finally {
       syncInFlightRef.current = false;
-      setBackupRevision((value) => value + 1);
     }
   // forgetPreviews only touches refs and stable setters.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accountId, ownership, recordsChanged, storageId]);
+  }, [accountId, ownership, recordsChanged, sessionEnded, storageId]);
 
   useEffect(() => {
     void syncNow();
-    const timer = window.setInterval(() => { if (document.visibilityState === "visible") void syncNow(); }, 60_000);
+    // Recording saves a sample every ten seconds; the backup is batched over
+    // five minutes. A local change, the tab becoming visible and "今すぐ"
+    // still sync right away.
+    const timer = window.setInterval(() => { if (document.visibilityState === "visible") void syncNow(); }, 5 * 60_000);
     const refreshWhenVisible = () => { if (document.visibilityState === "visible") void syncNow(); };
     document.addEventListener("visibilitychange", refreshWhenVisible);
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", refreshWhenVisible); };
@@ -1900,7 +1991,7 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
     const added: string[] = [];
     try {
       const imported: LifeEvent[] = [];
-      const nextPreviews = new Map(photoPreviewsRef.current);
+      const addedPreviews = new Map<string, string>();
       // One file at a time: decoding many camera originals at once can exhaust memory.
       for (const file of files) {
         const id = crypto.randomUUID();
@@ -1910,10 +2001,14 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
         const thumbnail = await makePhotoThumbnail(file);
         imported.push({ id, startedAt, ...photoLocation, mediaType: file.type.startsWith("video/") ? "video" : "photo", photoCount: 1, source: "photo", updatedAt: new Date().toISOString() });
         // The thumbnail, not the original, is what stays on screen.
-        nextPreviews.set(id, URL.createObjectURL(thumbnail));
+        addedPreviews.set(id, URL.createObjectURL(thumbnail));
         added.push(id);
         await savePhotoPreview(storageId, id, thumbnail);
       }
+      // Previews may have been loaded while the files were decoded: add to the
+      // latest map instead of overwriting those.
+      const nextPreviews = new Map(photoPreviewsRef.current);
+      addedPreviews.forEach((url, id) => nextPreviews.set(id, url));
       photoPreviewsRef.current = nextPreviews;
       setPhotoPreviews(nextPreviews);
       if (!await commit(() => putLocalEvents(storageId, imported))) throw new Error("storage");
@@ -2072,6 +2167,7 @@ function Home({ user, onOpenAuth }: { user?: { id: string; email: string }; onOp
         captureEnabled={captureEnabled}
         captureIssue={captureIssue}
         syncState={syncState}
+        rejectedCount={rejectedCount}
         lastBackupAt={lastBackupAt}
         eventCount={eventCount}
         storage={storage}

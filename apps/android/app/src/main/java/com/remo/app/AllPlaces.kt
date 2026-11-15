@@ -252,6 +252,7 @@ internal fun AllPlacesSheetContent(
     places: List<AllTimeStayPlace>?,
     stays: List<StaySummary>?,
     progress: StayIndexProgress?,
+    failed: Boolean,
     period: PlacePeriod,
     selectedPlaceId: String?,
     listState: LazyListState,
@@ -277,12 +278,17 @@ internal fun AllPlacesSheetContent(
             ) {
                 when {
                     places == null || stays == null -> {
-                        CircularProgressIndicator(Modifier.size(18.dp), color = AppColors.green, strokeWidth = 2.dp)
-                        Text(
-                            "過去の記録を集計しています…" + (progress?.takeIf { it.total > 0 }?.let { " ${it.done}/${it.total}日" } ?: ""),
-                            style = MaterialTheme.typography.bodyMedium.tabular,
-                            color = AppColors.inkSecondary,
-                        )
+                        // A failed read leaves nothing to wait for; the records are still there.
+                        if (failed) {
+                            Text("過去の記録を集計できませんでした", style = MaterialTheme.typography.bodyMedium, color = AppColors.danger)
+                        } else {
+                            CircularProgressIndicator(Modifier.size(18.dp), color = AppColors.green, strokeWidth = 2.dp)
+                            Text(
+                                "過去の記録を集計しています…" + (progress?.takeIf { it.total > 0 }?.let { " ${it.done}/${it.total}日" } ?: ""),
+                                style = MaterialTheme.typography.bodyMedium.tabular,
+                                color = AppColors.inkSecondary,
+                            )
+                        }
                     }
                     places.isEmpty() -> Text("この期間の滞在はありません", style = MaterialTheme.typography.bodyMedium, color = AppColors.inkTertiary)
                     else -> {

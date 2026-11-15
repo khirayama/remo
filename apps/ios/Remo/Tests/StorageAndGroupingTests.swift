@@ -364,4 +364,37 @@ final class StorageAndGroupingTests: XCTestCase {
         XCTAssertEqual(merged[0].distance, 200)
         XCTAssertEqual(merged[0].path.count, 3)
     }
+
+    // MARK: Refused records (C1 / IOS-07)
+
+    func testARefusedRecordLeavesTheQueueAndReturnsWhenEdited() throws {
+        let database = LogDatabase(url: nil, defaults: defaults())
+        database.upsert([entry("a"), entry("b")])
+        let batch = database.dirtyEntries(limit: 10)
+        let rejected = try XCTUnwrap(batch.first { $0.id == "a" })
+
+        database.markUploadRejected([(rejected, "startedAt is out of range")])
+        database.markSynced(batch.filter { $0.id != "a" })
+
+        XCTAssertEqual(database.rejectedCount(), 1)
+        XCTAssertEqual(database.rejectedEntryIDs(), ["a"])
+        XCTAssertTrue(database.dirtyEntries(limit: 10).isEmpty)
+        XCTAssertFalse(database.hasPendingChanges())
+
+        // An edit makes it uploadable again.
+        database.upsert([entry("a", 60)])
+        XCTAssertEqual(database.rejectedCount(), 0)
+        XCTAssertEqual(database.dirtyEntries(limit: 10).map(\.id), ["a"])
+    }
+
+    func testAnUnavailableDatabaseReportsDroppedWrites() {
+        // The support directory itself is not a database file, so opening fails.
+        let database = LogDatabase(url: directory, defaults: defaults())
+        XCTAssertFalse(database.isAvailable)
+        let failures = Counter()
+        database.onWriteFailure = { failures.increment() }
+        database.upsert([entry("a")])
+        database.flush()
+        XCTAssertEqual(failures.value, 1)
+    }
 }

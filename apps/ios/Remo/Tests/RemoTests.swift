@@ -1,4 +1,5 @@
 import CoreLocation
+import Photos
 import XCTest
 @testable import Remo
 
@@ -724,5 +725,196 @@ final class PrivacyHardeningTests: XCTestCase {
         let token = try JSONDecoder().decode(ApiToken.self, from: data)
         XCTAssertNil(token.expiresAt)
         XCTAssertFalse(token.issuedAndExpiryText.contains("まで有効"))
+    }
+}
+
+/// The upload contract shared with the API: refused records, photo preview
+/// statuses, sleep resends and the photo index used by the timeline views.
+@MainActor
+final class SyncContractTests: XCTestCase {
+    // MARK: Refused records (C1 / IOS-07)
+
+    func testBatchResponseListsOnlyRejectedEventsWithAnID() throws {
+        let data = Data(#"""
+        {"data":{"accepted":1,"changed":1,"deleted":0,"rejected":[
+          {"kind":"event","index":0,"id":"bad-root","message":"startedAt is out of range"},
+          {"kind":"event","index":1,"id":null,"message":"must be an object"},
+          {"kind":"deletion","index":0,"id":"bad-delete","message":"invalid"}
+        ]}}
+        """#.utf8)
+        XCTAssertEqual(LifeEventSync.rejectedEvents(data), [
+            LifeEventSync.RejectedUpload(id: "bad-root", message: "startedAt is out of range"),
+        ])
+    }
+
+    func testBatchResponseWithoutRejectionsAcceptsEverything() throws {
+        let data = Data(#"{"data":{"accepted":2,"changed":2,"deleted":0}}"#.utf8)
+        XCTAssertTrue(LifeEventSync.rejectedEvents(data).isEmpty)
+        XCTAssertTrue(LifeEventSync.rejectedEvents(Data("not json".utf8)).isEmpty)
+    }
+
+    // MARK: Photo preview statuses (C2 / IOS-28)
+
+    func testPhotoUploadStatusDecidesWhetherToStopOrSkip() {
+        XCTAssertEqual(PhotoBackup.disposition(for: 200), .uploaded)
+        XCTAssertEqual(PhotoBackup.disposition(for: 204), .uploaded)
+        XCTAssertEqual(PhotoBackup.disposition(for: 401), .unauthorized)
+        XCTAssertEqual(PhotoBackup.disposition(for: 429), .stopPass)
+        XCTAssertEqual(PhotoBackup.disposition(for: 500), .stopPass)
+        XCTAssertEqual(PhotoBackup.disposition(for: 503), .stopPass)
+        XCTAssertEqual(PhotoBackup.disposition(for: nil), .stopPass)
+        // One bad record is skipped, and 507 is quota, not an outage.
+        for status in [400, 404, 413, 415, 507] {
+            XCTAssertEqual(PhotoBackup.disposition(for: status), .skip, "\(status)")
+        }
+    }
+
+    // MARK: Background task completion (IOS-01)
+
+    func testBackgroundCompletionRunsOnce() {
+        let completion = OnceCompletion()
+        var results: [Bool] = []
+        completion.run { results.append(false) }
+        completion.run { results.append(true) }
+        XCTAssertEqual(results, [false])
+    }
+
+    // MARK: Sleep resends (IOS-05)
+
+    private func sleep(_ from: TimeInterval, _ to: TimeInterval) -> SleepSession {
+        SleepSession(startedAt: Date(timeIntervalSince1970: from), endedAt: Date(timeIntervalSince1970: to))
+    }
+
+    func testSleepSendsOnlyNewOrChangedNights() {
+        let night = sleep(1_700_000_000, 1_700_028_800)
+        let sent = [SleepBackup.id(night): SleepBackup.signature(night)]
+        XCTAssertTrue(SleepBackup.pending([night], sent: sent).isEmpty)
+
+        // A night that ends later (the watch is still counting) is sent again.
+        let extended = sleep(1_700_000_000, 1_700_032_400)
+        XCTAssertEqual(SleepBackup.pending([night, extended], sent: sent), [extended])
+
+        let newNight = sleep(1_700_100_000, 1_700_130_000)
+        XCTAssertEqual(SleepBackup.pending([night, extended, newNight], sent: sent), [extended, newNight])
+        XCTAssertEqual(SleepBackup.pending([night], sent: [:]), [night])
+    }
+
+    func testSleepSentMapIsPrunedToTheReadWindow() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let windowStart = now.addingTimeInterval(-7 * 86_400)
+        let recent = sleep(now.timeIntervalSince1970 - 86_400, now.timeIntervalSince1970)
+        let old = sleep(now.timeIntervalSince1970 - 30 * 86_400, now.timeIntervalSince1970 - 29 * 86_400)
+        let pruned = SleepBackup.prunedSent(
+            [SleepBackup.id(recent): SleepBackup.signature(recent), SleepBackup.id(old): SleepBackup.signature(old)],
+            from: windowStart,
+        )
+        XCTAssertEqual(pruned, [SleepBackup.id(recent): SleepBackup.signature(recent)])
+    }
+
+    // MARK: Mass photo deletion (IOS-02)
+
+    func testSmallPhotoDisappearanceIsDeletedAtOnce() {
+        let candidates: Set<String> = ["a", "b"]
+        let decision = stalePhotoDeletions(candidates: candidates, current: [], previousRecords: 100, deferred: [])
+        XCTAssertEqual(decision.delete, candidates)
+        XCTAssertTrue(decision.deferred.isEmpty)
+    }
+
+    func testMassPhotoDisappearanceWaitsForTheNextScan() {
+        let candidates = Set((0..<100).map { "record-\($0)" })
+        let first = stalePhotoDeletions(candidates: candidates, current: [], previousRecords: 100, deferred: [])
+        XCTAssertTrue(first.delete.isEmpty)
+        XCTAssertEqual(first.deferred, candidates)
+
+        // The next completed scan still does not see them: the deletion is confirmed.
+        let second = stalePhotoDeletions(candidates: [], current: [], previousRecords: 100, deferred: first.deferred)
+        XCTAssertEqual(second.delete, candidates)
+        XCTAssertTrue(second.deferred.isEmpty)
+    }
+
+    func testFewNewDisappearancesDoNotHoldBackConfirmedOnes() {
+        let deferred: Set<String> = ["gone-1", "gone-2"]
+        let decision = stalePhotoDeletions(candidates: ["fresh"], current: [], previousRecords: 100, deferred: deferred)
+        XCTAssertEqual(decision.delete, ["gone-1", "gone-2", "fresh"])
+        XCTAssertTrue(decision.deferred.isEmpty)
+    }
+
+    func testPhotosThatCameBackAreNotDeleted() {
+        let deferred: Set<String> = ["back"]
+        let decision = stalePhotoDeletions(candidates: [], current: ["back"], previousRecords: 10, deferred: deferred)
+        XCTAssertTrue(decision.delete.isEmpty)
+        XCTAssertTrue(decision.deferred.isEmpty)
+    }
+
+    // MARK: Today's stay recompute (IOS-10)
+
+    func testTodayIsRecomputedAtMostEveryThirtySeconds() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertEqual(StayIndexStore.recomputeDelay(onlyToday: true, lastUpdateAt: now.addingTimeInterval(-10), now: now), 20, accuracy: 0.001)
+        XCTAssertEqual(StayIndexStore.recomputeDelay(onlyToday: true, lastUpdateAt: now.addingTimeInterval(-31), now: now), 0, accuracy: 0.001)
+        XCTAssertEqual(StayIndexStore.recomputeDelay(onlyToday: false, lastUpdateAt: now.addingTimeInterval(-1), now: now), 0, accuracy: 0.001)
+        XCTAssertEqual(StayIndexStore.recomputeDelay(onlyToday: true, lastUpdateAt: nil, now: now), 0, accuracy: 0.001)
+    }
+
+    // MARK: Photos without a date (IOS-21)
+
+    func testAPhotoWithoutADateKeepsTheTimeItWasFirstSeen() {
+        let seen = Date(timeIntervalSince1970: 1_700_000_000)
+        let now = Date(timeIntervalSince1970: 1_700_100_000)
+        XCTAssertEqual(PhotoTimelineIndexer.takenAt(creationDate: nil, modificationDate: nil, firstSeen: seen, now: now), seen)
+        XCTAssertEqual(PhotoTimelineIndexer.takenAt(creationDate: nil, modificationDate: nil, firstSeen: nil, now: now), now)
+        let modified = Date(timeIntervalSince1970: 1_700_050_000)
+        XCTAssertEqual(PhotoTimelineIndexer.takenAt(creationDate: nil, modificationDate: modified, firstSeen: seen, now: now), modified)
+    }
+
+    // MARK: Photo asset index (IOS-04)
+
+    private struct FakeAsset: PhotoAssetLike, Equatable {
+        let localIdentifier: String
+        let creationDate: Date?
+        let mediaType: PHAssetMediaType
+    }
+
+    /// The implementation the index replaced: filter the whole library per record.
+    private func referenceNearest(_ log: LogEntry, assets: [FakeAsset], calendar: Calendar) -> FakeAsset? {
+        let candidates = assets.filter { asset in
+            log.mediaType == .video ? asset.mediaType == .video : asset.mediaType == .image
+        }
+        if let exact = candidates.first(where: { $0.creationDate == log.startedAt }) { return exact }
+        return candidates.filter { asset in
+            guard let creationDate = asset.creationDate else { return false }
+            return calendar.isDate(creationDate, inSameDayAs: log.startedAt)
+        }.min { first, second in
+            guard let firstDate = first.creationDate, let secondDate = second.creationDate else { return false }
+            return abs(firstDate.timeIntervalSince(log.startedAt)) < abs(secondDate.timeIntervalSince(log.startedAt))
+        }
+    }
+
+    func testAssetIndexMatchesFilteringTheWholeLibrary() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Asia/Tokyo")!
+        let base = Date(timeIntervalSince1970: 1_757_000_000) // 2025-09-01 09:33 JST
+        func at(_ offset: TimeInterval) -> Date { base.addingTimeInterval(offset) }
+
+        let assets = [
+            FakeAsset(localIdentifier: "image-exact", creationDate: at(0), mediaType: .image),
+            FakeAsset(localIdentifier: "image-before", creationDate: at(-3_600), mediaType: .image),
+            FakeAsset(localIdentifier: "image-after", creationDate: at(3_600), mediaType: .image),
+            FakeAsset(localIdentifier: "image-tie-later", creationDate: at(600), mediaType: .image),
+            FakeAsset(localIdentifier: "image-tie-earlier", creationDate: at(-600), mediaType: .image),
+            FakeAsset(localIdentifier: "image-tomorrow", creationDate: at(20 * 3_600), mediaType: .image),
+            FakeAsset(localIdentifier: "video-exact", creationDate: at(0), mediaType: .video),
+            FakeAsset(localIdentifier: "video-near", creationDate: at(-120), mediaType: .video),
+            FakeAsset(localIdentifier: "image-no-date", creationDate: nil, mediaType: .image),
+        ]
+        let index = PhotoAssetIndex(assets: assets, calendar: calendar)
+        let logs = [at(0), at(120), at(-120), at(3_000), at(10 * 3_600), at(20 * 3_600), at(86_400)].map { date in
+            LogEntry(id: "at-\(date.timeIntervalSince1970)", startedAt: date, mediaType: .photo, source: .location, updatedAt: date)
+        } + [at(30), at(-30)].map { date in
+            LogEntry(id: "video-\(date.timeIntervalSince1970)", startedAt: date, mediaType: .video, source: .location, updatedAt: date)
+        }
+        for log in logs {
+            XCTAssertEqual(index.nearest(to: log)?.localIdentifier, referenceNearest(log, assets: assets, calendar: calendar)?.localIdentifier, "\(log.id)")
+        }
     }
 }

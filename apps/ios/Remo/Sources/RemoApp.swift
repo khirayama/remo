@@ -35,21 +35,47 @@ final class RemoAppDelegate: NSObject, UIApplicationDelegate {
     }
 
     private static func runBackup(_ task: BGAppRefreshTask) async {
-        task.expirationHandler = { task.setTaskCompleted(success: false) }
+        // The system may expire the task while the sync is still running, so
+        // completion is guarded: `BGTaskScheduler` expects exactly one call.
+        let completion = OnceCompletion()
+        let work = Task { @MainActor in
+            try await BackupCoordinator.shared.synchronize(pull: true)
+        }
+        task.expirationHandler = {
+            // Stop the network work the task no longer has time for.
+            Task { await BackupCoordinator.shared.cancel() }
+            work.cancel()
+            completion.run { task.setTaskCompleted(success: false) }
+        }
         defer { scheduleBackup() }
         guard KeychainToken.load() != nil else {
-            task.setTaskCompleted(success: true)
+            completion.run { task.setTaskCompleted(success: true) }
             return
         }
         do {
             // The same coordinator as the foreground sync: the two never run at
             // once, and what the download returns is applied record by record,
             // so a sample captured meanwhile is never dropped.
-            _ = try await BackupCoordinator.shared.synchronize(pull: true)
-            task.setTaskCompleted(success: true)
+            _ = try await work.value
+            completion.run { task.setTaskCompleted(success: true) }
         } catch {
-            task.setTaskCompleted(success: false)
+            completion.run { task.setTaskCompleted(success: false) }
         }
+    }
+}
+
+/// Runs an action at most once, from any thread. A background task can expire
+/// while its sync returns at the same moment; only the first finish counts.
+final class OnceCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+
+    func run(_ action: () -> Void) {
+        lock.lock()
+        let shouldRun = !completed
+        if shouldRun { completed = true }
+        lock.unlock()
+        if shouldRun { action() }
     }
 }
 

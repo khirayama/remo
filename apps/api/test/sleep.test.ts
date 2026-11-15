@@ -144,9 +144,26 @@ describe("sleep API", () => {
     // Newer copy replaces it.
     expect((await api.batch([session("a", BASE, 7, { updatedAt: now - 500 })])).body.data.changed).toBe(1);
     expect((await api.get("/sleep")).body.data[0]).toMatchObject({ endedAt: BASE + 7 * HOUR, updatedAt: now - 500 });
-    // An equal timestamp is accepted so a retry is idempotent.
+    // An equal timestamp with another span is a real edit.
     expect((await api.batch([session("a", BASE, 5, { updatedAt: now - 500 })])).body.data.changed).toBe(1);
     expect((await api.get("/sleep")).body.data[0].endedAt).toBe(BASE + 5 * HOUR);
+  });
+
+  it("does not rewrite an identical session and moves the cursor only for a write", async () => {
+    const { as } = setup();
+    const api = as("user-1");
+    const updatedAt = Date.now() - 10_000;
+    expect((await api.batch([session("a", BASE, 8, { updatedAt })])).body.data).toEqual({ accepted: 1, changed: 1 });
+    const head = (await api.get("/events/head")).body.data.cursor as string;
+    expect(head).toEqual(expect.any(String));
+
+    // Devices send the nights they read with every sync; the same copy again
+    // is not a write and leaves the sync cursor where it was.
+    expect((await api.batch([session("a", BASE, 8, { updatedAt })])).body.data).toEqual({ accepted: 1, changed: 0 });
+    expect((await api.get("/events/head")).body.data.cursor).toBe(head);
+
+    expect((await api.batch([session("a", BASE, 9, { updatedAt: updatedAt + 1 })])).body.data.changed).toBe(1);
+    expect((await api.get("/events/head")).body.data.cursor).not.toBe(head);
   });
 
   it("filters by the day a session ended", async () => {

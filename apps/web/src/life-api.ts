@@ -1,5 +1,5 @@
 import { LifeEvent, MediaType, normalizeCorrection, normalizePlace, PhotoLocationSource, SyncCursor } from "./life-log";
-import { applyRemoteChanges, applyRemoteCorrections, applyRemotePlaces, countDirtyEvents, loadDirtyCorrections, loadDirtyEvents, loadDirtyPlaces, loadPendingDeletes, loadSyncState, markCorrectionsSynced, markEventsSynced, markPlacesSynced, PendingDeletion, removePendingDeletes, updateSyncState } from "./timeline-db";
+import { applyRemoteChanges, applyRemoteCorrections, applyRemotePlaces, countDirtyEvents, forgetRejectedEvents, loadDirtyCorrections, loadDirtyEvents, loadDirtyPlaces, loadPendingDeletes, loadRejectedEvents, loadSyncState, markCorrectionsSynced, markEventsRejected, markEventsSynced, markPlacesSynced, PendingDeletion, removePendingDeletes, updateSyncState } from "./timeline-db";
 
 import { apiBaseURL as baseURL } from "./api-base";
 
@@ -34,12 +34,24 @@ export class UnauthorizedError extends Error {
   }
 }
 
-/** Sends a request with the session cookie; any failure other than a rejected session is "unavailable". */
+/** Why a request failed, as the app tells the user apart. */
+export type SyncFailure = "rate_limited" | "server" | "permanent";
+
+/** A request the server refused. Only a rate limit or a server fault clears up by itself. */
+export class RequestError extends Error {
+  constructor(readonly reason: SyncFailure) {
+    super(reason);
+  }
+}
+
+/** Sends a request with the session cookie; any failure other than a rejected session is thrown classified. */
 async function request(path: string, init: RequestInit = {}): Promise<Response> {
   const response = await fetch(`${baseURL}${path}`, { credentials: "include", ...init });
   if (response.status === 401) throw new UnauthorizedError();
-  if (!response.ok) throw new Error("sync unavailable");
-  return response;
+  if (response.ok) return response;
+  // Too many requests and a server fault go away by themselves; any other 4xx
+  // is this request's own problem and fails the same way every time.
+  throw new RequestError(response.status === 429 ? "rate_limited" : response.status >= 500 ? "server" : "permanent");
 }
 
 function jsonBody(method: string, body: unknown): RequestInit {
@@ -140,8 +152,8 @@ async function fetchEventHead(): Promise<SyncCursor | null> {
 const BATCH_SIZE = 400;
 
 // A 2xx response means every item was handled: applied, or rejected by the
-// server as invalid (reported in data.rejected). Either way it is done, so one
-// malformed record cannot block the rest forever.
+// server. A refused deletion is malformed and can never succeed, so it is
+// dropped from the queue with the ones that were applied.
 async function pushDeletions(storageId: string): Promise<void> {
   for (;;) {
     const batch: PendingDeletion[] = await loadPendingDeletes(storageId, BATCH_SIZE);
@@ -159,8 +171,23 @@ async function pushEvents(storageId: string, epoch: number): Promise<void> {
   for (;;) {
     const batch = await loadDirtyEvents(storageId, epoch, BATCH_SIZE);
     if (!batch.length) return;
-    await request("/api/v1/events/batch", jsonBody("POST", { events: batch.map(toApi) }));
-    await markEventsSynced(storageId, batch, epoch);
+    const response = await request("/api/v1/events/batch", jsonBody("POST", { events: batch.map(toApi) }));
+    const payload = await response.json().catch(() => null) as {
+      data?: { rejected?: Array<{ kind?: unknown; id?: unknown; message?: unknown }> };
+    } | null;
+    // A refused record is kept here with the server's message, so the rest of
+    // the queue is not held up by it and the app can say why it is missing
+    // from the backup. An entry without an id names no record.
+    const messages = new Map<string, string>();
+    for (const item of payload?.data?.rejected ?? []) {
+      if (item?.kind === "event" && typeof item.id === "string" && item.id) {
+        messages.set(item.id, typeof item.message === "string" ? item.message : "rejected");
+      }
+    }
+    const accepted = batch.filter((event) => !messages.has(event.id));
+    await markEventsSynced(storageId, accepted, epoch);
+    await forgetRejectedEvents(storageId, accepted.map((event) => event.id));
+    await markEventsRejected(storageId, batch.filter((event) => messages.has(event.id)), messages, epoch);
   }
 }
 
@@ -168,16 +195,17 @@ async function pushEvents(storageId: string, epoch: number): Promise<void> {
  * Downloads what changed in the backup and applies it page by page, so a
  * restore of years of records is never held in memory and continues where it
  * stopped. What was applied is reported through [outcome] even when a later
- * page fails.
+ * page fails. Returns whether a download ran: when the head shows no change
+ * there is nothing new to read from the other endpoints either.
  */
-async function pull(storageId: string, userId: string, epoch: number, outcome: SyncOutcome): Promise<void> {
+async function pull(storageId: string, userId: string, epoch: number, outcome: SyncOutcome): Promise<boolean> {
   const state = await loadSyncState(storageId);
   const stored: SyncCursor | undefined = state.cursors[userId];
   let page: string | undefined = stored ? undefined : state.fullSync[userId];
   let cursor: SyncCursor | undefined = stored;
   if (stored) {
     const head = await fetchEventHead();
-    if (!head || compareCursors(head, stored) <= 0) return;
+    if (!head || compareCursors(head, stored) <= 0) return false;
   }
   let reached: SyncCursor | undefined;
   for (;;) {
@@ -204,15 +232,22 @@ async function pull(storageId: string, userId: string, epoch: number, outcome: S
     if (final) next.cursors[userId] = final;
     delete next.fullSync[userId];
   });
+  return true;
 }
 
-async function syncPlaces(storageId: string, epoch: number): Promise<boolean> {
+/**
+ * Sends the places changed here. The list is read back only after a download
+ * ran: the server moves the sync head for every write, so an unchanged head
+ * means nobody wrote a place since the last sync.
+ */
+async function syncPlaces(storageId: string, epoch: number, download: boolean): Promise<boolean> {
   const dirty = await loadDirtyPlaces(storageId, epoch);
   for (let index = 0; index < dirty.length; index += 200) {
     const batch = dirty.slice(index, index + 200);
     await request("/api/v1/places", jsonBody("PUT", { places: batch }));
     await markPlacesSynced(storageId, batch, epoch);
   }
+  if (!download) return false;
   const response = await request("/api/v1/places");
   const payload = await response.json() as { data?: unknown[] };
   return applyRemotePlaces(storageId, (payload.data ?? []).flatMap((place) => normalizePlace(place) ?? []), epoch);
@@ -224,15 +259,16 @@ const MAX_CORRECTION_PAGES = 100;
 /**
  * Sends the corrections created or deleted here, then takes the ones written
  * since this account's cursor (docs/CORRECTIONS.md). Returns whether any local
- * correction changed.
+ * correction changed. The list is read back only after a download ran.
  */
-async function syncCorrections(storageId: string, userId: string, epoch: number): Promise<boolean> {
+async function syncCorrections(storageId: string, userId: string, epoch: number, download: boolean): Promise<boolean> {
   const dirty = await loadDirtyCorrections(storageId, epoch);
   for (let index = 0; index < dirty.length; index += CORRECTION_BATCH) {
     const batch = dirty.slice(index, index + CORRECTION_BATCH);
     await request("/api/v1/corrections", jsonBody("PUT", { corrections: batch }));
     await markCorrectionsSynced(storageId, batch, epoch);
   }
+  if (!download) return false;
   let after = (await loadSyncState(storageId)).correctionCursors[userId] ?? 0;
   let changed = false;
   for (let page = 0; page < MAX_CORRECTION_PAGES; page += 1) {
@@ -304,12 +340,18 @@ export type SyncOutcome = {
   online: boolean;
   /** The session was rejected: the user has to sign in again. */
   unauthorized: boolean;
+  /** Why the sync stopped, when it did: each reason has its own message. Missing means offline. */
+  failure?: SyncFailure | "offline";
   /** Records and deletions that are still waiting to be uploaded. */
   pending: number;
+  /** Records the server refused: they are not uploaded again until they change here. */
+  rejected: number;
   /** Local records or places changed and the screen should reload them. */
   changed: boolean;
   /** Records another device deleted, removed here by this sync. */
   removedIds: string[];
+  /** The records download ran (the head moved), so what other devices wrote was read too. */
+  pulled: boolean;
 };
 
 /**
@@ -320,21 +362,48 @@ export type SyncOutcome = {
  */
 export async function synchronizeEvents(storageId: string, userId: string, options: { pull?: boolean } = {}): Promise<SyncOutcome> {
   const { epoch, owner } = await loadSyncState(storageId);
-  const outcome: SyncOutcome = { online: true, unauthorized: false, pending: 0, changed: false, removedIds: [] };
+  const outcome: SyncOutcome = {
+    online: true,
+    unauthorized: false,
+    pending: 0,
+    rejected: 0,
+    changed: false,
+    removedIds: [],
+    pulled: false,
+  };
   // The records belong to another account until the user decides otherwise.
   if (owner !== userId) return { ...outcome, online: false };
-  try {
-    await pushDeletions(storageId);
-    await pushEvents(storageId, epoch);
-    if (options.pull ?? true) {
-      await pull(storageId, userId, epoch, outcome);
-      if (await syncPlaces(storageId, epoch)) outcome.changed = true;
-      if (await syncCorrections(storageId, userId, epoch)) outcome.changed = true;
+  // Each part runs on its own: a place or correction the server refuses must
+  // not stop the records from being backed up, and a failed part does not hide
+  // what the others did. The first failure is what the app reports.
+  let failure: unknown;
+  const run = async (work: () => Promise<unknown>): Promise<void> => {
+    if (failure instanceof UnauthorizedError) return;
+    try {
+      await work();
+    } catch (error) {
+      failure ??= error;
     }
-  } catch (error) {
+  };
+  await run(() => pushDeletions(storageId));
+  await run(() => pushEvents(storageId, epoch));
+  if (options.pull ?? true) {
+    await run(async () => {
+      outcome.pulled = await pull(storageId, userId, epoch, outcome);
+    });
+    await run(async () => {
+      if (await syncPlaces(storageId, epoch, outcome.pulled)) outcome.changed = true;
+    });
+    await run(async () => {
+      if (await syncCorrections(storageId, userId, epoch, outcome.pulled)) outcome.changed = true;
+    });
+  }
+  if (failure !== undefined) {
     outcome.online = false;
-    outcome.unauthorized = error instanceof UnauthorizedError;
+    outcome.unauthorized = failure instanceof UnauthorizedError;
+    outcome.failure = failure instanceof RequestError ? failure.reason : "offline";
   }
   outcome.pending = await countDirtyEvents(storageId, epoch) + (await loadPendingDeletes(storageId)).length;
+  outcome.rejected = (await loadRejectedEvents(storageId)).size;
   return outcome;
 }

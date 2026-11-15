@@ -61,6 +61,12 @@ data class EventPage(
     val nextCursorToken: String?,
 )
 
+/**
+ * An item the server refused while still answering 2xx. [index] is its position
+ * in the batch; [id] is null when the server could not read one.
+ */
+data class BatchRejection(val kind: String, val index: Int, val id: String?, val message: String?)
+
 object ApiClient {
     private val baseUrl = BuildConfig.API_BASE_URL.trimEnd('/')
 
@@ -169,10 +175,13 @@ object ApiClient {
             .put("source", entry.source.wireValue)
             .put("updatedAt", entry.updatedAt)
 
-    // A 2xx response means every item was handled: applied, or rejected by the
-    // server as invalid. Either way it is done, so one malformed record cannot
-    // block the rest of the queue forever.
-    suspend fun pushEvents(entries: List<LogEntry>, token: String? = SecureTokenStore.get()) = withContext(Dispatchers.IO) {
+    /**
+     * A 2xx response means the server handled the request, but individual
+     * records can still be refused as invalid. Those are returned in the list
+     * and must not be marked as backed up: one malformed record cannot be sent,
+     * and the user has to see that it is not.
+     */
+    suspend fun pushEvents(entries: List<LogEntry>, token: String? = SecureTokenStore.get()): List<BatchRejection> = withContext(Dispatchers.IO) {
         require(entries.isNotEmpty() && entries.size <= BATCH_SIZE)
         postBatch(JSONObject().put("events", JSONArray().apply { entries.forEach { put(eventPayload(it)) } }), token)
     }
@@ -182,7 +191,7 @@ object ApiClient {
      * server resolves a deletion against edits from other devices. The start
      * time and kind tell the server where the record is stored.
      */
-    suspend fun pushDeletions(deletions: List<PendingDeletion>, token: String? = SecureTokenStore.get()) = withContext(Dispatchers.IO) {
+    suspend fun pushDeletions(deletions: List<PendingDeletion>, token: String? = SecureTokenStore.get()): List<BatchRejection> = withContext(Dispatchers.IO) {
         require(deletions.isNotEmpty() && deletions.size <= BATCH_SIZE)
         postBatch(JSONObject().put("deletions", JSONArray().apply {
             deletions.forEach {
@@ -205,9 +214,26 @@ object ApiClient {
         requireSuccess(request("POST", "/api/v1/sleep/batch", body.toString(), token))
     }
 
-    private fun postBatch(body: JSONObject, token: String?) {
-        requireSuccess(request("POST", "/api/v1/events/batch", body.toString(), token))
+    private fun postBatch(body: JSONObject, token: String?): List<BatchRejection> {
+        val response = request("POST", "/api/v1/events/batch", body.toString(), token)
+        requireSuccess(response)
+        return parseBatchRejections(response.body)
     }
+
+    /** The items of `data.rejected`, empty when the response carries none. */
+    internal fun parseBatchRejections(body: String): List<BatchRejection> = runCatching {
+        val array = JSONObject(body).optJSONObject("data")?.optJSONArray("rejected") ?: return emptyList()
+        (0 until array.length()).mapNotNull { index ->
+            val item = array.optJSONObject(index) ?: return@mapNotNull null
+            BatchRejection(
+                kind = item.optString("kind"),
+                index = item.optInt("index", -1),
+                // An id the server could not read says nothing about a local record.
+                id = if (item.isNull("id")) null else item.optString("id").takeIf(String::isNotBlank),
+                message = if (item.isNull("message")) null else item.optString("message").takeIf(String::isNotBlank),
+            )
+        }
+    }.getOrElse { emptyList() }
 
     suspend fun fetchPlaces(token: String?): List<NamedPlace> = withContext(Dispatchers.IO) {
         val response = request("GET", "/api/v1/places", token = token)
@@ -397,6 +423,8 @@ object ApiClient {
             connectTimeout = 15_000
             readTimeout = 30_000
             useCaches = false
+            // A redirect would carry the bearer token to another URL.
+            instanceFollowRedirects = false
             setRequestProperty("Accept", "application/json")
             if (!token.isNullOrBlank()) setRequestProperty("Authorization", "Bearer $token")
             if (body != null) {

@@ -163,14 +163,26 @@ final class AuthStore: ObservableObject {
         } catch {
             // Only the server rejecting the session signs the user out.
             // Starting offline (or during an outage) keeps the session and
-            // its backup; the stored account is shown until the API answers.
-            if let cached = Self.storedUser() {
-                user = cached
-                phase = .signedIn
-            } else {
-                expireSession()
-            }
+            // its backup. A cached account is shown as before; without one the
+            // token is kept and the account details are asked for again on the
+            // next launch or when the app comes back to the foreground.
+            if let cached = Self.storedUser() { user = cached }
+            phase = .signedIn
         }
+    }
+
+    /// Retries the account details after a launch that could not read them
+    /// (offline, 429, 5xx). The stored token is only dropped when the server
+    /// rejects it.
+    func refreshUserIfNeeded() async {
+        guard phase == .signedIn, user == nil, let token else { return }
+        do {
+            let current = try await fetchCurrentUser(token: token)
+            user = current
+            Self.storeUser(current)
+        } catch AuthError.unauthorized {
+            expireSession()
+        } catch {}
     }
 
     /// The server no longer accepts the stored session: sign out locally so

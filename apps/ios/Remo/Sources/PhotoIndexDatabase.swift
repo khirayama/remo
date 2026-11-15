@@ -143,32 +143,43 @@ final class PhotoIndexDatabase: @unchecked Sendable {
     /// preview, so the record's preview list has to be sent again.
     /// `photos` are the library assets of this scan; their time, place and
     /// kind are kept for archiving later.
+    ///
+    /// Only rows whose assignment actually changed are written: a scan that
+    /// finds a small change does not rewrite the whole library on the main thread.
     func replaceAssignments(_ assignments: [String: String], photos: [GroupablePhoto], changedEvents: Set<String> = []) {
         queue.sync {
             guard let connection else { return }
             do {
                 // A digest learned by the backup pass belongs to the asset, not
-                // to the scan; keep it when the rows are rewritten.
+                // to the scan; keep it when a row is rewritten.
                 let digests = Dictionary((try connection.query("SELECT asset_id, digest FROM assets WHERE digest IS NOT NULL") { row -> (String, String)? in
                     guard let asset = row.text(0), let digest = row.text(1) else { return nil }
                     return (asset, digest)
                 }), uniquingKeysWith: { first, _ in first })
                 let metadata = Dictionary(photos.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                let existing = try connection.query("SELECT asset_id, event_id, taken_at, latitude, longitude, media_type FROM assets") { row -> (String, [SQLiteValue])? in
+                    guard let asset = row.text(0), let event = row.text(1) else { return nil }
+                    return (asset, [.text(event), .optional(row.double(2)), .optional(row.double(3)), .optional(row.double(4)), row.text(5).map(SQLiteValue.text) ?? .null])
+                }
+                let previous = Dictionary(existing, uniquingKeysWith: { first, _ in first })
+                let removed = Set(previous.keys).subtracting(assignments.keys)
+                var changed: [[SQLiteValue]] = []
+                for (asset, event) in assignments {
+                    let photo = metadata[asset]
+                    let content: [SQLiteValue] = [
+                        .text(event),
+                        photo.map { .real($0.takenAt.timeIntervalSince1970) } ?? .null,
+                        .optional(photo?.coordinate?.0),
+                        .optional(photo?.coordinate?.1),
+                        photo.map { .text($0.mediaType.rawValue) } ?? .null,
+                    ]
+                    if previous[asset] == content { continue }
+                    changed.append([.text(asset)] + content + [digests[asset].map(SQLiteValue.text) ?? .null])
+                }
                 try connection.transaction {
                     try connection.run("INSERT OR IGNORE INTO manifest_pending (event_id) VALUES (?)", changedEvents.map { [.text($0)] })
-                    try connection.execute("DELETE FROM assets")
-                    try connection.run("INSERT INTO assets (asset_id, event_id, taken_at, latitude, longitude, media_type, digest) VALUES (?, ?, ?, ?, ?, ?, ?)", assignments.map { entry in
-                        let photo = metadata[entry.key]
-                        return [
-                            .text(entry.key),
-                            .text(entry.value),
-                            photo.map { .real($0.takenAt.timeIntervalSince1970) } ?? .null,
-                            .optional(photo?.coordinate?.0),
-                            .optional(photo?.coordinate?.1),
-                            photo.map { .text($0.mediaType.rawValue) } ?? .null,
-                            digests[entry.key].map(SQLiteValue.text) ?? .null,
-                        ]
-                    })
+                    try connection.run("DELETE FROM assets WHERE asset_id = ?", removed.map { [.text($0)] })
+                    try connection.run("INSERT OR REPLACE INTO assets (asset_id, event_id, taken_at, latitude, longitude, media_type, digest) VALUES (?, ?, ?, ?, ?, ?, ?)", changed)
                     try connection.run("INSERT OR REPLACE INTO metadata (name, value) VALUES ('grouping', ?)", [.text(Self.groupingVersion)])
                 }
             } catch {

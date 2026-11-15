@@ -23,9 +23,11 @@ const BY_SYNC = "bySync";
 /**
  * `t` is the record's start in milliseconds. `s` is the sync epoch the record
  * was last backed up in: 0 after a local change, and anything below the
- * current epoch means the record still has to be uploaded.
+ * current epoch means the record still has to be uploaded. `rj` is the
+ * server's message when it refused the record: it is not uploaded again (and
+ * not counted as pending) until the record changes locally.
  */
-type StoredEvent = { storageId: string; id: string; event: LifeEvent; t: number; s: number };
+type StoredEvent = { storageId: string; id: string; event: LifeEvent; t: number; s: number; rj?: string };
 type StoredDeletion = { storageId: string; id: string; deletedAt: number; startedAt?: number; source?: EventSource };
 type StoredDirtyDay = { storageId: string; day: string; token: number };
 type StoredPlace = { storageId: string; id: string; place: Place; s: number };
@@ -49,10 +51,22 @@ export type SyncState = {
   fullSync: Record<string, string>;
   /** Correction download cursor per account. */
   correctionCursors: Record<string, number>;
+  /** Records the server refused, with the message it gave, by record id. */
+  rejected: Record<string, string>;
 };
 
-const emptySyncState = (): SyncState => ({ epoch: 1, cursors: {}, fullSync: {}, correctionCursors: {} });
+const emptySyncState = (): SyncState => ({ epoch: 1, cursors: {}, fullSync: {}, correctionCursors: {}, rejected: {} });
 const syncStateKey = (storageId: string) => `sync:${storageId}`;
+
+/** The stored sync state with every nested record copied, so a change cannot reach the stored copy. */
+function copySyncState(stored: Partial<SyncState> | undefined): SyncState {
+  return {
+    ...emptySyncState(),
+    ...stored,
+    correctionCursors: { ...stored?.correctionCursors },
+    rejected: { ...stored?.rejected },
+  };
+}
 
 let databasePromise: Promise<IDBDatabase> | undefined;
 
@@ -187,7 +201,15 @@ async function transact<T>(stores: string[], mode: IDBTransactionMode, work: (tr
     transaction.onerror = () => reject(transaction.error ?? new Error("Timeline storage transaction failed"));
     transaction.onabort = () => reject(transaction.error ?? new Error("Timeline storage transaction aborted"));
   });
-  const result = await work(transaction);
+  let result: T;
+  try {
+    result = await work(transaction);
+  } catch (error) {
+    // The failed work aborts the transaction; its own promise must not be
+    // left unhandled while the failure is reported through this one.
+    done.catch(() => undefined);
+    throw error;
+  }
   await done;
   return result;
 }
@@ -266,18 +288,28 @@ export async function listRecordedDays(storageId: string): Promise<string[]> {
 /** Writes records created or edited on this device; they are uploaded on the next backup. */
 export async function putLocalEvents(storageId: string, events: LifeEvent[]): Promise<void> {
   if (!events.length) return;
-  await transact([EVENTS, DIRTY_DAYS, PENDING_DELETES], "readwrite", async (transaction) => {
+  await transact([EVENTS, DIRTY_DAYS, PENDING_DELETES, STATE], "readwrite", async (transaction) => {
     const store = transaction.objectStore(EVENTS);
     const pendingDeletes = transaction.objectStore(PENDING_DELETES);
+    const stateStore = transaction.objectStore(STATE);
+    const stored = await requestResult(stateStore.get(syncStateKey(storageId)) as IDBRequest<Partial<SyncState> | undefined>);
+    const rejected = { ...stored?.rejected };
+    let retried = false;
     const touched = new Set<string>();
     await Promise.all(events.map(async (event) => {
       const previous = await requestResult(store.get([storageId, event.id]) as IDBRequest<StoredEvent | undefined>);
       if (previous && previous.t !== timeOf(event)) markDay(transaction, storageId, previous.t, touched);
       markDay(transaction, storageId, timeOf(event), touched);
       store.put({ storageId, id: event.id, event, t: timeOf(event), s: 0 } satisfies StoredEvent);
-      // Writing a record again takes back a deletion that was not sent yet.
+      // Writing a record again takes back a deletion that was not sent yet,
+      // and an edit retries a record the server refused.
       pendingDeletes.delete([storageId, event.id]);
+      if (event.id in rejected) {
+        delete rejected[event.id];
+        retried = true;
+      }
     }));
+    if (retried) stateStore.put({ ...copySyncState(stored), rejected }, syncStateKey(storageId));
   });
 }
 
@@ -304,6 +336,12 @@ export async function deleteLocalEvents(storageId: string, ids: string[]): Promi
         transaction.objectStore(PENDING_DELETES).put({ storageId, id, deletedAt, startedAt: row.t, source: row.event.source } satisfies StoredDeletion);
       }
     }));
+    // A deleted record is no longer one that cannot be backed up.
+    const rejected = { ...state?.rejected };
+    if (removed.some((event) => event.id in rejected)) {
+      removed.forEach((event) => { delete rejected[event.id]; });
+      transaction.objectStore(STATE).put({ ...copySyncState(state), rejected }, syncStateKey(storageId));
+    }
     return removed;
   });
 }
@@ -321,9 +359,13 @@ export async function applyRemoteChanges(
   epoch: number,
 ): Promise<{ changed: boolean; removedIds: string[] }> {
   if (!events.length && !deletions.length) return { changed: false, removedIds: [] };
-  return transact([EVENTS, DIRTY_DAYS, PENDING_DELETES], "readwrite", async (transaction) => {
+  return transact([EVENTS, DIRTY_DAYS, PENDING_DELETES, STATE], "readwrite", async (transaction) => {
     const store = transaction.objectStore(EVENTS);
     const pendingDeletes = transaction.objectStore(PENDING_DELETES);
+    const stateStore = transaction.objectStore(STATE);
+    const stored = await requestResult(stateStore.get(syncStateKey(storageId)) as IDBRequest<Partial<SyncState> | undefined>);
+    const rejected = { ...stored?.rejected };
+    let retried = false;
     const touched = new Set<string>();
     const removedIds: string[] = [];
     let changed = false;
@@ -338,6 +380,11 @@ export async function applyRemoteChanges(
       if (local && local.t !== timeOf(event)) markDay(transaction, storageId, local.t, touched);
       markDay(transaction, storageId, timeOf(event), touched);
       store.put({ storageId, id: event.id, event, t: timeOf(event), s: epoch } satisfies StoredEvent);
+      // The copy from the backup is backed up: it is no longer refused.
+      if (event.id in rejected) {
+        delete rejected[event.id];
+        retried = true;
+      }
       changed = true;
     }));
     await Promise.all(deletions.map(async ({ id, deletedAt }) => {
@@ -345,9 +392,14 @@ export async function applyRemoteChanges(
       if (!local || updatedAtOf(local.event) > deletedAt) return;
       store.delete([storageId, id]);
       markDay(transaction, storageId, local.t, touched);
+      if (id in rejected) {
+        delete rejected[id];
+        retried = true;
+      }
       removedIds.push(id);
       changed = true;
     }));
+    if (retried) stateStore.put({ ...copySyncState(stored), rejected }, syncStateKey(storageId));
     return { changed, removedIds };
   });
 }
@@ -373,9 +425,68 @@ export async function markEventsSynced(storageId: string, sent: LifeEvent[], epo
     const store = transaction.objectStore(EVENTS);
     await Promise.all(sent.map(async (event) => {
       const row = await requestResult(store.get([storageId, event.id]) as IDBRequest<StoredEvent | undefined>);
-      if (row && row.event.updatedAt === event.updatedAt) store.put({ ...row, s: epoch } satisfies StoredEvent);
+      // A record that was refused before is backed up now: the flag goes.
+      if (row && row.event.updatedAt === event.updatedAt) {
+        store.put({ storageId, id: row.id, event: row.event, t: row.t, s: epoch } satisfies StoredEvent);
+      }
     }));
   });
+}
+
+/**
+ * Remembers the records the server refused in [epoch]. They stay on this
+ * device but are not uploaded again, and no longer count as pending, until
+ * they change locally; the message is kept so the app can say why.
+ */
+export async function markEventsRejected(storageId: string, sent: LifeEvent[], messages: Map<string, string>, epoch: number): Promise<void> {
+  if (!sent.length) return;
+  await transact([EVENTS, STATE], "readwrite", async (transaction) => {
+    const store = transaction.objectStore(EVENTS);
+    const stateStore = transaction.objectStore(STATE);
+    const stored = await requestResult(stateStore.get(syncStateKey(storageId)) as IDBRequest<Partial<SyncState> | undefined>);
+    const rejected = { ...stored?.rejected };
+    let flagged = false;
+    await Promise.all(sent.map(async (event) => {
+      const message = messages.get(event.id);
+      if (message === undefined) return;
+      const row = await requestResult(store.get([storageId, event.id]) as IDBRequest<StoredEvent | undefined>);
+      // Edited while the request was in flight: that version has to go out.
+      if (!row || row.event.updatedAt !== event.updatedAt) return;
+      store.put({ ...row, s: epoch, rj: message } satisfies StoredEvent);
+      rejected[event.id] = message;
+      flagged = true;
+    }));
+    if (flagged) stateStore.put({ ...copySyncState(stored), rejected }, syncStateKey(storageId));
+  });
+}
+
+/** Forgets that the server refused [ids]: they were just backed up. */
+export async function forgetRejectedEvents(storageId: string, ids: string[]): Promise<void> {
+  if (!ids.length) return;
+  await transact([STATE], "readwrite", async (transaction) => {
+    const store = transaction.objectStore(STATE);
+    const stored = await requestResult(store.get(syncStateKey(storageId)) as IDBRequest<Partial<SyncState> | undefined>);
+    if (!stored?.rejected) return;
+    const rejected = { ...stored.rejected };
+    let removed = false;
+    ids.forEach((id) => {
+      if (id in rejected) {
+        delete rejected[id];
+        removed = true;
+      }
+    });
+    if (removed) store.put({ ...copySyncState(stored), rejected }, syncStateKey(storageId));
+  });
+}
+
+/** Records the server refused, with the message it gave: they cannot be backed up. */
+export async function loadRejectedEvents(storageId: string): Promise<Map<string, string>> {
+  return new Map(Object.entries((await loadSyncState(storageId)).rejected));
+}
+
+/** Ids of the records the server refused: their previews are not uploaded either. */
+export async function loadRejectedEventIds(storageId: string): Promise<Set<string>> {
+  return new Set(Object.keys((await loadSyncState(storageId)).rejected));
 }
 
 export async function loadPendingDeletes(storageId: string, limit?: number): Promise<PendingDeletion[]> {
@@ -429,7 +540,7 @@ export async function clearDirtyDays(storageId: string, days: DirtyDay[]): Promi
 export async function loadSyncState(storageId: string): Promise<SyncState> {
   return transact([STATE], "readonly", async (transaction) => {
     const stored = await requestResult(transaction.objectStore(STATE).get(syncStateKey(storageId)) as IDBRequest<Partial<SyncState> | undefined>);
-    return { ...emptySyncState(), ...stored, correctionCursors: { ...stored?.correctionCursors } };
+    return copySyncState(stored);
   });
 }
 
@@ -438,7 +549,7 @@ export async function updateSyncState(storageId: string, change: (state: SyncSta
   return transact([STATE], "readwrite", async (transaction) => {
     const store = transaction.objectStore(STATE);
     const stored = await requestResult(store.get(syncStateKey(storageId)) as IDBRequest<Partial<SyncState> | undefined>);
-    const state: SyncState = { ...emptySyncState(), ...stored, correctionCursors: { ...stored?.correctionCursors } };
+    const state = copySyncState(stored);
     change(state);
     store.put(state, syncStateKey(storageId));
     return state;

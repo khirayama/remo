@@ -96,7 +96,7 @@ final class SQLiteConnection {
     private func lastError() -> Failure { Failure(description: String(cString: sqlite3_errmsg(handle))) }
 }
 
-enum SQLiteValue {
+enum SQLiteValue: Equatable {
     case null
     case integer(Int64)
     case real(Double)

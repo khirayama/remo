@@ -52,4 +52,22 @@ class TimelineTransferTest {
     @Test fun decodeTimelineImportStillReturnsOnlyRecords() {
         assertEquals(listOf("event-1"), decodeTimelineImport(payload, importedAt = 0L).map(LogEntry::id))
     }
+
+    @Test fun recordsWithAnIdTheServerRefusesAreSkippedInsteadOfTruncated() {
+        val tooLong = "x".repeat(121)
+        val longest = "y".repeat(120)
+        val withLongIds = """
+            {
+              "schemaVersion": 1,
+              "events": [
+                { "id": "$tooLong", "startedAt": "2026-10-11T03:30:02.171Z" },
+                { "id": "$longest", "startedAt": "2026-10-11T03:30:02.171Z" }
+              ]
+            }
+        """.trimIndent()
+
+        // Truncating to 120 would merge records that share a prefix; the server
+        // refuses ids this long, so they cannot be backed up.
+        assertEquals(listOf(longest), decodeTimelineArchive(withLongIds, importedAt = 0L).entries.map(LogEntry::id))
+    }
 }

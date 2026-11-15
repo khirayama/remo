@@ -1,10 +1,12 @@
 import { purgeDeletedCorrections } from "./corrections";
 import { purgeExpiredTombstones } from "./life-events";
 import { purgePhotoCleanup } from "./photos";
+import { purgeDeletedPlaces } from "./places";
 
 export type MaintenanceResult = {
   tombstones: number;
   corrections: number;
+  places: number;
   sessions: number;
   verifications: number;
   apiTokens: number;
@@ -18,6 +20,7 @@ export type MaintenanceResult = {
 export async function runMaintenance(db: D1Database, now: number, bucket?: R2Bucket): Promise<MaintenanceResult> {
   const tombstones = await purgeExpiredTombstones(db, now);
   const corrections = await purgeDeletedCorrections(db, now);
+  const places = await purgeDeletedPlaces(db, now);
   const photoCleanup = bucket ? await purgePhotoCleanup(db, bucket) : undefined;
   const [sessions, verifications, apiTokens] = await db.batch([
     db.prepare("DELETE FROM session WHERE expires_at < ?1").bind(now),
@@ -27,6 +30,7 @@ export async function runMaintenance(db: D1Database, now: number, bucket?: R2Buc
   return {
     tombstones,
     corrections,
+    places,
     sessions: sessions?.meta.changes ?? 0,
     verifications: verifications?.meta.changes ?? 0,
     apiTokens: apiTokens?.meta.changes ?? 0,

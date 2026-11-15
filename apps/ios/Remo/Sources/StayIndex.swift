@@ -340,13 +340,21 @@ final class StayIndexStore: ObservableObject {
     @Published private(set) var revision = 0
     private let worker = StayIndexWorker()
     private var task: Task<Void, Never>?
+    private var lastUpdateAt: Date?
 
     /// Continuous capture changes today's records every few seconds; batch those updates.
     func schedule(database: LogDatabase = .shared) {
         task?.cancel()
         let debounce = stays != nil
+        // A new sample rewrites today, and detecting the whole day again for
+        // every sample is O(n²) over the day. Today is recomputed at most every
+        // 30 seconds; changes to other days still take effect at once.
+        let today = stayDayKey(Date())
+        let onlyToday = database.dirtyDays().allSatisfy { $0.day == today }
+        let throttle = Self.recomputeDelay(onlyToday: onlyToday, lastUpdateAt: lastUpdateAt, now: Date())
         task = Task { [weak self, worker] in
-            if debounce { try? await Task.sleep(for: .seconds(1)) }
+            let wait = max(debounce ? 1 : 0, throttle)
+            if wait > 0 { try? await Task.sleep(for: .seconds(wait)) }
             guard !Task.isCancelled else { return }
             let stays = try? await worker.update(database: database) { done, total in
                 Task { @MainActor [weak self] in self?.progress = (done, total) }
@@ -355,7 +363,15 @@ final class StayIndexStore: ObservableObject {
             self?.stays = stays
             self?.progress = nil
             self?.revision += 1
+            self?.lastUpdateAt = Date()
         }
+    }
+
+    /// How long to wait before recomputing, so today is only recomputed every
+    /// `minimumGap` seconds. Days other than today have no delay.
+    nonisolated static func recomputeDelay(onlyToday: Bool, lastUpdateAt: Date?, now: Date, minimumGap: TimeInterval = 30) -> TimeInterval {
+        guard onlyToday, let lastUpdateAt else { return 0 }
+        return max(0, minimumGap - now.timeIntervalSince(lastUpdateAt))
     }
 
     func clear() {

@@ -69,7 +69,9 @@ export function ApiTokenDialog({ onDismiss, onUnauthorized }: { onDismiss: () =>
   }
 
   if (created) {
-    return <Dialog icon="key" title="トークンを発行しました" onDismiss={() => setCreated(undefined)} actions={
+    // The token is shown only once: a tap outside or Escape must not lose it,
+    // so only the button closes this.
+    return <Dialog icon="key" title="トークンを発行しました" dismissable={false} onDismiss={() => setCreated(undefined)} actions={
       <button type="button" className="text-button" onClick={() => setCreated(undefined)}>完了</button>
     }>
       <p>このトークンは今だけ表示されます。閉じると再表示できないため、AIツールに設定してから閉じてください。</p>

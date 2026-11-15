@@ -7,6 +7,8 @@ struct SettingsState {
     let sleepAccess: SleepData.Access
     let syncStatus: String
     let lastBackupAt: Date?
+    /// Records the server refused; the backup cannot hold them until they are edited.
+    let rejectedRecords: Int
     let email: String?
 }
 
@@ -91,6 +93,16 @@ struct SettingsView: View {
                                 action: nil,
                             ) {
                                 Button("今すぐ", action: actions.onBackup).buttonStyle(TextActionStyle())
+                            }
+                            if state.rejectedRecords > 0 {
+                                GroupDivider()
+                                ActionRow(
+                                    systemName: "exclamationmark.triangle",
+                                    title: "バックアップできない記録 \(state.rejectedRecords)件",
+                                    tint: RemoStyle.amber,
+                                    subtitle: "サーバーが受け付けなかった記録です。記録を編集すると再びバックアップを試みます",
+                                    action: nil,
+                                )
                             }
                             GroupDivider()
                             ActionRow(systemName: "person", title: email, subtitle: "ログイン中", action: nil)

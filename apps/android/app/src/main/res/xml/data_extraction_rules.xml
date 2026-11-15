@@ -6,9 +6,11 @@
   data that is either device-specific or rebuilt from the records.
 -->
 <data-extraction-rules>
-    <cloud-backup>
+    <cloud-backup disableIfNoEncryptionCapabilities="true">
         <exclude domain="sharedpref" path="rem_auth.xml" />
         <exclude domain="sharedpref" path="rem_sync.xml" />
+        <!-- The legacy JSON copy of the timeline, kept only as a migration recovery copy. -->
+        <exclude domain="sharedpref" path="rem_logs.xml" />
         <exclude domain="database" path="rem_photo_index.db" />
         <exclude domain="file" path="stay-index.json" />
         <exclude domain="file" path="capture-diagnostics.jsonl" />
@@ -19,6 +21,7 @@
     <device-transfer>
         <exclude domain="sharedpref" path="rem_auth.xml" />
         <exclude domain="sharedpref" path="rem_sync.xml" />
+        <exclude domain="sharedpref" path="rem_logs.xml" />
         <exclude domain="database" path="rem_photo_index.db" />
         <exclude domain="file" path="stay-index.json" />
         <exclude domain="file" path="capture-diagnostics.jsonl" />

@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { AppContext } from "./auth";
-import { MAX_CLIENT_CLOCK_SKEW_MS } from "./life-events";
+import { advanceSequenceStatement, groupsOf, MAX_CLIENT_CLOCK_SKEW_MS, TOMBSTONE_RETENTION_MS } from "./life-events";
 
 // Names the user gives to places they stay at ("Home", "Office"). A place is a
 // name at one or more anchors (a coordinate and a radius); clients show the
@@ -12,6 +12,10 @@ export const placeRoutes = new Hono<AppContext>();
 
 export const MAX_PLACES = 2_000;
 const MAX_BATCH = 200;
+// D1 allows 100 bound parameters per statement.
+const ID_LOOKUP_SIZE = 90;
+const PURGE_BATCH_SIZE = 1_000;
+const PURGE_MAX_BATCHES = 20;
 export const MAX_PLACE_NAME_LENGTH = 80;
 const MAX_ID_LENGTH = 120;
 export const MIN_PLACE_RADIUS_METERS = 25;
@@ -109,8 +113,11 @@ export function placeFromRow(row: Record<string, unknown>): Place {
 }
 
 export async function readPlaces(db: D1Database, userId: string): Promise<Place[]> {
+  // Tombstones (deleted places) are listed until they are purged, so the limit
+  // has to leave room for them: with only MAX_PLACES rows a full account could
+  // push its own live places out of the list.
   const { results } = await db.prepare(`SELECT ${PLACE_COLUMNS} FROM place WHERE user_id = ?1 ORDER BY id LIMIT ?2`)
-    .bind(userId, MAX_PLACES).all<Record<string, unknown>>();
+    .bind(userId, MAX_PLACES * 2).all<Record<string, unknown>>();
   return results.map(placeFromRow);
 }
 
@@ -123,31 +130,69 @@ export class PlaceLimitError extends Error {}
  */
 export async function writePlaces(db: D1Database, userId: string, places: Place[]): Promise<void> {
   if (!places.length) return;
-  const count = await db.prepare("SELECT COUNT(*) AS count FROM place WHERE user_id = ?1").bind(userId).first<{ count: number }>();
-  if ((count?.count ?? 0) + places.length > MAX_PLACES) throw new PlaceLimitError("The place limit has been reached");
-  await db.batch(places.map((place) => db.prepare(
-    `INSERT INTO place (user_id, id, name, latitude, longitude, radius_meters, anchors, merged_into, updated_at, deleted)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-     ON CONFLICT(user_id, id) DO UPDATE SET
-       name = excluded.name, latitude = excluded.latitude, longitude = excluded.longitude,
-       radius_meters = CASE WHEN excluded.deleted = 1 THEN NULL ELSE COALESCE(excluded.radius_meters, place.radius_meters) END,
-       anchors = CASE WHEN excluded.deleted = 1 THEN NULL ELSE COALESCE(excluded.anchors, place.anchors) END,
-       merged_into = excluded.merged_into,
-       updated_at = excluded.updated_at, deleted = excluded.deleted
-     WHERE excluded.updated_at > place.updated_at`,
-  ).bind(
-    userId,
-    place.id,
-    place.deleted ? "" : place.name,
-    // The coordinate of a deleted place is erased with its name.
-    place.deleted ? 0 : place.latitude,
-    place.deleted ? 0 : place.longitude,
-    place.deleted ? null : place.radiusMeters ?? null,
-    place.deleted || !place.anchors ? null : JSON.stringify(place.anchors),
-    place.deleted ? place.mergedInto ?? null : null,
-    place.updatedAt,
-    place.deleted ? 1 : 0,
-  )));
+  // Updating a stored place and writing a tombstone take no capacity of the
+  // live places, so only ids that do not exist yet count towards the limit.
+  const ids = [...new Set(places.map((place) => place.id))];
+  const stored = new Set<string>();
+  for (const group of groupsOf(ids, ID_LOOKUP_SIZE)) {
+    const { results } = await db.prepare(
+      `SELECT id FROM place WHERE user_id = ?1 AND id IN (${group.map((_, index) => `?${index + 2}`).join(", ")})`,
+    ).bind(userId, ...group).all<{ id: string }>();
+    results.forEach((row) => stored.add(row.id));
+  }
+  const added = new Set(places.filter((place) => !place.deleted && !stored.has(place.id)).map((place) => place.id)).size;
+  if (added > 0) {
+    const live = await db.prepare("SELECT COUNT(*) AS count FROM place WHERE user_id = ?1 AND deleted = 0")
+      .bind(userId).first<{ count: number }>();
+    if ((live?.count ?? 0) + added > MAX_PLACES) throw new PlaceLimitError("The place limit has been reached");
+  }
+  await db.batch([
+    // Places have no updated_at from the sequence (the client clock decides
+    // last-writer-wins), but a write still moves the sync cursor so other
+    // devices notice that they have to read the list again.
+    advanceSequenceStatement(db, userId, places.length, 0),
+    ...places.map((place) => db.prepare(
+      `INSERT INTO place (user_id, id, name, latitude, longitude, radius_meters, anchors, merged_into, updated_at, deleted)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+       ON CONFLICT(user_id, id) DO UPDATE SET
+         name = excluded.name, latitude = excluded.latitude, longitude = excluded.longitude,
+         radius_meters = CASE WHEN excluded.deleted = 1 THEN NULL ELSE COALESCE(excluded.radius_meters, place.radius_meters) END,
+         anchors = CASE WHEN excluded.deleted = 1 THEN NULL ELSE COALESCE(excluded.anchors, place.anchors) END,
+         merged_into = excluded.merged_into,
+         updated_at = excluded.updated_at, deleted = excluded.deleted
+       WHERE excluded.updated_at > place.updated_at`,
+    ).bind(
+      userId,
+      place.id,
+      place.deleted ? "" : place.name,
+      // The coordinate of a deleted place is erased with its name.
+      place.deleted ? 0 : place.latitude,
+      place.deleted ? 0 : place.longitude,
+      place.deleted ? null : place.radiusMeters ?? null,
+      place.deleted || !place.anchors ? null : JSON.stringify(place.anchors),
+      place.deleted ? place.mergedInto ?? null : null,
+      place.updatedAt,
+      place.deleted ? 1 : 0,
+    )),
+  ]);
+}
+
+// A deleted place only has to stay until every device had a chance to read the
+// list again; then it is removed. Returns the number of rows removed.
+export async function purgeDeletedPlaces(db: D1Database, now: number): Promise<number> {
+  const cutoff = now - TOMBSTONE_RETENTION_MS;
+  let purged = 0;
+  for (let batch = 0; batch < PURGE_MAX_BATCHES; batch += 1) {
+    const result = await db.prepare(
+      `DELETE FROM place
+       WHERE (user_id, id) IN (
+         SELECT user_id, id FROM place WHERE deleted = 1 AND updated_at < ?1 LIMIT ?2
+       )`,
+    ).bind(cutoff, PURGE_BATCH_SIZE).run();
+    purged += result.meta.changes;
+    if (result.meta.changes < PURGE_BATCH_SIZE) break;
+  }
+  return purged;
 }
 
 placeRoutes.get("/places", async (c) => {

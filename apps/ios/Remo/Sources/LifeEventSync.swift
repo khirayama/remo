@@ -28,6 +28,9 @@ actor BackupCoordinator {
         defer { inFlight = nil }
         return try await task.value
     }
+
+    /// Stops the running backup, for a background task that is about to expire.
+    func cancel() { inFlight?.cancel() }
 }
 
 enum LifeEventSync {
@@ -203,30 +206,73 @@ enum LifeEventSync {
             database.markDeletionsSynced(deletions)
         }
         // Each batch is marked as it is acknowledged, so an interrupted first
-        // backup continues instead of starting over.
+        // backup continues instead of starting over. A 2xx can still refuse
+        // items; those are remembered and not sent again unless edited.
         while true {
             let batch = database.dirtyEntries(limit: batchSize)
             if batch.isEmpty { break }
-            try await send("api/v1/events/batch", method: "POST", token: token, body: ["events": batch.map(eventPayload)])
-            database.markSynced(batch)
+            let data = try await send("api/v1/events/batch", method: "POST", token: token, body: ["events": batch.map(eventPayload)])
+            let rejected = Self.rejectedEvents(data)
+            let rejectedByID = Dictionary(rejected.map { ($0.id, $0.message) }, uniquingKeysWith: { first, _ in first })
+            database.markUploadRejected(batch.compactMap { entry in
+                rejectedByID[entry.id].map { (entry, $0) }
+            })
+            database.markSynced(batch.filter { rejectedByID[$0.id] == nil })
         }
         // Sleep is read from HealthKit, so a failure there never blocks the rest of the backup.
         do { try await SleepBackup.synchronize(token: token, account: account) }
         catch SyncError.unauthorized { throw SyncError.unauthorized }
         catch {}
         guard pull else { return .synced }
-        try await download(database: database, token: token, account: account)
-        try await syncPlaces(database: database, token: token)
+        // The head cursor advances on every synced write (records, deletions,
+        // corrections, places, sleep). When it did not move, nothing else can
+        // have changed for this account, so the places and corrections reads
+        // are skipped as well; locally dirty ones are still uploaded.
+        let pulled = try await download(database: database, token: token, account: account)
+        try await syncPlaces(database: database, token: token, pull: pulled)
         // Corrections come right after the places they name.
-        try await syncCorrections(database: database, token: token, account: account)
+        try await syncCorrections(database: database, token: token, account: account, pull: pulled)
         return .synced
     }
 
-    /// Downloads page by page and applies each page, so a restore is never held in memory.
-    private static func download(database: LogDatabase, token: String, account: String) async throws {
+    /// A record the server refused with the reason it gave. An item without an
+    /// id cannot be matched to a stored record and is ignored.
+    struct RejectedUpload: Equatable {
+        let id: String
+        let message: String
+    }
+
+    private struct BatchResponse: Decodable {
+        let data: Payload?
+
+        struct Payload: Decodable {
+            let rejected: [Rejection]?
+        }
+
+        struct Rejection: Decodable {
+            let kind: String
+            let id: String?
+            let message: String?
+        }
+    }
+
+    /// The events of a batch response the server refused. Rejected deletions
+    /// are dropped with the rest of the deletion queue: they can never succeed.
+    static func rejectedEvents(_ data: Foundation.Data) -> [RejectedUpload] {
+        guard let response = try? JSONDecoder().decode(BatchResponse.self, from: data) else { return [] }
+        return (response.data?.rejected ?? []).compactMap { rejection in
+            guard rejection.kind == "event", let id = rejection.id else { return nil }
+            return RejectedUpload(id: id, message: rejection.message ?? "invalid")
+        }
+    }
+
+    /// Downloads page by page and applies each page, so a restore is never held
+    /// in memory. False when the head showed nothing changed since the stored
+    /// cursor; the caller then skips the other reads.
+    private static func download(database: LogDatabase, token: String, account: String) async throws -> Bool {
         let stored = loadCursor(account: account, token: token)
         if let stored {
-            guard let head = try await fetchHead(token: token), compareCursors(head, stored) > 0 else { return }
+            guard let head = try await fetchHead(token: token), compareCursors(head, stored) > 0 else { return false }
         }
         var page = stored == nil ? UserDefaults.standard.string(forKey: fullPageKey(account)) : nil
         var cursor = stored
@@ -259,15 +305,17 @@ enum LifeEventSync {
         // says nothing about what other devices committed in between.
         if let reached { UserDefaults.standard.set(reached.token, forKey: cursorKey(account)) }
         UserDefaults.standard.removeObject(forKey: fullPageKey(account))
+        return true
     }
 
-    private static func syncPlaces(database: LogDatabase, token: String) async throws {
+    private static func syncPlaces(database: LogDatabase, token: String, pull: Bool) async throws {
         let dirty = database.dirtyPlaces()
         for start in stride(from: 0, to: dirty.count, by: 200) {
             let batch = Array(dirty[start..<Swift.min(start + 200, dirty.count)])
             try await send("api/v1/places", method: "PUT", token: token, body: ["places": batch.map(placePayload)])
             database.markPlacesSynced(batch)
         }
+        guard pull else { return }
         let data = try await request(AppConfig.apiBaseURL.appendingPathComponent("api/v1/places"), token: token)
         let places = try JSONDecoder().decode(PlacesResponse.self, from: data).data
         database.applyRemotePlaces(places.map(\.place))
@@ -292,16 +340,18 @@ enum LifeEventSync {
         return body
     }
 
-    /// Sends the corrections that were not uploaded in this epoch and reads
-    /// every page after this account's cursor. A received correction is added
-    /// when it is missing here, and a deletion is applied; nothing else changes.
-    private static func syncCorrections(database: LogDatabase, token: String, account: String) async throws {
+    /// Sends the corrections that were not uploaded in this epoch and, after a
+    /// pull, reads every page after this account's cursor. A received
+    /// correction is added when it is missing here, and a deletion is applied;
+    /// nothing else changes.
+    private static func syncCorrections(database: LogDatabase, token: String, account: String, pull: Bool) async throws {
         while true {
             let batch = database.dirtyCorrections(limit: 200)
             if batch.isEmpty { break }
             try await send("api/v1/corrections", method: "PUT", token: token, body: ["corrections": batch.map(correctionPayload)])
             database.markCorrectionsSynced(batch)
         }
+        guard pull else { return }
         var cursor = correctionCursor(account: account)
         while true {
             var components = URLComponents(url: AppConfig.apiBaseURL.appendingPathComponent("api/v1/corrections"), resolvingAgainstBaseURL: false)!
@@ -367,16 +417,18 @@ enum LifeEventSync {
     }
 
     // A 2xx response means every item was handled: applied, or rejected by the
-    // server as invalid. Either way it is done, so one malformed record cannot
-    // block the rest of the queue forever.
-    static func send(_ path: String, method: String, token: String, body: [String: Any]) async throws {
+    // server as invalid (reported in the body). Either way it is done, so one
+    // malformed record cannot block the rest of the queue forever.
+    @discardableResult
+    static func send(_ path: String, method: String, token: String, body: [String: Any]) async throws -> Data {
         var request = URLRequest(url: AppConfig.apiBaseURL.appendingPathComponent(path))
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (_, response) = try await AppConfig.session.data(for: request)
+        let (data, response) = try await AppConfig.session.data(for: request)
         try validate(response)
+        return data
     }
 
     private static func request(_ url: URL, token: String) async throws -> Data {

@@ -76,8 +76,6 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.foundation.text.KeyboardOptions
 import com.google.android.gms.maps.model.LatLng
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.util.Locale
 
 private data class DisplayPhoto(val entry: LogEntry, val digest: String? = null) {
@@ -174,8 +172,7 @@ private fun PhotoViewerDialog(entry: LogEntry, libraryPhoto: LibraryPhoto?, dige
     var loading by remember(entry.id, digest, libraryPhoto?.id) { mutableStateOf(true) }
     LaunchedEffect(entry.id, digest, libraryPhoto) {
         image = if (digest != null) runCatching { PhotoBackup.remoteImage(entry.id, digest) }.getOrNull()
-            else withContext(Dispatchers.IO) { libraryPhoto?.let { PhotoLibrary.loadThumbnail(context, it, 1800) } }
-                ?: runCatching { PhotoBackup.remoteThumbnail(entry.id) }.getOrNull()
+            else runCatching { loadPhotoThumbnail(context, entry, libraryPhoto, 1800) }.getOrNull()
         loading = false
     }
     val isVideo = entry.mediaType == MediaType.VIDEO

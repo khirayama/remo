@@ -259,8 +259,13 @@ export async function ownershipFor(storageId: string, userId: string): Promise<O
   const { owner } = await loadSyncState(storageId);
   if (!owner) return "unclaimed";
   if (owner === userId) return "owned";
-  // Nothing recorded here: there is nothing that could end up in the wrong account.
-  return await countEvents(storageId) === 0 ? "unclaimed" : "other";
+  // Anything recorded here, including place names (which hold coordinates)
+  // and corrections, could end up in the wrong account. Only an empty
+  // browser can be handed to another account without asking.
+  const hasData = await countEvents(storageId) !== 0
+    || (await loadStoredPlaces(storageId)).some((place) => !place.deleted)
+    || (await loadCorrections(storageId)).some((correction) => !correction.deleted);
+  return hasData ? "other" : "unclaimed";
 }
 
 /** Backs the records in this browser up to [userId] from now on. */
@@ -277,8 +282,14 @@ export async function replaceRecords(storageId: string, userId: string): Promise
   await clearStoredEvents(storageId);
   await updateSyncState(storageId, (state) => {
     state.owner = userId;
-    delete state.cursors[userId];
-    delete state.fullSync[userId];
+    // Every download position belonged to the account that was here before:
+    // keeping one would leave this account's backup unrestored (its writes
+    // before that position look applied already).
+    state.cursors = {};
+    state.fullSync = {};
+    state.correctionCursors = {};
+    // Nothing is refused for this account yet.
+    state.rejected = {};
   });
 }
 
@@ -288,6 +299,10 @@ export async function clearEvents(storageId: string): Promise<void> {
   await updateSyncState(storageId, (state) => {
     state.cursors = {};
     state.fullSync = {};
+    // The corrections and places went with the records, so their download
+    // positions no longer describe what is here.
+    state.correctionCursors = {};
+    state.rejected = {};
   });
 }
 
@@ -299,9 +314,13 @@ export async function forgetAccount(storageId: string, userId: string): Promise<
   await updateSyncState(storageId, (state) => {
     delete state.cursors[userId];
     delete state.fullSync[userId];
+    delete state.correctionCursors[userId];
     if (state.owner === userId) {
       state.owner = undefined;
       state.epoch += 1;
+      // The server refused these for the account that is gone; the records now
+      // go to the next account.
+      state.rejected = {};
     }
   });
   await clearUploadedPhotoIds(userId).catch(() => undefined);
@@ -402,8 +421,14 @@ export async function downloadExport(storageId: string, range: ExportRange): Pro
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = `remo-timeline-${range.from}-${range.to}-${new Date().toISOString().slice(0, 10)}.json`;
+  // Safari starts the download after click() returns, and only for an anchor
+  // in the document: the URL has to stay valid until then.
+  document.body.appendChild(anchor);
   anchor.click();
-  URL.revokeObjectURL(url);
+  setTimeout(() => {
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }, 0);
 }
 
 /** What a Remo JSON file brings in besides its records. */

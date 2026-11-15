@@ -58,6 +58,7 @@ class AuthViewModel : ViewModel() {
             withContext(Dispatchers.IO) { SecureTokenStore.clear() }
             SecureTokenStore.clearAccountId()
             BackupCoordinator.resetSession()
+            BackupWorker.cancel(RemoApplication.context)
             mutableState.value = AuthUiState(initialized = true)
         }
     }
@@ -97,6 +98,7 @@ class AuthViewModel : ViewModel() {
         BackupCoordinator.forgetAccount(RemoApplication.context)
         withContext(Dispatchers.IO) { SecureTokenStore.clear() }
         SecureTokenStore.clearAccountId()
+        BackupWorker.cancel(RemoApplication.context)
         mutableState.value = AuthUiState(initialized = true)
         return null
     }
@@ -107,6 +109,7 @@ class AuthViewModel : ViewModel() {
             withContext(Dispatchers.IO) { SecureTokenStore.clear() }
             SecureTokenStore.clearAccountId()
             BackupCoordinator.resetSession()
+            BackupWorker.cancel(RemoApplication.context)
             mutableState.value = AuthUiState(initialized = true)
         }
     }

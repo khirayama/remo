@@ -31,4 +31,25 @@ class SleepBackupTest {
     fun cursorIsNowWithoutSessions() {
         assertEquals(999L, sleepBackupCursor(emptyList(), 999L))
     }
+
+    @Test
+    fun onlyNewOrChangedSessionsAreSent() {
+        val sessions = listOf(SleepSession(10, 20), SleepSession(30, 40), SleepSession(50, 60))
+        val sent = mapOf(10L to 20L, 30L to 45L)
+
+        assertEquals(listOf(SleepSession(30, 40), SleepSession(50, 60)), sleepSessionsToSend(sessions, sent))
+    }
+
+    @Test
+    fun sentSessionsRoundTrip() {
+        val sent = mapOf(10L to 20L, 30L to 50L)
+        assertEquals(sent, decodeSentSleep(encodeSentSleep(sent)))
+    }
+
+    @Test
+    fun unreadableSentSessionsMeanNothingWasSent() {
+        assertEquals(emptyMap<Long, Long>(), decodeSentSleep(null))
+        assertEquals(emptyMap<Long, Long>(), decodeSentSleep("not json"))
+        assertEquals(mapOf(10L to 20L), decodeSentSleep("""{"10":20,"bad":30}"""))
+    }
 }

@@ -14,6 +14,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /** The stored session is no longer accepted: the user has to sign in again. */
@@ -28,6 +29,26 @@ internal fun sleepBackupRange(cursor: Long?, now: Long): Pair<Long, Long> =
 
 /** The newest end time that was sent, or [now] when there was nothing to send. */
 internal fun sleepBackupCursor(sessions: List<SleepSession>, now: Long): Long = sessions.maxOfOrNull(SleepSession::endedAt) ?: now
+
+/** The sessions already sent, by start time: the end time is what changes. */
+internal fun decodeSentSleep(value: String?): Map<Long, Long> = runCatching {
+    val json = JSONObject(value ?: return emptyMap())
+    buildMap {
+        json.keys().forEach { key -> key.toLongOrNull()?.let { put(it, json.optLong(key)) } }
+    }
+}.getOrElse { emptyMap() }
+
+internal fun encodeSentSleep(sent: Map<Long, Long>): String = JSONObject().apply {
+    sent.forEach { (startedAt, endedAt) -> put(startedAt.toString(), endedAt) }
+}.toString()
+
+/**
+ * Only sessions that are new or whose end time changed. The server rewrites
+ * every row it receives, so re-sending the re-read week on each sync costs a
+ * write per night for nothing.
+ */
+internal fun sleepSessionsToSend(sessions: List<SleepSession>, sent: Map<Long, Long>): List<SleepSession> =
+    sessions.filter { sent[it.startedAt] != it.endedAt }
 
 /** A single gate shared by foreground refreshes and durable background backup. */
 object BackupCoordinator {
@@ -83,6 +104,7 @@ object BackupCoordinator {
             remove(fullPageKey(token))
             remove(correctionCursorKey(token))
             remove(sleepCursorKey(token))
+            remove(sleepSentKey(token))
             remove("sync_last_success_${accountKey(token)}")
             remove("sync_last_success_${token.hashCode()}")
         }
@@ -101,6 +123,9 @@ object BackupCoordinator {
 
     /** How far sleep has been backed up; kept per account. */
     private fun sleepCursorKey(token: String): String = "sleep_synced_until_${accountKey(token)}"
+
+    /** The sleep sessions already sent, kept per account so a re-read week is not uploaded again. */
+    private fun sleepSentKey(token: String): String = "sleep_sent_${accountKey(token)}"
 
     private fun loadCursor(context: Context, token: String): SyncCursor? {
         val preferences = preferences(context)
@@ -173,16 +198,22 @@ object BackupCoordinator {
             while (true) {
                 val deletions = store.pendingDeletions(ApiClient.BATCH_SIZE)
                 if (deletions.isEmpty()) break
+                // A refused deletion is malformed and can never succeed, so it
+                // is dropped like an accepted one.
                 ApiClient.pushDeletions(deletions, token)
                 store.markDeletionsSynced(deletions)
             }
             // Each batch is marked as it is acknowledged, so an interrupted
-            // first backup continues instead of starting over.
+            // first backup continues instead of starting over. A record the
+            // server refused is kept as rejected, not as backed up.
             while (true) {
                 val batch = store.dirtyEntries(ApiClient.BATCH_SIZE)
                 if (batch.isEmpty()) break
-                ApiClient.pushEvents(batch, token)
-                store.markSynced(batch)
+                val rejected = ApiClient.pushEvents(batch, token)
+                    .filter { it.kind == "event" }
+                    .mapNotNull { item -> item.id?.let { it to (item.message ?: "送信できませんでした") } }
+                    .toMap()
+                store.markSynced(batch, rejected)
             }
             // A failure reading or uploading Health Connect sleep must not hold
             // back the records, places and photos; the next sync reads the same
@@ -202,9 +233,12 @@ object BackupCoordinator {
             val revisionAfterPush = store.revision
             val pullDue = force || (lastPullAt?.let { now - it >= PULL_INTERVAL_MS } ?: true)
             if (pullDue) {
-                pull(context, store, token)
-                syncPlaces(store, token)
-                syncCorrections(context, store, token)
+                // The cursor advances on every synced write (events, deletions,
+                // corrections, places and sleep), so an unchanged head means
+                // the places and corrections are unchanged too.
+                val pulled = pull(context, store, token)
+                syncPlaces(store, token, pullRemote = pulled)
+                syncCorrections(context, store, token, pullRemote = pulled)
                 // Never keep an old account's response after sign-out/account change.
                 if (SecureTokenStore.get() != token) return@withLock STATUS_WAITING
                 lastPullAt = SystemClock.elapsedRealtime()
@@ -221,7 +255,14 @@ object BackupCoordinator {
             syncedRevision = if (store.hasPendingChanges) revisionAfterPush else store.revision
             lastSuccessAt = SystemClock.elapsedRealtime()
             preferences(context).edit { putLong("sync_last_success_${accountKey(token)}", System.currentTimeMillis()) }
-            status = if (photosPending) STATUS_PHOTOS_WAITING else STATUS_DONE
+            // A record the server refused is not in the backup, so everything
+            // else being uploaded must not be reported as a complete backup.
+            val rejectedCount = store.rejectedCount()
+            status = when {
+                photosPending -> STATUS_PHOTOS_WAITING
+                rejectedCount > 0 -> "$STATUS_DONE（${rejectedCount}件は送信できません）"
+                else -> STATUS_DONE
+            }
             status
         } catch (error: ApiException) {
             if (isSessionRejected(error)) throw SessionExpiredException()
@@ -241,25 +282,32 @@ object BackupCoordinator {
         val stored = if (preferences.contains(key)) preferences.getLong(key, 0L) else null
         val (from, until) = sleepBackupRange(stored, now)
         val sessions = SleepData.sessions(context, from, until) ?: return
-        sessions.chunked(ApiClient.BATCH_SIZE).forEach { ApiClient.pushSleepSessions(it, token) }
+        // The range is read from a week back so a changed night is noticed, but
+        // only the sessions that are new or changed are sent.
+        val sentKey = sleepSentKey(token)
+        val changed = sleepSessionsToSend(sessions, decodeSentSleep(preferences.getString(sentKey, null)))
+        changed.chunked(ApiClient.BATCH_SIZE).forEach { ApiClient.pushSleepSessions(it, token) }
         // Re-reading from a week before the cursor can find only older sessions; the cursor never moves back.
-        preferences.edit { putLong(key, maxOf(stored ?: 0L, sleepBackupCursor(sessions, now))) }
+        preferences.edit {
+            putLong(key, maxOf(stored ?: 0L, sleepBackupCursor(sessions, now)))
+            putString(sentKey, encodeSentSleep(sessions.associate { it.startedAt to it.endedAt }))
+        }
     }
 
-    /** Downloads page by page and applies each page, so a restore is never held in memory. */
-    private suspend fun pull(context: Context, store: LogStore, token: String) {
+    /** Downloads page by page and applies each page, so a restore is never held in memory. Returns whether a download ran. */
+    private suspend fun pull(context: Context, store: LogStore, token: String): Boolean {
         val preferences = preferences(context)
         val stored = loadCursor(context, token)
         if (stored != null) {
             val head = ApiClient.fetchEventHead(token)
-            if (head == null || ApiClient.compareCursors(head, stored) <= 0) return
+            if (head == null || ApiClient.compareCursors(head, stored) <= 0) return false
         }
         var page: String? = if (stored == null) preferences.getString(fullPageKey(token), null) else null
         var cursor = stored
         var reached: SyncCursor? = null
         while (true) {
             val result = ApiClient.fetchEventPage(token, cursor, page)
-            if (SecureTokenStore.get() != token) return
+            if (SecureTokenStore.get() != token) return false
             store.applyRemote(result.events, result.deletions)
             reached = result.cursor ?: reached
             if (result.nextPage != null) {
@@ -278,24 +326,29 @@ object BackupCoordinator {
             reached?.takeIf { it.updatedAt >= 0L }?.let { putString(cursorKey(token), it.token()) }
             remove(fullPageKey(token))
         }
+        return true
     }
 
-    private suspend fun syncPlaces(store: LogStore, token: String) {
+    /** Sends this device's places; the account's are read only when a download ran. */
+    private suspend fun syncPlaces(store: LogStore, token: String, pullRemote: Boolean) {
         store.dirtyPlaces().chunked(200).forEach { batch ->
             ApiClient.pushPlaces(batch, token)
             store.markPlacesSynced(batch)
         }
-        store.applyRemotePlaces(ApiClient.fetchPlaces(token))
+        if (pullRemote) store.applyRemotePlaces(ApiClient.fetchPlaces(token))
     }
 
     /** Sends this device's corrections, then reads the account's from its cursor. */
-    private suspend fun syncCorrections(context: Context, store: LogStore, token: String) {
+    private suspend fun syncCorrections(context: Context, store: LogStore, token: String, pullRemote: Boolean) {
         while (true) {
             val batch = store.dirtyCorrections(ApiClient.CORRECTION_BATCH_SIZE)
             if (batch.isEmpty()) break
             ApiClient.pushCorrections(batch, token)
             store.markCorrectionsSynced(batch)
         }
+        // Nothing was downloaded, so the account's corrections are unchanged;
+        // the ones created here were just sent.
+        if (!pullRemote) return
         var cursor = preferences(context).getLong(correctionCursorKey(token), 0L)
         while (true) {
             val page = ApiClient.fetchCorrections(cursor, token)
@@ -312,6 +365,7 @@ object BackupCoordinator {
         StayIndexStorage.delete(context)
         CaptureDiagnostics.clear(context)
         PhotoLibrary.clearCache(context)
+        PhotoBackup.clearCache()
     }
 
     suspend fun deleteAll(context: Context) = mutex.withLock {
@@ -325,7 +379,7 @@ object BackupCoordinator {
         }
         if (token != null && !belongsToOtherAccount(context)) {
             ApiClient.deleteAllData()
-            preferences(context).edit { remove(cursorKey(token)); remove(fullPageKey(token)); remove(correctionCursorKey(token)); remove(sleepCursorKey(token)) }
+            preferences(context).edit { remove(cursorKey(token)); remove(fullPageKey(token)); remove(correctionCursorKey(token)); remove(sleepCursorKey(token)); remove(sleepSentKey(token)) }
         }
         AutomaticCaptureService.setEnabled(context, false)
         clearDevice(context)
@@ -338,8 +392,14 @@ object BackupCoordinator {
 
 class BackupWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
     override suspend fun doWork(): Result = try {
-        BackupCoordinator.synchronize(applicationContext)
-        Result.success()
+        // Signed out there is nothing to back up. Leave without touching the
+        // network or the database instead of waking the process every 15 minutes.
+        if (SecureTokenStore.accountId() == null) {
+            Result.success()
+        } else {
+            BackupCoordinator.synchronize(applicationContext)
+            Result.success()
+        }
     } catch (cancelled: kotlinx.coroutines.CancellationException) {
         throw cancelled
     } catch (_: SessionExpiredException) {
@@ -350,11 +410,18 @@ class BackupWorker(context: Context, parameters: WorkerParameters) : CoroutineWo
     }
 
     companion object {
+        private const val WORK_NAME = "remo-backup"
+
         fun schedule(context: Context) {
             val request = PeriodicWorkRequestBuilder<BackupWorker>(15, TimeUnit.MINUTES)
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
                 .build()
-            WorkManager.getInstance(context).enqueueUniquePeriodicWork("remo-backup", ExistingPeriodicWorkPolicy.KEEP, request)
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, request)
+        }
+
+        /** Stops the periodic backup while signed out; [schedule] brings it back after signing in. */
+        fun cancel(context: Context) {
+            WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME)
         }
     }
 }

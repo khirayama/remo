@@ -2,9 +2,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
+import { noStoreCache } from "../src/index";
 import type { AppContext } from "../src/lib/auth";
 import { lifeEventRoutes, MAX_BATCH_ITEMS, MAX_CHUNK_BYTES, MAX_CLIENT_CLOCK_SKEW_MS, MAX_PHOTO_EVENTS_PER_USER, TOMBSTONE_RETENTION_MS } from "../src/lib/life-events";
-import { placeRoutes } from "../src/lib/places";
+import { placeRoutes, MAX_PLACES } from "../src/lib/places";
 import { runMaintenance } from "../src/lib/maintenance";
 import { photoRoutes } from "../src/lib/photos";
 import { d1, migrate } from "./support/sqlite-d1";
@@ -380,10 +381,25 @@ describe("timeline sync against SQLite", () => {
       VALUES ('hash-expired', 'expired', 'user-1', '', 0, ${now - 1}),
              ('hash-valid', 'valid', 'user-1', '', 0, ${now + 60_000})`);
 
-    expect(await runMaintenance(env.DB, now)).toEqual({ tombstones: 1, corrections: 0, sessions: 1, verifications: 1, apiTokens: 1 });
+    expect(await runMaintenance(env.DB, now)).toEqual({ tombstones: 1, corrections: 0, places: 0, sessions: 1, verifications: 1, apiTokens: 1 });
     expect(database.prepare("SELECT id FROM life_event ORDER BY id").all()).toEqual([{ id: "active" }, { id: "recent" }]);
     expect(database.prepare("SELECT id FROM session").all()).toEqual([{ id: "valid" }]);
     expect(database.prepare("SELECT id FROM api_token").all()).toEqual([{ id: "valid" }]);
+  });
+
+  it("marks authenticated responses as not cacheable", async () => {
+    const { env } = setup();
+    const app = new Hono<AppContext>();
+    app.use("*", noStoreCache);
+    app.use("*", async (c, next) => {
+      c.set("user", { id: "user-1", email: "user-1@example.com", name: "user-1" });
+      await next();
+    });
+    app.route("/", lifeEventRoutes);
+
+    const response = await app.request("/events", {}, env);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
   });
 
   it("reads through indexes", () => {
@@ -434,6 +450,29 @@ describe("timeline sync against SQLite", () => {
     expect((await user.sync(cursor)).ids).toEqual(["late"]);
   });
 
+  it("does not read location windows on a page filled with records", async () => {
+    const statements: string[] = [];
+    const { as, database } = setup((sql) => statements.push(sql));
+    const user = as("user-1");
+    database.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+      INSERT INTO life_event (user_id, id, started_at, source, updated_at, client_updated_at)
+      SELECT 'user-1', printf('e%05d', i), i, 'photo', i, i FROM n`);
+    database.exec("INSERT INTO user_sync_state (user_id, seq) VALUES ('user-1', 5000) ON CONFLICT(user_id) DO UPDATE SET seq = excluded.seq");
+
+    statements.length = 0;
+    const first = await user.get("/events");
+    expect(first.body.data).toHaveLength(5000);
+    expect(first.body.meta.hasMore).toBe(true);
+    // A megabyte of samples per window row would be read and discarded.
+    expect(statements.some((sql) => sql.includes("location_chunk"))).toBe(false);
+
+    // The page that finishes the records reads the windows with them.
+    statements.length = 0;
+    const next = await user.get(`/events?page=${encodeURIComponent(first.body.meta.nextPage)}`);
+    expect(next.body.meta.hasMore).toBe(false);
+    expect(statements.some((sql) => sql.includes("FROM location_chunk"))).toBe(true);
+  });
+
   it("starts a full sync over for a page token it did not issue", async () => {
     const { as } = setup();
     const user = as("user-1");
@@ -479,6 +518,55 @@ describe("timeline sync against SQLite", () => {
     await user.putPlaces([{ ...home, updatedAt: 20, deleted: true }]);
     expect((await user.get("/places")).body.data).toEqual([{ id: "home", name: "", latitude: 0, longitude: 0, updatedAt: 20, deleted: true }]);
     expect((await as("user-2").get("/places")).body.data).toEqual([]);
+  });
+
+  it("moves the sync cursor when places change", async () => {
+    const { as } = setup();
+    const user = as("user-1");
+    await user.batch({ events: [event("a", 10)] });
+    const head = (await user.get("/events/head")).body.data.cursor as string;
+    await user.putPlaces([{ id: "home", name: "Home", latitude: 35, longitude: 139, updatedAt: 10 }]);
+    const after = (await user.get("/events/head")).body.data.cursor as string;
+    expect(after).not.toBe(head);
+    await user.putPlaces([{ id: "home", name: "Home", latitude: 35, longitude: 139, updatedAt: 20 }]);
+    expect((await user.get("/events/head")).body.data.cursor).not.toBe(after);
+  });
+
+  it("counts only new live places against the place limit", async () => {
+    const { as, database } = setup();
+    const user = as("user-1");
+    database.exec(`WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ${MAX_PLACES - 1})
+      INSERT INTO place (user_id, id, name, latitude, longitude, updated_at, deleted)
+      SELECT 'user-1', 'p' || i, 'P', 35, 139, 1, 0 FROM n`);
+    const place = (id: string, extra: Record<string, unknown> = {}) => ({ id, name: "P", latitude: 35, longitude: 139, updatedAt: 10, ...extra });
+
+    // Updating a stored place takes no capacity.
+    expect((await user.putPlaces([place("p0")])).body.data).toEqual({ accepted: 1 });
+    // A new live place does not fit.
+    const full = await user.putPlaces([place("new")]);
+    expect(full.status).toBe(507);
+    expect(full.body.error.code).toBe("storage_limit");
+    // A tombstone takes no capacity either.
+    expect((await user.putPlaces([place("gone", { name: "", deleted: true })])).body.data).toEqual({ accepted: 1 });
+    // Deleting a stored place frees its slot.
+    expect((await user.putPlaces([place("p1", { name: "", deleted: true })])).body.data).toEqual({ accepted: 1 });
+    expect((await user.putPlaces([place("new")])).body.data).toEqual({ accepted: 1 });
+    expect(database.prepare("SELECT COUNT(*) AS count FROM place WHERE user_id = 'user-1' AND deleted = 0").get())
+      .toEqual({ count: MAX_PLACES });
+  });
+
+  it("purges deleted places past their retention and keeps live ones", async () => {
+    const { as, database, env } = setup();
+    const user = as("user-1");
+    await user.putPlaces([
+      { id: "gone", name: "", latitude: 0, longitude: 0, updatedAt: 10, deleted: true },
+      { id: "home", name: "Home", latitude: 35, longitude: 139, updatedAt: 10 },
+    ]);
+    const now = Date.now();
+    database.exec(`UPDATE place SET updated_at = ${now - TOMBSTONE_RETENTION_MS - 1} WHERE id = 'gone'`);
+
+    expect((await runMaintenance(env.DB, now)).places).toBe(1);
+    expect(database.prepare("SELECT id FROM place ORDER BY id").all()).toEqual([{ id: "home" }]);
   });
 
   it("moves existing location rows into chunks and keeps cursors valid", async () => {

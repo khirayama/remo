@@ -9,6 +9,31 @@ struct PhotoImportResult {
     var inheritedCorrections: [String: String] = [:]
 }
 
+/// What one scan decided about records whose photos are gone.
+struct StalePhotoDeletion: Equatable {
+    /// Records to remove now.
+    let delete: Set<String>
+    /// Missing records held back until the next completed scan confirms them.
+    let deferred: Set<String>
+}
+
+/// A single scan can see a partial library: iCloud photos still downloading,
+/// Photos rebuilding after an update, or a limited-access fetch. Deleting a
+/// record then tombstones it and removes its cloud preview for good, so a
+/// large disappearance waits for the next completed scan. A record confirmed
+/// missing twice in a row is deleted however many there are.
+func stalePhotoDeletions(candidates: Set<String>, current: Set<String>, previousRecords: Int, deferred: Set<String>) -> StalePhotoDeletion {
+    let confirmed = deferred.subtracting(current)
+    let fresh = candidates.subtracting(deferred)
+    // More than max(20, 10%) of the records the last scan knew about is not
+    // something a few deleted photos can explain.
+    let limit = max(20, Int(Double(previousRecords) * 0.1))
+    if fresh.count > limit {
+        return StalePhotoDeletion(delete: confirmed, deferred: deferred.subtracting(confirmed).union(fresh))
+    }
+    return StalePhotoDeletion(delete: candidates.union(confirmed), deferred: [])
+}
+
 @MainActor
 final class PhotoTimelineIndexer: ObservableObject {
     @Published private(set) var isIndexing = false
@@ -19,6 +44,9 @@ final class PhotoTimelineIndexer: ObservableObject {
     private let index: PhotoIndexDatabase
     /// PHAsset local identifier to its timeline record, from the last scan.
     private static var assignments: [String: String]?
+    /// Records a scan wanted to delete but held back because too many
+    /// disappeared at once; the next scan confirms them before deleting.
+    private static var deferredStale: Set<String> = []
     /// Changes whenever a scan found the library different from the stored index.
     private(set) static var generation = 0
 
@@ -66,7 +94,7 @@ final class PhotoTimelineIndexer: ObservableObject {
             let id = asset.localIdentifier
             // An asset restored from Recently Deleted keeps the record it had
             // while it was archived.
-            photos.append(Self.groupable(asset, previousEventID: previous[id]?.eventID ?? archive.restored[id]))
+            photos.append(Self.groupable(asset, previousEventID: previous[id]?.eventID ?? archive.restored[id], previousTakenAt: previous[id]?.takenAt))
             progress += 1
             if progress.isMultiple(of: 500) {
                 status = "写真をタイムラインに追加中… (\(progress))/\(total)"
@@ -95,6 +123,13 @@ final class PhotoTimelineIndexer: ObservableObject {
         let current = Set(groups.map(\.eventID))
         let legacy = sessionGrouping ? Set<String>() : Set(photos.map { legacyPhotoEventID(takenAt: $0.takenAt, coordinate: $0.coordinate, mediaType: $0.mediaType) })
         let stale = authorization == .authorized && !assets.isEmpty ? Set(previousAssignments.values).union(legacy).subtracting(current) : []
+        let deletion = stalePhotoDeletions(
+            candidates: stale,
+            current: current,
+            previousRecords: Set(previousAssignments.values).count,
+            deferred: Self.deferredStale,
+        )
+        Self.deferredStale = deletion.deferred
 
         // Records that lost a photo since the last scan. As with stale records,
         // only full library access shows every photo.
@@ -109,13 +144,20 @@ final class PhotoTimelineIndexer: ObservableObject {
         status = "\(assets.count)件（写真と動画）をタイムラインに追加しました"
         var inherited: [String: String] = [:]
         for group in groups { if let origin = group.inheritsFrom { inherited[group.eventID] = origin } }
-        return PhotoImportResult(entries: entries, staleEventIDs: stale, inheritedCorrections: inherited)
+        return PhotoImportResult(entries: entries, staleEventIDs: deletion.delete, inheritedCorrections: inherited)
     }
 
-    private static func groupable(_ asset: PHAsset, previousEventID: String?) -> GroupablePhoto {
-        let date = asset.creationDate ?? asset.modificationDate ?? Date()
+    private static func groupable(_ asset: PHAsset, previousEventID: String?, previousTakenAt: Date?) -> GroupablePhoto {
+        let date = takenAt(creationDate: asset.creationDate, modificationDate: asset.modificationDate, firstSeen: previousTakenAt)
         let coordinate = asset.location.map { ($0.coordinate.latitude, $0.coordinate.longitude) }.flatMap { hasUsableCoordinates($0.0, $0.1) ? $0 : nil }
         return GroupablePhoto(id: asset.localIdentifier, takenAt: date, mediaType: asset.mediaType == .video ? .video : .photo, coordinate: coordinate, previousEventID: previousEventID)
+    }
+
+    /// The time a photo is recorded at. An asset without a date keeps the one
+    /// the index stored when it was first seen: a fresh scan time every time
+    /// would rewrite the record and upload it again on every scan.
+    static func takenAt(creationDate: Date?, modificationDate: Date?, firstSeen: Date?, now: Date = Date()) -> Date {
+        creationDate ?? modificationDate ?? firstSeen ?? now
     }
 
     /// The timeline record the last scan assigned `asset` to.
@@ -126,6 +168,7 @@ final class PhotoTimelineIndexer: ObservableObject {
 
     static func forgetAssignments() {
         assignments = [:]
+        deferredStale = []
         generation += 1
         PhotoIndexDatabase.shared.clear()
     }

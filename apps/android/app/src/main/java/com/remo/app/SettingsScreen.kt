@@ -75,6 +75,8 @@ internal data class SettingsState(
     val sleepAccess: Boolean?,
     val syncStatus: String,
     val lastBackupAt: Long?,
+    /** Records the server refused: they are stored here but not in the backup. */
+    val rejectedCount: Int,
     val user: RemoUser?,
 )
 
@@ -181,10 +183,20 @@ internal fun SettingsScreen(state: SettingsState, actions: SettingsActions) {
             item {
                 if (state.user == null) BackupSignInCard(actions.onOpenAuth) else SettingsGroup("バックアップ") {
                     val backedUp = state.lastBackupAt != null
+                    // Everything else may be backed up, but a refused record is
+                    // not: the status must not claim a complete backup.
+                    val statusText = if (state.syncStatus == BackupCoordinator.STATUS_DONE && state.rejectedCount > 0) {
+                        "バックアップ済み（${state.rejectedCount}件は送信できません）"
+                    } else {
+                        state.syncStatus
+                    }
                     ActionRow(
                         if (backedUp) Icons.Outlined.CloudDone else Icons.Outlined.CloudUpload,
-                        state.syncStatus,
-                        subtitle = state.lastBackupAt?.let { "最終バックアップ ${formatBackupTime(it)}" } ?: "まだバックアップされていません",
+                        statusText,
+                        subtitle = listOfNotNull(
+                            state.lastBackupAt?.let { "最終バックアップ ${formatBackupTime(it)}" } ?: "まだバックアップされていません",
+                            state.rejectedCount.takeIf { it > 0 }?.let { "バックアップできない記録 ${it}件" },
+                        ).joinToString("\n"),
                         trailing = { TextButton(onClick = actions.onBackup) { Text("今すぐ") } },
                         onClick = null,
                     )

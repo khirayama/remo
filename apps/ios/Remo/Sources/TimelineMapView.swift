@@ -38,7 +38,8 @@ struct TimelineMapView: UIViewRepresentable {
     let snapshotRevision: Int
     let loaded: Bool
     let viewKey: Date
-    let assets: [PHAsset]
+    /// The library organized once per change, so annotations do not filter it.
+    let assetIndex: PhotoAssetIndex<PHAsset>
     let stayLabels: [String: StayPlaceLabel]
     let focus: TimelineMapFocus?
     let insets: UIEdgeInsets
@@ -76,7 +77,7 @@ struct TimelineMapView: UIViewRepresentable {
             coordinator.renderOverlays(snapshot: snapshot, focus: focus, replaying: replaying)
         }
         if coordinator.renderedRevision != snapshotRevision || coordinator.renderedLabels != stayLabels.mapValues(\.primary) {
-            coordinator.renderAnnotations(snapshot: snapshot, labels: stayLabels, assets: assets)
+            coordinator.renderAnnotations(snapshot: snapshot, labels: stayLabels, assetIndex: assetIndex)
         }
         if focusChanged || replayChanged { coordinator.applyFocusDimming() }
         coordinator.renderedRevision = snapshotRevision
@@ -180,7 +181,7 @@ struct TimelineMapView: UIViewRepresentable {
             }
         }
 
-        func renderAnnotations(snapshot: TimelineRenderSnapshot, labels: [String: StayPlaceLabel], assets: [PHAsset]) {
+        func renderAnnotations(snapshot: TimelineRenderSnapshot, labels: [String: StayPlaceLabel], assetIndex: PhotoAssetIndex<PHAsset>) {
             guard let map else { return }
             renderedLabels = labels.mapValues(\.primary)
             let selectedStay = (map.selectedAnnotations.first as? StayAnnotation)?.stayID
@@ -195,7 +196,7 @@ struct TimelineMapView: UIViewRepresentable {
             let photos = snapshot.photoClusters.compactMap { cluster -> PhotoAnnotation? in
                 guard let first = cluster.entries.first else { return nil }
                 let annotation = PhotoAnnotation(cluster: cluster)
-                annotation.asset = nearestPhotoAsset(first, assets: assets)
+                annotation.asset = assetIndex.nearest(to: first)
                 return annotation
             }
             map.addAnnotations(stays)
@@ -728,24 +729,6 @@ private func photoMarkerImage(thumbnail: UIImage?, count: Int, isVideo: Bool) ->
         UIColor(hex: 0x2F5A45).setFill()
         UIBezierPath(roundedRect: inner, cornerRadius: inner.height / 2).fill()
         (text as NSString).draw(at: CGPoint(x: inner.midX - textSize.width / 2, y: inner.midY - textSize.height / 2), withAttributes: attributes)
-    }
-}
-
-func nearestPhotoAsset(_ log: LogEntry, assets: [PHAsset]) -> PHAsset? {
-    let candidates = assets.filter { asset in
-        log.mediaType == .video ? asset.mediaType == .video : asset.mediaType == .image
-    }
-    if let exact = candidates.first(where: { $0.creationDate == log.startedAt }) { return exact }
-    // The record's own photo can be gone from the library while its preview
-    // is backed up. Another local photo from the same day is not a stand-in
-    // for it; the cloud preview is.
-    if log.source == .photo, PhotoIndexDatabase.shared.hasArchivedPhotos(eventID: log.id) { return nil }
-    return candidates.filter { asset in
-        guard let creationDate = asset.creationDate else { return false }
-        return Calendar.current.isDate(creationDate, inSameDayAs: log.startedAt)
-    }.min { first, second in
-        guard let firstDate = first.creationDate, let secondDate = second.creationDate else { return false }
-        return abs(firstDate.timeIntervalSince(log.startedAt)) < abs(secondDate.timeIntervalSince(log.startedAt))
     }
 }
 

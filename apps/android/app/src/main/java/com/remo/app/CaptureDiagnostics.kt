@@ -67,7 +67,9 @@ internal object CaptureDiagnostics {
         if (file.length() > maxFileBytes) {
             val previous = File(directory, "$fileName.1")
             previous.delete()
-            file.renameTo(previous)
+            // Dropping the file when the rename fails keeps the journal bounded
+            // either way; the alternative is a file that only grows.
+            if (!file.renameTo(previous)) file.delete()
         }
         file.appendText(line + "\n", Charsets.UTF_8)
     }

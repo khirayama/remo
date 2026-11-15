@@ -78,6 +78,10 @@ final class LogStore: ObservableObject {
     @Published var writeFailed = false
     let database: LogDatabase
 
+    /// False when the database could not be opened (disk full, corrupt file):
+    /// nothing is stored and the home screen says so.
+    var storageAvailable: Bool { database.isAvailable }
+
     init(database: LogDatabase) {
         self.database = database
         database.onChange = { [weak self] in Task { @MainActor [weak self] in self?.revision += 1 } }
@@ -290,6 +294,11 @@ private struct TrackerHomeView: View {
     @State private var lastSyncAttemptAt: Date?
     @State private var lastPullAt: Date?
     @State private var lastBackupAt: Date? = UserDefaults.standard.object(forKey: "remo.last-backup-at") as? Date
+    /// Records the server refused; counted in the backup status and settings.
+    @State private var rejectedRecords = 0
+    /// A library change arrived while a scan was running; one rerun follows it.
+    @State private var photoIndexQueued = false
+    @State private var showingStorageError = false
     @State private var showingAuth = false
     /// The records on this device are backed up to another account than the one signed in.
     @State private var ownershipConflict = false
@@ -308,7 +317,7 @@ private struct TrackerHomeView: View {
                 date: $selectedDate,
                 logs: dayRecords?.logs ?? [],
                 logsDate: dayRecords?.date,
-                assets: photoLibrary.assets,
+                assetIndex: photoLibrary.assetIndex,
                 // Another day's sleep is not shown while the selected day is being read.
                 sleep: daySleep.flatMap { $0.date == selectedDate ? $0.sessions : nil } ?? [],
                 sleepMoments: daySleep.flatMap { $0.date == selectedDate ? $0.moments : nil } ?? [],
@@ -342,6 +351,8 @@ private struct TrackerHomeView: View {
             // The system prompts appear without context of their own: on a first
             // launch the intro explains them and starts recording from there.
             if !showingIntro { automaticCapture.startIfPossible(); photoLibrary.requestAccess() }
+            if !store.storageAvailable { showingStorageError = true }
+            rejectedRecords = store.database.rejectedCount()
             await refreshSleep()
             await indexPhotos(syncAfter: false)
             await sync(force: true)
@@ -368,18 +379,24 @@ private struct TrackerHomeView: View {
             stayIndex.schedule(database: store.database)
             namedPlaces.reload(from: store.database)
             corrections.reload(from: store.database)
+            rejectedRecords = store.database.rejectedCount()
         }
         .onChange(of: store.writeFailed) { _, failed in
             guard failed else { return }
             status = "記録を保存できませんでした。端末の空き容量を確認してください"
             store.writeFailed = false
         }
+        .alert("記録を保存できません", isPresented: $showingStorageError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("端末の記録用データベースを開けませんでした。空き容量を確認してから、Remoを開き直してください。記録は保存されません。")
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
             locationAccess = .current
             if !showingIntro { automaticCapture.startIfPossible() }
             photoLibrary.reload()
             // While the app is in the background the access can be taken away and last night's sleep can arrive.
-            Task { await refreshSleep(); await indexPhotos(syncAfter: false); await sync(force: true) }
+            Task { await auth.refreshUserIfNeeded(); await refreshSleep(); await indexPhotos(syncAfter: false); await sync(force: true) }
         }
         .onReceive(NotificationCenter.default.publisher(for: .remoAutomaticLogSaved)) { _ in Task { await sync() } }
         .fullScreenCover(item: $selectedLog) { log in
@@ -476,7 +493,7 @@ private struct TrackerHomeView: View {
     private let sessionExpiredStatus = "再ログインが必要です"
 
     private var settingsState: SettingsState {
-        SettingsState(autoCapture: capturing, locationAccess: locationAccess, photoAccess: photoLibrary.hasAccess, sleepAccess: sleepAccess, syncStatus: syncStatus, lastBackupAt: lastBackupAt, email: auth.phase == .signedIn ? auth.user.flatMap { $0.email.isEmpty ? nil : $0.email } ?? "ログイン中" : nil)
+        SettingsState(autoCapture: capturing, locationAccess: locationAccess, photoAccess: photoLibrary.hasAccess, sleepAccess: sleepAccess, syncStatus: syncStatus, lastBackupAt: lastBackupAt, rejectedRecords: rejectedRecords, email: auth.phase == .signedIn ? auth.user.flatMap { $0.email.isEmpty ? nil : $0.email } ?? "ログイン中" : nil)
     }
 
     private var settingsActions: SettingsActions {
@@ -612,9 +629,10 @@ private struct TrackerHomeView: View {
         }
         // Location notifications can arrive every 10 seconds while moving.
         // Android and Web already limit backup attempts; keep iOS from issuing
-        // a round-trip for every local sample as well.
+        // a round-trip for every local sample as well. Five minutes is the
+        // shared cadence; explicit actions still pass force.
         let now = Date()
-        if !force, let lastSyncAttemptAt, now.timeIntervalSince(lastSyncAttemptAt) < 60 {
+        if !force, let lastSyncAttemptAt, now.timeIntervalSince(lastSyncAttemptAt) < 5 * 60 {
             return
         }
         guard !syncInFlight else { syncQueued = true; return }
@@ -640,7 +658,14 @@ private struct TrackerHomeView: View {
             }
             if shouldPull { lastPullAt = Date() }
             let photoBackup = try await PhotoBackup.uploadPending(assets: photoLibrary.assets, database: store.database)
-            syncStatus = photoBackup.pending ? "写真バックアップ待ち" : "バックアップ済み"
+            rejectedRecords = store.database.rejectedCount()
+            // A refused record is not backed up: the status says so instead of
+            // claiming everything is in the backup.
+            syncStatus = photoBackup.pending
+                ? "写真バックアップ待ち"
+                : rejectedRecords > 0
+                    ? "バックアップ済み（\(rejectedRecords)件は送信できません）"
+                    : "バックアップ済み"
             if photoBackup.more {
                 Task {
                     do { try await Task.sleep(for: .seconds(65)) } catch { return }
@@ -688,13 +713,20 @@ private struct TrackerHomeView: View {
     }
     private func requestPhotoAccess() { if photoLibrary.status == .notDetermined { photoLibrary.requestAccess() } else { openAppSettings() } }
     private func indexPhotos(syncAfter: Bool = true) async {
-        guard photoLibrary.hasAccess, !photoIndexer.isIndexing else { return }
+        guard photoLibrary.hasAccess else { return }
+        // A change during a scan is not lost: one rerun follows it.
+        guard !photoIndexer.isIndexing else { photoIndexQueued = true; return }
+        photoIndexQueued = false
         let database = store.database
         let photoRecords = database.photoEntries()
         let result = await photoIndexer.indexAll(existingEventIDs: Set(photoRecords.map(\.id)))
         store.upsertScanned(inheritPhotoCorrections(result.entries, inheritedFrom: result.inheritedCorrections, current: photoRecords))
         let present = Set(database.photoEntries().map(\.id))
         store.deleteAll(result.staleEventIDs.intersection(present))
+        if photoIndexQueued {
+            photoIndexQueued = false
+            await indexPhotos(syncAfter: false)
+        }
         if syncAfter && !result.entries.isEmpty { await sync() }
     }
 

@@ -131,7 +131,7 @@ data class RangeSummary(val locationCount: Int, val photoCount: Int)
  */
 class LogStore internal constructor(context: Context, databaseName: String = "rem_logs.db", legacyStorageName: String = STORAGE_NAME) {
     private val preferences = context.getSharedPreferences(legacyStorageName, Context.MODE_PRIVATE)
-    private val helper = object : SQLiteOpenHelper(context, databaseName, null, 5) {
+    private val helper = object : SQLiteOpenHelper(context, databaseName, null, 6) {
         override fun onCreate(db: SQLiteDatabase) {
             createTables(db)
         }
@@ -142,6 +142,12 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
             // migrateToTypedColumns creates the current tables; only version 4
             // needs the new place columns and the corrections table added.
             if (oldVersion == 4) migrateCorrections(db)
+            // Versions 4 and 5 already have the typed entries table; the
+            // rejection of an upload is recorded on the record itself.
+            if (oldVersion >= 4 && oldVersion < 6) {
+                db.execSQL("ALTER TABLE entries ADD COLUMN rejected_message TEXT")
+                db.execSQL(REJECTED_INDEX)
+            }
         }
     }.apply { setWriteAheadLoggingEnabled(true) }
     private val mutex = Mutex()
@@ -303,17 +309,39 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
 
     /** Records that have not been backed up in the current epoch. */
     suspend fun dirtyEntries(limit: Int): List<LogEntry> = access { db ->
-        db.rawQuery("SELECT $COLUMNS FROM entries WHERE synced_epoch < ? LIMIT ?", arrayOf(epoch.toString(), limit.toString())).use(::readEntries)
+        // A record the server rejected is not retried until it changes here.
+        db.rawQuery("SELECT $COLUMNS FROM entries WHERE synced_epoch < ? AND rejected_message IS NULL LIMIT ?", arrayOf(epoch.toString(), limit.toString())).use(::readEntries)
     }
 
-    /** Marks sent records as backed up, unless they were edited while the request was in flight. */
-    suspend fun markSynced(sent: List<LogEntry>) = access { db ->
+    /**
+     * Marks sent records as backed up, unless they were edited while the request
+     * was in flight. [rejected] maps the ids the server refused to its message:
+     * those stay unbacked-up and are not sent again until they change.
+     */
+    suspend fun markSynced(sent: List<LogEntry>, rejected: Map<String, String> = emptyMap()) = access { db ->
         transaction(db) {
             sent.forEach { entry ->
-                db.execSQL("UPDATE entries SET synced_epoch = ? WHERE id = ? AND updated_at = ?", arrayOf<Any>(epoch, entry.id, entry.updatedAt))
+                val message = rejected[entry.id]
+                if (message != null) {
+                    db.execSQL("UPDATE entries SET rejected_message = ? WHERE id = ? AND updated_at = ?", arrayOf<Any>(message, entry.id, entry.updatedAt))
+                } else {
+                    db.execSQL("UPDATE entries SET synced_epoch = ?, rejected_message = NULL WHERE id = ? AND updated_at = ?", arrayOf<Any>(epoch, entry.id, entry.updatedAt))
+                }
             }
         }
         refreshPending(db)
+    }
+
+    /** Records the server refused: they are stored, but they are not in the backup. */
+    suspend fun rejectedCount(): Int = access { db ->
+        db.rawQuery("SELECT COUNT(*) FROM entries WHERE rejected_message IS NOT NULL", null).use { it.moveToFirst(); it.getInt(0) }
+    }
+
+    /** Photo records the server refused; their previews cannot be uploaded either. */
+    suspend fun rejectedPhotoIds(): Set<String> = access { db ->
+        db.rawQuery("SELECT id FROM entries WHERE source = 'photo' AND rejected_message IS NOT NULL", null).use { cursor ->
+            buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
+        }
     }
 
     suspend fun pendingDeletions(limit: Int): List<PendingDeletion> = access { db ->
@@ -554,7 +582,7 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
 
     private fun pendingIn(db: SQLiteDatabase): Boolean =
         db.rawQuery(
-            "SELECT EXISTS (SELECT 1 FROM entries WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM deleted WHERE synced = 0) OR EXISTS (SELECT 1 FROM places WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM corrections WHERE synced_epoch < ?1)",
+            "SELECT EXISTS (SELECT 1 FROM entries WHERE synced_epoch < ?1 AND rejected_message IS NULL) OR EXISTS (SELECT 1 FROM deleted WHERE synced = 0) OR EXISTS (SELECT 1 FROM places WHERE synced_epoch < ?1) OR EXISTS (SELECT 1 FROM corrections WHERE synced_epoch < ?1)",
             arrayOf(epoch.toString()),
         ).use { it.moveToFirst() && it.getInt(0) != 0 }
 
@@ -581,7 +609,9 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
     /** A correction touches every local day its range covers. */
     private fun markDaysInRange(db: SQLiteDatabase, startedAt: Long, endedAt: Long) {
         var day = dayKey(minOf(startedAt, endedAt))
-        val last = dayKey(maxOf(startedAt, endedAt))
+        // The stay index only recomputes today and earlier, so a future day
+        // would stay dirty forever and be read on every update.
+        val last = minOf(dayKey(maxOf(startedAt, endedAt)), dayKey(System.currentTimeMillis()))
         var guard = 0
         while (day <= last && guard < 400) {
             db.insertWithOnConflict("dirty_days", null, ContentValues().apply { put("day", day); put("token", System.nanoTime()) }, SQLiteDatabase.CONFLICT_REPLACE)
@@ -705,6 +735,9 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
             instance ?: LogStore(context.applicationContext).also { instance = it }
         }
         private const val STORAGE_NAME = "rem_logs"
+        // The refused records are counted after every sync and every new sample;
+        // a partial index keeps that from reading the whole timeline.
+        private const val REJECTED_INDEX = "CREATE INDEX entries_rejected ON entries(id) WHERE rejected_message IS NOT NULL"
         private const val ENTRIES_KEY = "entries"
         private const val PENDING_DELETES_KEY = "pending_deletes"
         private const val OWNER_KEY = "owner"
@@ -719,11 +752,12 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
                     original_latitude REAL, original_longitude REAL, location_source TEXT,
                     auto_placement_disabled INTEGER NOT NULL DEFAULT 0, accuracy_meters REAL, media_type TEXT,
                     photo_count INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL, updated_at INTEGER NOT NULL,
-                    synced_epoch INTEGER NOT NULL DEFAULT 0)""",
+                    synced_epoch INTEGER NOT NULL DEFAULT 0, rejected_message TEXT)""",
             )
             db.execSQL("CREATE INDEX entries_time ON entries(started_at)")
             db.execSQL("CREATE INDEX entries_sync ON entries(synced_epoch)")
             db.execSQL("CREATE INDEX entries_photo ON entries(started_at) WHERE source = 'photo'")
+            db.execSQL(REJECTED_INDEX)
             db.execSQL("CREATE TABLE deleted (id TEXT PRIMARY KEY NOT NULL, synced INTEGER NOT NULL DEFAULT 0, deleted_at INTEGER, started_at INTEGER, source TEXT)")
             db.execSQL("CREATE TABLE dirty_days (day TEXT PRIMARY KEY NOT NULL, token INTEGER NOT NULL)")
             db.execSQL("CREATE TABLE places (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, updated_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, synced_epoch INTEGER NOT NULL DEFAULT 0, radius_meters REAL, anchors TEXT, merged_into TEXT)")
@@ -788,6 +822,8 @@ class LogStore internal constructor(context: Context, databaseName: String = "re
             put("accuracy_meters", entry.accuracyMeters); put("media_type", entry.mediaType?.wireValue)
             put("photo_count", entry.photoCount); put("source", entry.source.wireValue)
             put("updated_at", entry.updatedAt); put("synced_epoch", syncedEpoch)
+            // Any write is a change here, so a record the server refused is tried again.
+            putNull("rejected_message")
         }
 
         private fun readEntries(cursor: Cursor): List<LogEntry> = buildList(cursor.count) {

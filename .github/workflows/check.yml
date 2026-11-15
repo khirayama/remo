@@ -75,8 +75,13 @@ jobs:
             apps/android/**/*.gradle.kts
             apps/android/gradle/libs.versions.toml
             apps/android/gradle/wrapper/gradle-wrapper.properties
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with:
           packages: "platforms;android-36 build-tools;36.0.0"
       - name: Lint, unit tests and debug build
         run: ./gradlew --no-daemon --console=plain lintDebug testDebugUnitTest assembleDebug
+      # The release build is the only one that runs R8 (minify and resource
+      # shrinking). It is signed with the debug key here only to check that it
+      # builds; the artifact is never distributed.
+      - name: Release build with R8 (debug-signed, not for distribution)
+        run: ./gradlew --no-daemon --console=plain assembleRelease -PallowDebugSigning=true

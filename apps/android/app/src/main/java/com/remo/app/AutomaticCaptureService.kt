@@ -138,7 +138,9 @@ class AutomaticCaptureService : Service(), SensorEventListener {
             return START_NOT_STICKY
         }
 
-        startForegroundWithCurrentMode()
+        // A service the system refuses to put in the foreground has to stop,
+        // not carry on and crash on the next call into the platform.
+        if (!startForegroundWithCurrentMode()) return START_NOT_STICKY
         if (!heartbeatScheduled) scheduleHeartbeat()
 
         if (intent?.action == ACTION_ACTIVITY_TRANSITION) {
@@ -665,7 +667,8 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         ContextCompat.checkSelfPermission(this, ACTIVITY_RECOGNITION_PERMISSION_PRE_Q) == PackageManager.PERMISSION_GRANTED
     }
 
-    private fun startForegroundWithCurrentMode() {
+    /** Returns false when the system refused the foreground start: the service has stopped itself. */
+    private fun startForegroundWithCurrentMode(): Boolean = try {
         val openApp = PendingIntent.getActivity(
             this,
             0,
@@ -687,6 +690,24 @@ class AutomaticCaptureService : Service(), SensorEventListener {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+        true
+    } catch (error: SecurityException) {
+        // Started from the background without the "all the time" permission
+        // (Android 14 and later refuse a location service then).
+        onForegroundStartRefused(error)
+        false
+    } catch (error: IllegalStateException) {
+        // ForegroundServiceStartNotAllowedException on Android 12 and later.
+        onForegroundStartRefused(error)
+        false
+    }
+
+    private fun onForegroundStartRefused(error: Exception) {
+        diagnose("foreground_start_failed", mapOf("error" to error.message, "type" to error.javaClass.simpleName))
+        // Ask the user to open the app instead of leaving a service the system
+        // will not run (and that would otherwise crash the process).
+        remindToOpen(this)
+        stopSelf()
     }
 
     private fun saveModeReason(reason: String) {

@@ -2,7 +2,7 @@ import "fake-indexeddb/auto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { synchronizeEvents } from "./life-api";
 import { buildExport, claimRecords, clearEvents, countUnsavedEvents, dateKey, forgetAccount, LifeEvent, loadDayEvents, loadUploadedPhotos, migrateLegacyTimeline, ownershipFor, readImport, readImportExtras, rememberUploadedPhoto, replaceRecords, sortNewest, sortOldest, storeImported, storeImportExtras, summarizeRange } from "./life-log";
-import { applyRemoteChanges, applyRemoteCorrections, clearDirtyDays, closeDatabaseForTests, countEvents, deleteLocalEvents, listRecordedDays, loadCorrections, loadDirtyCorrections, loadDirtyDays, loadDirtyEvents, loadEvent, loadEventsInRange, loadPendingDeletes, loadStoredPlaces, loadSyncState, markEventsSynced, putLocalCorrections, putLocalEvents, putLocalPlace, updateSyncState } from "./timeline-db";
+import { applyRemoteChanges, applyRemoteCorrections, clearDirtyDays, closeDatabaseForTests, countEvents, deleteLocalEvents, listRecordedDays, loadCorrections, loadDirtyCorrections, loadDirtyDays, loadDirtyEvents, loadEvent, loadEventsInRange, loadPendingDeletes, loadRejectedEvents, loadStoredPlaces, loadSyncState, markEventsSynced, putLocalCorrections, putLocalEvents, putLocalPlace, updateSyncState } from "./timeline-db";
 
 const STORAGE = "device:test";
 
@@ -239,6 +239,37 @@ describe("account ownership", () => {
     expect(await ownershipFor(STORAGE, "user-2")).toBe("owned");
   });
 
+  it("forgets every download position when the records are replaced", async () => {
+    await claimRecords(STORAGE, "user-1");
+    await updateSyncState(STORAGE, (state) => {
+      state.cursors["user-1"] = { updatedAt: 10, id: "~" };
+      state.cursors["user-2"] = { updatedAt: 20, id: "~" };
+      state.fullSync["user-1"] = "5|0|e00001";
+      state.correctionCursors["user-1"] = 7;
+      state.rejected["bad"] = "invalid";
+    });
+    await replaceRecords(STORAGE, "user-2");
+    // A cursor left from the other account would hide this account's backup.
+    expect(await loadSyncState(STORAGE)).toMatchObject({
+      owner: "user-2", cursors: {}, fullSync: {}, correctionCursors: {}, rejected: {},
+    });
+  });
+
+  it("asks before handing another account's places or corrections over", async () => {
+    await claimRecords(STORAGE, "user-1");
+    expect(await ownershipFor(STORAGE, "user-2")).toBe("unclaimed");
+
+    await putLocalPlace(STORAGE, { id: "home", name: "Home", latitude: 35, longitude: 139, updatedAt: 1, deleted: false });
+    expect(await ownershipFor(STORAGE, "user-2")).toBe("other");
+
+    // A deleted place says nothing about where the user goes.
+    await putLocalPlace(STORAGE, { id: "home", name: "", latitude: 0, longitude: 0, updatedAt: 2, deleted: true });
+    expect(await ownershipFor(STORAGE, "user-2")).toBe("unclaimed");
+
+    await putLocalCorrections(STORAGE, [{ id: "c1", kind: "exclude", startedAt: 1, endedAt: 2, createdAt: 3, source: "app", deleted: false }]);
+    expect(await ownershipFor(STORAGE, "user-2")).toBe("other");
+  });
+
   it("uploads everything to a later account after the account was deleted", async () => {
     await putLocalEvents(STORAGE, [event({ id: "a" })]);
     await claimRecords(STORAGE, "user-1");
@@ -372,6 +403,105 @@ describe("backup sync", () => {
     expect(await synchronizeEvents(STORAGE, "user-1")).toMatchObject({ online: false, unauthorized: false, pending: 1 });
     stubApi(() => 401);
     expect(await synchronizeEvents(STORAGE, "user-1")).toMatchObject({ online: false, unauthorized: true, pending: 1 });
+  });
+
+  it("keeps the records the server refused and stops sending them", async () => {
+    await putLocalEvents(STORAGE, [event({ id: "ok" }), event({ id: "bad" })]);
+    await claimRecords(STORAGE, "user-1");
+    let calls = stubApi(({ method }) => method === "POST"
+      // A rejection without an id names no record and is ignored.
+      ? { data: { accepted: 1, rejected: [
+        { kind: "event", index: 1, id: "bad", message: "startedAt is out of range" },
+        { kind: "event", index: 2, id: null, message: "id and startedAt are required" },
+      ] } }
+      : emptyPage(null));
+
+    const outcome = await synchronizeEvents(STORAGE, "user-1");
+
+    expect(outcome).toMatchObject({ online: true, pending: 0, rejected: 1 });
+    expect(await loadRejectedEvents(STORAGE)).toEqual(new Map([["bad", "startedAt is out of range"]]));
+    const { epoch } = await loadSyncState(STORAGE);
+    expect(await loadDirtyEvents(STORAGE, epoch, 10)).toEqual([]);
+
+    // The refused record is not uploaded again, nor counted as pending.
+    calls = stubApi(({ method }) => method === "POST" ? { data: { accepted: 0 } } : emptyPage(null));
+    expect(await synchronizeEvents(STORAGE, "user-1")).toMatchObject({ pending: 0, rejected: 1 });
+    expect(calls.filter((call) => call.method === "POST")).toEqual([]);
+
+    // Editing it retries it.
+    await putLocalEvents(STORAGE, [event({ id: "bad", updatedAt: "2026-09-01T00:00:00.000Z" })]);
+    expect(await loadRejectedEvents(STORAGE)).toEqual(new Map());
+    calls = stubApi(({ method }) => method === "POST" ? { data: { accepted: 1 } } : emptyPage(null));
+    expect((await synchronizeEvents(STORAGE, "user-1")).rejected).toBe(0);
+    expect(calls.find((call) => call.method === "POST")?.body.events.map((item: { id: string }) => item.id)).toEqual(["bad"]);
+  });
+
+  it("stops counting a refused record once it is deleted here", async () => {
+    await putLocalEvents(STORAGE, [event({ id: "bad" })]);
+    await claimRecords(STORAGE, "user-1");
+    stubApi(({ method }) => method === "POST"
+      ? { data: { accepted: 0, rejected: [{ kind: "event", index: 0, id: "bad", message: "startedAt is out of range" }] } }
+      : emptyPage(null));
+    expect((await synchronizeEvents(STORAGE, "user-1")).rejected).toBe(1);
+
+    await deleteLocalEvents(STORAGE, ["bad"]);
+
+    expect(await loadRejectedEvents(STORAGE)).toEqual(new Map());
+  });
+
+  it("drops a deletion the server refused", async () => {
+    await putLocalEvents(STORAGE, [event({ id: "a" })]);
+    await claimRecords(STORAGE, "user-1");
+    await updateSyncState(STORAGE, (state) => { state.cursors["user-1"] = { updatedAt: 50, id: "~" }; });
+    const { epoch } = await loadSyncState(STORAGE);
+    await markEventsSynced(STORAGE, [event({ id: "a" })], epoch);
+    await deleteLocalEvents(STORAGE, ["a"]);
+
+    stubApi(({ method }) => method === "POST"
+      ? { data: { accepted: 0, rejected: [{ kind: "deletion", index: 0, id: "a", message: "id is invalid" }] } }
+      : emptyPage(null));
+    await synchronizeEvents(STORAGE, "user-1");
+
+    // It can never succeed, so it does not stay in the queue.
+    expect(await loadPendingDeletes(STORAGE)).toEqual([]);
+  });
+
+  it("reads places and corrections only when the records download ran", async () => {
+    await putLocalEvents(STORAGE, [event({ id: "a" })]);
+    await claimRecords(STORAGE, "user-1");
+    await updateSyncState(STORAGE, (state) => {
+      state.cursors["user-1"] = { updatedAt: 50, id: "~" };
+      state.correctionCursors["user-1"] = 5;
+    });
+    const { epoch } = await loadSyncState(STORAGE);
+    await markEventsSynced(STORAGE, [event({ id: "a" })], epoch);
+
+    // The head did not move: nobody wrote anything for this account.
+    let calls = stubApi(({ path }) => path.endsWith("/head") ? { data: { cursor: "50|~" } } : emptyPage(null));
+    expect((await synchronizeEvents(STORAGE, "user-1")).pulled).toBe(false);
+    expect(calls.map((call) => call.path)).toEqual(["/api/v1/events/head"]);
+
+    calls = stubApi(({ path }) => path.endsWith("/head") ? { data: { cursor: "60|~" } } : emptyPage(null));
+    expect((await synchronizeEvents(STORAGE, "user-1")).pulled).toBe(true);
+    expect(calls.map((call) => call.path)).toContain("/api/v1/places");
+    expect(calls.some((call) => call.path.startsWith("/api/v1/corrections"))).toBe(true);
+  });
+
+  it("reports why a sync stopped and still finishes the parts that work", async () => {
+    await putLocalEvents(STORAGE, [event({ id: "local" })]);
+    await claimRecords(STORAGE, "user-1");
+    const calls = stubApi(({ method, path }) => {
+      if (method === "GET" && path.startsWith("/api/v1/places")) return 429;
+      if (method === "POST") return { data: { accepted: 1 } };
+      return emptyPage(null);
+    });
+
+    const outcome = await synchronizeEvents(STORAGE, "user-1");
+
+    expect(outcome).toMatchObject({ online: false, failure: "rate_limited", pending: 0 });
+    // The records went up and the download ran before the places were refused.
+    expect(calls.some((call) => call.method === "POST")).toBe(true);
+    expect(calls.some((call) => call.path.startsWith("/api/v1/events?"))).toBe(true);
   });
 
   it("does not sync records that belong to another account", async () => {
