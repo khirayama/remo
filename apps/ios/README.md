@@ -23,4 +23,14 @@ xcodegen generate
 xcodebuild -project Remo.xcodeproj -scheme Remo -destination 'generic/platform=iOS Simulator' CODE_SIGN_IDENTITY="-" build
 ```
 
+シミュレータの起動と実行には`just`のレシピを使います。`target`には端末名かUDIDを指定し、同じ名前の端末が複数のランタイムにある場合は起動中のもの、次に新しいランタイムのものを選びます。
+
+```bash
+just simulator 'iPhone 17'   # 起動してウィンドウを開く
+just build && just run       # 起動中の1台へインストールして起動（複数台起動中は端末名かUDIDを指定）
+just screenshot home         # ios_home.png に保存
+```
+
+Xcode 27でSimulator.appはDeviceHubに置き換わりました。DeviceHubはコマンドラインから起動した端末のウィンドウを自動では開かないため、レシピは`devices://device/open?id=<UDID>`でウィンドウを開きます（Xcode 26以前はSimulator.appを開きます）。DeviceHubを終了すると、設定によっては起動中のシミュレータも終了します。
+
 シミュレータからは`http://localhost:8787`のAPIへ接続します。別のAPIを使う場合は`project.yml`の`REMO_API_BASE_URL`を変更してください。

@@ -1,5 +1,7 @@
 set shell := ["zsh", "-cu"]
 
+just := just_executable() + " --justfile " + quote(justfile())
+
 build:
     xcodegen generate
     xcodebuild -project Remo.xcodeproj -scheme Remo -configuration Debug -derivedDataPath build -destination 'generic/platform=iOS Simulator' CODE_SIGN_IDENTITY="-" build
@@ -8,23 +10,7 @@ test target='iPhone 17':
     #!/usr/bin/env zsh
     set -euo pipefail
 
-    target="{{ target }}"
-    device_udid=$(
-      xcrun simctl list devices available --json \
-        | jq -er --arg target "$target" '
-          [
-            .devices
-            | to_entries[]
-            | .key as $runtime
-            | .value[]
-            | select(.udid == $target or .name == $target)
-            | { runtime: $runtime, udid }
-          ]
-          | sort_by(.runtime, .udid)
-          | last
-          | .udid
-        '
-    )
+    device_udid=$({{ just }} _device "{{ target }}" | jq -r '.udid')
 
     xcodegen generate
     xcodebuild test -project Remo.xcodeproj -scheme Remo -destination "platform=iOS Simulator,id=$device_udid" CODE_SIGN_IDENTITY="-"
@@ -33,50 +19,40 @@ build-release api_base_url='https://remo-api.just-do-it-my-life.workers.dev':
     xcodegen generate
     xcodebuild -project Remo.xcodeproj -scheme Remo -configuration Release -derivedDataPath build-release -destination 'generic/platform=iOS Simulator' CODE_SIGN_IDENTITY="-" REMO_API_BASE_URL="{{ api_base_url }}" build
 
-run:
-    xcrun simctl install booted build/Build/Products/Debug-iphonesimulator/Remo.app
-    xcrun simctl launch booted com.remo.app
+# `target` is a device name or UDID, or `booted` for the only booted simulator.
+
+# Install and launch the Debug build on a simulator
+run target='booted':
+    #!/usr/bin/env zsh
+    set -euo pipefail
+
+    device_json=$({{ just }} _device "{{ target }}")
+    device_udid=$(jq -r '.udid' <<<"$device_json")
+
+    if [[ $(jq -r '.state' <<<"$device_json") != Booted ]]; then
+      {{ just }} simulator "$device_udid"
+    else
+      {{ just }} _show "$device_udid"
+    fi
+
+    xcrun simctl install "$device_udid" build/Build/Products/Debug-iphonesimulator/Remo.app
+    xcrun simctl launch "$device_udid" com.remo.app
 
 simulator-list:
     xcrun simctl list devices available
 
+# Xcode 27 replaced Simulator.app with DeviceHub; older Xcode still uses Simulator.app.
+
+# Boot a simulator and open its window in DeviceHub (or Simulator.app)
 simulator target='iPhone 17':
     #!/usr/bin/env zsh
     set -euo pipefail
 
-    target="{{ target }}"
-
-    if [[ -z "$target" ]]; then
-      echo "usage: just simulator <device-name-or-udid>" >&2
-      exit 1
-    fi
-
-    # Xcode 27 replaced Simulator.app with DeviceHub; fall back for older Xcode.
-    open -a DeviceHub 2>/dev/null || open -a Simulator
-
-    device_json=$(
-      xcrun simctl list devices available --json \
-        | jq -cer --arg target "$target" '
-          .devices
-          | to_entries[]
-          | .key as $runtime
-          | .value[]
-          | select(.udid == $target or .name == $target)
-          | {
-              runtime: $runtime,
-              udid,
-              name,
-              dataPath,
-              deviceTypeIdentifier
-            }
-          ' \
-        | head -n 1
-    )
-
+    device_json=$({{ just }} _device "{{ target }}")
     target_udid=$(jq -r '.udid' <<<"$device_json")
-    data_path=$(jq -r '.dataPath' <<<"$device_json")
+    state=$(jq -r '.state' <<<"$device_json")
 
-    if [[ ! -d "$data_path" ]]; then
+    if [[ ! -d $(jq -r '.dataPath' <<<"$device_json") ]]; then
       runtime=$(jq -r '.runtime' <<<"$device_json")
       name=$(jq -r '.name' <<<"$device_json")
       device_type=$(jq -r '.deviceTypeIdentifier' <<<"$device_json")
@@ -84,10 +60,93 @@ simulator target='iPhone 17':
       echo "Recreating stale simulator $target_udid ($name, $runtime)" >&2
       xcrun simctl delete "$target_udid" >/dev/null 2>&1 || true
       target_udid=$(xcrun simctl create "$name" "$device_type" "$runtime")
+      state=Shutdown
     fi
 
-    xcrun simctl boot "$target_udid"
+    if [[ $state != Booted ]]; then
+      xcrun simctl boot "$target_udid"
+    fi
+    {{ just }} _show "$target_udid"
     xcrun simctl bootstatus "$target_udid" -b
 
-screenshot target='current':
-    xcrun simctl io booted screenshot ios_{{ target }}.png
+# Save a screenshot of a simulator as ios_<name>.png
+screenshot name='current' target='booted':
+    #!/usr/bin/env zsh
+    set -euo pipefail
+
+    device_udid=$({{ just }} _device "{{ target }}" | jq -r '.udid')
+    xcrun simctl io "$device_udid" screenshot "ios_{{ name }}.png"
+
+# Prints the iOS simulator a target names as JSON. A name can match devices on
+# several runtimes: a booted one wins, then the newest runtime. `booted` must
+# match exactly one booted simulator, because DeviceHub makes several common.
+_device target:
+    #!/usr/bin/env zsh
+    set -euo pipefail
+
+    target="{{ target }}"
+    if [[ -z "$target" ]]; then
+      echo "usage: <device-name-or-udid|booted>" >&2
+      exit 1
+    fi
+
+    devices=$(
+      xcrun simctl list devices available --json \
+        | jq -c --arg target "$target" '
+          [
+            .devices
+            | to_entries[]
+            | select(.key | test("\\.iOS-[0-9-]+$"))
+            | .key as $runtime
+            | .value[]
+            | select(
+                if $target == "booted"
+                then .state == "Booted"
+                else .udid == $target or .name == $target
+                end
+              )
+            | {
+                runtime: $runtime,
+                version: ($runtime | capture("iOS-(?<v>[0-9-]+)$").v | split("-") | map(tonumber)),
+                udid,
+                name,
+                state,
+                dataPath,
+                deviceTypeIdentifier
+              }
+          ]
+          | sort_by(.state == "Booted", .version)
+        '
+    )
+
+    count=$(jq 'length' <<<"$devices")
+    if (( count == 0 )); then
+      if [[ "$target" == booted ]]; then
+        echo "No iOS simulator is booted. Run \`just simulator <device-name-or-udid>\` first." >&2
+      else
+        echo "No available iOS simulator matches '$target'. See \`just simulator-list\`." >&2
+      fi
+      exit 1
+    fi
+    if [[ "$target" == booted ]] && (( count > 1 )); then
+      echo "Several iOS simulators are booted; pass a device name or UDID:" >&2
+      jq -r '.[] | "  \(.name) (\(.udid))"' <<<"$devices" >&2
+      exit 1
+    fi
+
+    jq -c 'last' <<<"$devices"
+
+# Opens the window of a simulator. Xcode 27 replaced Simulator.app with
+# DeviceHub, which only shows devices it is asked to open.
+_show udid:
+    #!/usr/bin/env zsh
+    set -euo pipefail
+
+    developer_dir=$(xcode-select -p)
+    device_hub="${developer_dir:h}/Applications/DeviceHub.app"
+
+    if [[ -d "$device_hub" ]]; then
+      open -a "$device_hub" "devices://device/open?id={{ udid }}"
+    else
+      open -a "$developer_dir/Applications/Simulator.app" --args -CurrentDeviceUDID "{{ udid }}"
+    fi

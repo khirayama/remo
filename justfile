@@ -22,8 +22,8 @@ android-release:
 emulator target='Pixel_9_API_35':
     cd apps/android && just emulator "{{ target }}"
 
-ios:
-    cd apps/ios && just build && just run
+ios target='booted':
+    cd apps/ios && just build && just run "{{ target }}"
 
 ios-release:
     cd apps/ios && just build-release
